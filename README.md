@@ -8,6 +8,20 @@ Node.js + Express + Prisma (PostgreSQL) backend for ScriptMark.
 - PostgreSQL (via Supabase for both local dev and production)
 - JWT auth (`jsonwebtoken`) + `bcryptjs` for password hashing
 
+## Environment Variables
+Create a `.env` file in this folder with the following variables:
+
+| Variable | Example | Notes |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://postgres.xxxx:PASSWORD@aws-1-eu-west-1.pooler.supabase.com:6543/postgres?pgbouncer=true` | Supabase pooled connection — used by the running app |
+| `DIRECT_URL` | `postgresql://postgres.xxxx:PASSWORD@aws-1-eu-west-1.pooler.supabase.com:5432/postgres` | Supabase session pooler (port 5432) — used only for migrations. If your network supports IPv6, `db.xxxx.supabase.co:5432` also works. |
+| `JWT_SECRET` | a long random string | Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `JWT_EXPIRES_IN` | `7d` | How long a login session stays valid |
+| `FRONTEND_URL` | `http://localhost:5173` | For CORS — update to your Vercel URL after deploying |
+| `PORT` | `4000` | Local port for the API |
+
+Get your Supabase values from your project's **Connect** button → **ORM** tab → **Prisma**.
+
 ## 1. Create your free database (Supabase)
 1. Go to https://supabase.com → New Project (free tier).
 2. Once it's created: **Project Settings → Database → Connection string → URI**.
