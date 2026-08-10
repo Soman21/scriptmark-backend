@@ -1,0 +1,110 @@
+// ScriptMark database schema
+// Run `npx prisma migrate dev` after setting DATABASE_URL to generate tables.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  LECTURER
+  REVIEWER
+  ADMIN
+}
+
+enum SessionStatus {
+  DRAFT
+  ACTIVE
+  COMPLETED
+}
+
+enum ScriptStatus {
+  PENDING
+  DIGITIZED
+  REVIEWED
+  FLAGGED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(LECTURER)
+  createdAt    DateTime @default(now())
+
+  markingGuides  MarkingGuide[]
+  markingSessions MarkingSession[]
+}
+
+model MarkingGuide {
+  id          String   @id @default(cuid())
+  title       String
+  subject     String?
+  createdById String
+  createdBy   User     @relation(fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  questions Question[]
+  sessions  MarkingSession[]
+}
+
+model Question {
+  id           String  @id @default(cuid())
+  guideId      String
+  guide        MarkingGuide @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  text         String
+  modelAnswer  String
+  keywords     String   // comma-separated
+  maxMarks     Int
+  order        Int      @default(0)
+
+  scriptAnswers ScriptAnswer[]
+}
+
+model MarkingSession {
+  id          String        @id @default(cuid())
+  title       String
+  guideId     String?
+  guide       MarkingGuide? @relation(fields: [guideId], references: [id])
+  createdById String
+  createdBy   User          @relation(fields: [createdById], references: [id])
+  status      SessionStatus @default(DRAFT)
+  createdAt   DateTime      @default(now())
+
+  scripts Script[]
+}
+
+model Script {
+  id                String       @id @default(cuid())
+  sessionId         String
+  session           MarkingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  studentIdentifier String?
+  imageUrl          String?
+  ocrText           String?
+  ocrConfidence     Float?
+  status            ScriptStatus @default(PENDING)
+  totalScore        Float?
+  uploadedAt        DateTime     @default(now())
+
+  answers ScriptAnswer[]
+}
+
+model ScriptAnswer {
+  id              String   @id @default(cuid())
+  scriptId        String
+  script          Script   @relation(fields: [scriptId], references: [id], onDelete: Cascade)
+  questionId      String
+  question        Question @relation(fields: [questionId], references: [id])
+  extractedText   String?
+  suggestedScore  Float?
+  confirmedScore  Float?
+  reasoning       String?
+  confirmedAt     DateTime?
+}
