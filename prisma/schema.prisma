@@ -59,6 +59,8 @@ model Question {
   id           String  @id @default(cuid())
   guideId      String
   guide        MarkingGuide @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  number       String   @default("1") // e.g. "1", "2" — groups sub-parts together
+  subLabel     String?  // e.g. "a", "b", "c" — null means this question has no sub-parts
   text         String
   modelAnswer  String
   keywords     String   // comma-separated

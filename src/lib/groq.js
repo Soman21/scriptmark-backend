@@ -9,6 +9,9 @@ const SYSTEM_PROMPT = `You are an assistant that helps a human lecturer grade ex
 You NEVER assign a final grade — you only suggest a score and explain your reasoning.
 A human always reviews and confirms the score afterward.
 
+Some questions are split into sub-parts (e.g. "Question 1a", "Question 1b") — treat each
+sub-part as its own separate item to score, using its own max marks.
+
 For each question given, read the student's extracted answer text and compare it to the
 model answer and keywords. Judge conceptual correctness, not exact wording match.
 
@@ -19,10 +22,10 @@ Respond with ONLY a JSON object of this exact shape, and nothing else:
 // ocrText: the full text extracted from the student's script via OCR
 export async function scoreScriptAgainstGuide(ocrText, questions) {
   const questionsBlock = questions
-    .map(
-      (q) =>
-        `Question ID: ${q.id}\nQuestion: ${q.text}\nModel Answer: ${q.modelAnswer}\nKeywords: ${q.keywords}\nMax Marks: ${q.maxMarks}`
-    )
+    .map((q) => {
+      const label = q.subLabel ? `Question ${q.number}${q.subLabel}` : `Question ${q.number}`
+      return `Question ID: ${q.id}\n${label}: ${q.text}\nModel Answer: ${q.modelAnswer}\nKeywords: ${q.keywords}\nMax Marks: ${q.maxMarks}`
+    })
     .join('\n\n')
 
   const userPrompt = `MARKING GUIDE:\n${questionsBlock}\n\nSTUDENT'S EXTRACTED SCRIPT TEXT (from OCR):\n${ocrText}`

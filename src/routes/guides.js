@@ -41,6 +41,8 @@ router.post('/', async (req, res) => {
         createdById: req.user.id,
         questions: {
           create: questions.map((q, i) => ({
+            number: q.number || '1',
+            subLabel: q.subLabel || null,
             text: q.text || '',
             modelAnswer: q.modelAnswer || '',
             keywords: q.keywords || '',
