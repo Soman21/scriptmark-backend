@@ -8,7 +8,6 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
 }
 
 enum Role {
@@ -46,6 +45,7 @@ model MarkingGuide {
   id          String   @id @default(cuid())
   title       String
   subject     String?
+  isDraft     Boolean  @default(false)
   createdById String
   createdBy   User     @relation(fields: [createdById], references: [id])
   createdAt   DateTime @default(now())
@@ -72,7 +72,9 @@ model Question {
 
 model MarkingSession {
   id          String        @id @default(cuid())
-  title       String
+  title       String        // used as the course title on exported reports
+  department  String?
+  faculty     String?
   guideId     String?
   guide       MarkingGuide? @relation(fields: [guideId], references: [id])
   createdById String
@@ -87,15 +89,33 @@ model Script {
   id                String       @id @default(cuid())
   sessionId         String
   session           MarkingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  studentIdentifier String?
-  imageUrl          String?
-  ocrText           String?
-  ocrConfidence     Float?
+  studentIdentifier String?      // free-text fallback (kept for backward compatibility)
+  studentName       String?
+  regNumber         String?
+  caScore           Float?       // Continuous Assessment score, entered manually by the lecturer
+  imageUrl          String?      // first/primary page image, kept for quick preview
+  ocrText           String?      // combined OCR text across ALL pages of this script
+  ocrConfidence     Float?       // average confidence across pages
   status            ScriptStatus @default(PENDING)
   totalScore        Float?
   uploadedAt        DateTime     @default(now())
 
+  pages   ScriptPage[]
   answers ScriptAnswer[]
+}
+
+// A single physical page of a (possibly multi-page) exam script. A real exam script
+// can be 12+ pages; each page is uploaded and OCR'd separately, then combined onto
+// the parent Script's ocrText for scoring.
+model ScriptPage {
+  id            String   @id @default(cuid())
+  scriptId      String
+  script        Script   @relation(fields: [scriptId], references: [id], onDelete: Cascade)
+  pageNumber    Int
+  imageUrl      String
+  ocrText       String?
+  ocrConfidence Float?
+  createdAt     DateTime @default(now())
 }
 
 model ScriptAnswer {

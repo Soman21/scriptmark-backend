@@ -25,22 +25,28 @@ router.get('/:id', async (req, res) => {
 })
 
 // POST /api/guides - create a guide with its questions
-// body: { title, subject, questions: [{ text, modelAnswer, keywords, maxMarks }] }
+// body: { title, subject, questions: [{ text, modelAnswer, keywords, maxMarks }], isDraft }
+// When isDraft is true, validation is relaxed — an incomplete guide can still be saved
+// so the lecturer can come back and finish it later.
 router.post('/', async (req, res) => {
   try {
-    const { title, subject, questions } = req.body
+    const { title, subject, questions, isDraft } = req.body
 
-    if (!title || !Array.isArray(questions) || questions.length === 0) {
-      return res.status(400).json({ error: 'A title and at least one question are required.' })
+    if (!title) {
+      return res.status(400).json({ error: 'A title is required, even for a draft.' })
+    }
+    if (!isDraft && (!Array.isArray(questions) || questions.length === 0)) {
+      return res.status(400).json({ error: 'At least one question is required to publish.' })
     }
 
     const guide = await prisma.markingGuide.create({
       data: {
         title,
         subject,
+        isDraft: !!isDraft,
         createdById: req.user.id,
         questions: {
-          create: questions.map((q, i) => ({
+          create: (questions || []).map((q, i) => ({
             number: q.number || '1',
             subLabel: q.subLabel || null,
             text: q.text || '',
