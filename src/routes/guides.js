@@ -67,16 +67,38 @@ router.post('/', async (req, res) => {
   }
 })
 
-// PUT /api/guides/:id
+// PUT /api/guides/:id - full edit: title, subject, isDraft, and replace all questions.
+// Note: replacing questions deletes the old ones (cascade removes any ScriptAnswer
+// rows tied to them). This is fine for guides not yet used to score scripts, but
+// editing a guide that already has scored scripts will clear those links.
 router.put('/:id', async (req, res) => {
-  const { title, subject } = req.body
   try {
+    const { title, subject, isDraft, questions } = req.body
+
     const guide = await prisma.markingGuide.update({
       where: { id: req.params.id },
-      data: { title, subject },
+      data: {
+        title,
+        subject,
+        isDraft: !!isDraft,
+        questions: {
+          deleteMany: {},
+          create: (questions || []).map((q, i) => ({
+            number: q.number || '1',
+            subLabel: q.subLabel || null,
+            text: q.text || '',
+            modelAnswer: q.modelAnswer || '',
+            keywords: q.keywords || '',
+            maxMarks: Number(q.maxMarks) || 0,
+            order: i,
+          })),
+        },
+      },
+      include: { questions: { orderBy: { order: 'asc' } } },
     })
     res.json(guide)
   } catch (err) {
+    console.error(err)
     res.status(404).json({ error: 'Marking guide not found.' })
   }
 })

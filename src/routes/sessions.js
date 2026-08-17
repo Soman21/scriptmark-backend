@@ -6,6 +6,7 @@ import { requireAuth } from '../middleware/auth.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { extractTextFromImage } from '../lib/vision.js'
 import { computeGrade } from '../lib/grading.js'
+import { writeResultsPdf } from '../lib/pdfExport.js'
 
 const router = express.Router()
 router.use(requireAuth)
@@ -49,6 +50,35 @@ router.post('/', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not create marking session.' })
+  }
+})
+
+// GET /api/sessions/:id - a single session, including its linked guide (if any)
+router.get('/:id', async (req, res) => {
+  const session = await prisma.markingSession.findUnique({
+    where: { id: req.params.id },
+    include: { guide: { include: { questions: { orderBy: { order: 'asc' } } } } },
+  })
+  if (!session) return res.status(404).json({ error: 'Session not found.' })
+  res.json(session)
+})
+
+// PUT /api/sessions/:id - update a session (e.g. link a marking guide to it)
+router.put('/:id', async (req, res) => {
+  try {
+    const { title, department, faculty, guideId } = req.body
+    const session = await prisma.markingSession.update({
+      where: { id: req.params.id },
+      data: {
+        ...(title !== undefined ? { title } : {}),
+        ...(department !== undefined ? { department } : {}),
+        ...(faculty !== undefined ? { faculty } : {}),
+        ...(guideId !== undefined ? { guideId } : {}),
+      },
+    })
+    res.json(session)
+  } catch (err) {
+    res.status(404).json({ error: 'Session not found.' })
   }
 })
 
@@ -150,9 +180,20 @@ router.post('/:id/scripts', upload.single('image'), async (req, res) => {
   }
 })
 
-// PUT /api/sessions/scripts/:scriptId/ca-score - lecturer manually enters the
+// GET /api/sessions/scripts/:scriptId - a single script (used to resume an
+// in-progress multi-page scan after navigating away and coming back)
+router.get('/scripts/:scriptId', async (req, res) => {
+  const script = await prisma.script.findUnique({
+    where: { id: req.params.scriptId },
+    include: { pages: { orderBy: { pageNumber: 'asc' } }, answers: { include: { question: true } } },
+  })
+  if (!script) return res.status(404).json({ error: 'Script not found.' })
+  res.json(script)
+})
+
+// PUT /api/sessions/scripts/:scriptId/caScore - lecturer manually enters the
 // Continuous Assessment score for a student (separate from the exam script score).
-router.put('/scripts/:scriptId/ca-score', async (req, res) => {
+router.put('/scripts/:scriptId/caScore', async (req, res) => {
   try {
     const { caScore } = req.body
     const script = await prisma.script.update({
@@ -175,7 +216,7 @@ router.delete('/:id/scripts/:scriptId', async (req, res) => {
   }
 })
 
-// GET /api/sessions/:id/export - generate an Excel results sheet for the whole course/session
+// GET /api/sessions/:id/export?format=xlsx|pdf - generate a results report for the course/session
 router.get('/:id/export', async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
@@ -185,6 +226,16 @@ router.get('/:id/export', async (req, res) => {
       where: { sessionId: req.params.id },
       orderBy: { studentName: 'asc' },
     })
+
+    const format = req.query.format === 'pdf' ? 'pdf' : 'xlsx'
+    const safeName = session.title.replace(/[^a-z0-9]/gi, '_')
+
+    if (format === 'pdf') {
+      res.setHeader('Content-Type', 'application/pdf')
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}_results.pdf"`)
+      writeResultsPdf(res, session, scripts)
+      return
+    }
 
     const workbook = new ExcelJS.Workbook()
     const sheet = workbook.addWorksheet('Results')
@@ -228,7 +279,7 @@ router.get('/:id/export', async (req, res) => {
     })
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    res.setHeader('Content-Disposition', `attachment; filename="${session.title.replace(/[^a-z0-9]/gi, '_')}_results.xlsx"`)
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}_results.xlsx"`)
 
     await workbook.xlsx.write(res)
     res.end()

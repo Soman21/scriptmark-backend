@@ -8,43 +8,32 @@ Node.js + Express + Prisma (PostgreSQL) backend for ScriptMark.
 - PostgreSQL (via Supabase for both local dev and production)
 - JWT auth (`jsonwebtoken`) + `bcryptjs` for password hashing
 
-## Environment Variables
-Create a `.env` file in this folder with the following variables:
-
-| Variable | Example | Notes |
-|---|---|---|
-| `DATABASE_URL` | `postgresql://postgres.xxxx:PASSWORD@aws-1-eu-west-1.pooler.supabase.com:6543/postgres?pgbouncer=true` | Supabase pooled connection — used by the running app |
-| `DIRECT_URL` | `postgresql://postgres.xxxx:PASSWORD@aws-1-eu-west-1.pooler.supabase.com:5432/postgres` | Supabase session pooler (port 5432) — used only for migrations. If your network supports IPv6, `db.xxxx.supabase.co:5432` also works. |
-| `JWT_SECRET` | a long random string | Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
-| `JWT_EXPIRES_IN` | `7d` | How long a login session stays valid |
-| `FRONTEND_URL` | `http://localhost:5173` | For CORS — update to your Vercel URL after deploying |
-| `PORT` | `4000` | Local port for the API |
-
-Get your Supabase values from your project's **Connect** button → **ORM** tab → **Prisma**.
-
 ## 1. Create your free database (Supabase)
 1. Go to https://supabase.com → New Project (free tier).
-2. Once it's created: **Project Settings → Database → Connection string → URI**.
-3. Copy the "Transaction" pooled connection string — it looks like:
-   `postgresql://postgres.xxxx:[PASSWORD]@aws-0-xxxx.pooler.supabase.com:6543/postgres`
-4. You'll use this **same connection string locally and in production** — there's
-   only one database, so your local dev and your deployed app share data
-   (fine for a student project; you can create a second Supabase project
-   later if you want separate dev/prod databases).
+2. Click the **Connect** button at the top of your project → **ORM** tab → **Prisma** to get your connection strings.
+3. You'll need both the pooled connection (port 6543) and a session/direct connection (port 5432, for migrations).
 
-## 2. Configure environment variables
-```bash
-cp .env.example .env
-```
-Fill in:
-- `DATABASE_URL` — the Supabase connection string from step 1
-- `JWT_SECRET` — generate one with:
-  ```bash
-  node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-  ```
-- `FRONTEND_URL` — `http://localhost:5173` for now
+## 2. Set up Storage (for script images) and Vision OCR credentials
+1. In Supabase: **Storage** → New bucket → name it exactly `script-images` → make it Public.
+2. In Supabase: **Settings → API Keys → "Publishable and secret API keys"** → copy the **Secret key** (`sb_secret_...`).
+3. In Google Cloud Console: create a project → enable the **Cloud Vision API** → create a Service Account → generate a JSON key → download it.
 
-## 3. Install dependencies and create the database tables
+## 3. Configure environment variables
+Create a file named `.env` in this folder (there's no `.env.example` template — the values below are sensitive, so they're documented here instead) with:
+
+| Variable | Example / where to get it |
+|---|---|
+| `DATABASE_URL` | Supabase pooled connection string (port 6543) |
+| `DIRECT_URL` | Supabase session pooler connection string (port 5432) |
+| `JWT_SECRET` | Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `JWT_EXPIRES_IN` | `7d` |
+| `FRONTEND_URL` | `http://localhost:5173` (update after deploying) |
+| `PORT` | `4000` |
+| `SUPABASE_URL` | `https://[your-project-ref].supabase.co` |
+| `SUPABASE_SECRET_KEY` | The Secret key from step 2 above |
+| `GOOGLE_CREDENTIALS_JSON` | The entire contents of your downloaded `.json` key file, minified to one line, wrapped in single quotes: `GOOGLE_CREDENTIALS_JSON='{"type":"service_account",...}'` |
+
+## 4. Install dependencies and create the database tables
 ```bash
 npm install
 npx prisma migrate dev --name init
@@ -58,7 +47,7 @@ Optional — open a visual browser of your tables:
 npx prisma studio
 ```
 
-## 4. Run the API locally
+## 5. Run the API locally
 ```bash
 npm run dev
 ```
@@ -78,16 +67,14 @@ curl http://localhost:4000/api/health
 | GET | `/api/sessions` | Yes | List marking sessions |
 | POST | `/api/sessions` | Yes | Create a marking session |
 | GET | `/api/sessions/:id/scripts` | Yes | List scripts in a session |
-| POST | `/api/sessions/:id/scripts` | Yes | Register a scanned script |
+| POST | `/api/sessions/:id/scripts` | Yes | Upload a script image (`multipart/form-data`, field `image`) — runs OCR automatically and saves extracted text |
 | PUT | `/api/results/:answerId/confirm` | Yes | Lecturer confirms/edits a score |
 | PUT | `/api/results/scripts/:scriptId/flag` | Yes | Flag a script for review |
 
 Send the JWT on protected routes as: `Authorization: Bearer <token>`
 
-## Not built yet (next phases)
-- Google Cloud Vision OCR integration (script image → text)
-- LLM scoring integration (compare extracted text to marking guide)
-- File/image upload & storage (scripts are currently just URLs/text in the DB)
+## Not built yet (next phase)
+- LLM scoring integration (compare extracted OCR text to the marking guide and suggest a score)
 
 ## Deploying later (Railway)
 1. Push this backend folder to its own GitHub repo (or a `backend/` folder

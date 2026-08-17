@@ -1,8 +1,7 @@
-import { scoreScriptAgainstGuide } from '../lib/groq.js'
 import express from 'express'
 import prisma from '../lib/prisma.js'
 import { requireAuth } from '../middleware/auth.js'
-
+import { scoreScriptAgainstGuide } from '../lib/groq.js'
 
 const router = express.Router()
 router.use(requireAuth)
@@ -74,7 +73,6 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
     res.status(500).json({ error: 'Could not score this script: ' + err.message })
   }
 })
-
 
 // PUT /api/results/:answerId/confirm - lecturer confirms/edits a suggested score
 // This is the "human-in-the-loop" step: body { confirmedScore, reasoning? }
