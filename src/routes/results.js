@@ -75,7 +75,6 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
 })
 
 // PUT /api/results/:answerId/confirm - lecturer confirms/edits a suggested score
-// This is the "human-in-the-loop" step: body { confirmedScore, reasoning? }
 router.put('/:answerId/confirm', async (req, res) => {
   try {
     const { confirmedScore, extractedText } = req.body
@@ -89,7 +88,6 @@ router.put('/:answerId/confirm', async (req, res) => {
       },
     })
 
-    // Recompute the script's total from all confirmed answers
     const allAnswers = await prisma.scriptAnswer.findMany({
       where: { scriptId: answer.scriptId },
     })

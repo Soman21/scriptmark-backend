@@ -6,6 +6,7 @@ import authRoutes from './routes/auth.js'
 import guideRoutes from './routes/guides.js'
 import sessionRoutes from './routes/sessions.js'
 import resultRoutes from './routes/results.js'
+import assistantRoutes from './routes/assistant.js'
 
 const app = express()
 
@@ -22,8 +23,8 @@ app.use('/api/auth', authRoutes)
 app.use('/api/guides', guideRoutes)
 app.use('/api/sessions', sessionRoutes)
 app.use('/api/results', resultRoutes)
+app.use('/api/assistant', assistantRoutes)
 
-// Fallback error handler
 app.use((err, req, res, next) => {
   console.error(err)
   res.status(500).json({ error: 'Unexpected server error.' })

@@ -5,83 +5,61 @@ Node.js + Express + Prisma (PostgreSQL) backend for ScriptMark.
 ## Stack
 - Express (REST API)
 - Prisma ORM
-- PostgreSQL (via Supabase for both local dev and production)
-- JWT auth (`jsonwebtoken`) + `bcryptjs` for password hashing
+- PostgreSQL (via Supabase)
+- JWT auth + bcryptjs for password hashing
+- Google Cloud Vision (OCR)
+- Groq (Llama 3.3 70B) for LLM scoring and student info extraction
+- Supabase Storage (script images)
+- ExcelJS + PDFKit (results export)
 
-## 1. Create your free database (Supabase)
-1. Go to https://supabase.com → New Project (free tier).
-2. Click the **Connect** button at the top of your project → **ORM** tab → **Prisma** to get your connection strings.
-3. You'll need both the pooled connection (port 6543) and a session/direct connection (port 5432, for migrations).
+## 1. Database (Supabase)
+Create a free project at supabase.com. Use the Connect button, ORM tab, Prisma,
+to get your connection strings (pooled for `DATABASE_URL`, session pooler on
+port 5432 for `DIRECT_URL`).
 
-## 2. Set up Storage (for script images) and Vision OCR credentials
-1. In Supabase: **Storage** → New bucket → name it exactly `script-images` → make it Public.
-2. In Supabase: **Settings → API Keys → "Publishable and secret API keys"** → copy the **Secret key** (`sb_secret_...`).
-3. In Google Cloud Console: create a project → enable the **Cloud Vision API** → create a Service Account → generate a JSON key → download it.
+## 2. Storage and OCR/LLM credentials
+1. Supabase: Storage, New bucket named exactly `script-images`, make it Public.
+2. Supabase: Settings, API Keys, "Publishable and secret API keys", copy the Secret key.
+3. Google Cloud Console: enable the Cloud Vision API, create a Service Account, download its JSON key.
+4. Groq Console (console.groq.com): create a free API key.
 
-## 3. Configure environment variables
-Create a file named `.env` in this folder (there's no `.env.example` template — the values below are sensitive, so they're documented here instead) with:
+## 3. Environment variables
+Create a `.env` file in this folder with:
 
-| Variable | Example / where to get it |
+| Variable | Notes |
 |---|---|
-| `DATABASE_URL` | Supabase pooled connection string (port 6543) |
-| `DIRECT_URL` | Supabase session pooler connection string (port 5432) |
+| `DATABASE_URL` | Supabase pooled connection (port 6543) |
+| `DIRECT_URL` | Supabase session pooler connection (port 5432) |
 | `JWT_SECRET` | Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | `JWT_EXPIRES_IN` | `7d` |
 | `FRONTEND_URL` | `http://localhost:5173` (update after deploying) |
 | `PORT` | `4000` |
 | `SUPABASE_URL` | `https://[your-project-ref].supabase.co` |
-| `SUPABASE_SECRET_KEY` | The Secret key from step 2 above |
-| `GOOGLE_CREDENTIALS_JSON` | The entire contents of your downloaded `.json` key file, minified to one line, wrapped in single quotes: `GOOGLE_CREDENTIALS_JSON='{"type":"service_account",...}'` |
+| `SUPABASE_SECRET_KEY` | From step 2 |
+| `GOOGLE_CREDENTIALS_JSON` | Entire contents of the downloaded `.json` key, minified to one line, single quoted |
+| `GROQ_API_KEY` | From Groq console |
 
-## 4. Install dependencies and create the database tables
+## 4. Install and migrate
 ```bash
 npm install
 npx prisma migrate dev --name init
-```
-This reads `prisma/schema.prisma` and creates the actual tables (User,
-MarkingGuide, Question, MarkingSession, Script, ScriptAnswer) in your
-Supabase database.
-
-Optional — open a visual browser of your tables:
-```bash
-npx prisma studio
-```
-
-## 5. Run the API locally
-```bash
 npm run dev
 ```
-It starts on `http://localhost:4000`. Check it's alive:
-```bash
-curl http://localhost:4000/api/health
-```
+Runs on `http://localhost:4000`. Check with `curl http://localhost:4000/api/health`.
 
-## API routes so far
-| Method | Route | Auth? | Purpose |
-|---|---|---|---|
-| POST | `/api/auth/signup` | No | Create account, returns JWT |
-| POST | `/api/auth/login` | No | Log in, returns JWT |
-| GET | `/api/guides` | Yes | List all marking guides |
-| POST | `/api/guides` | Yes | Create a marking guide + questions |
-| GET | `/api/guides/:id` | Yes | Get one guide with its questions |
-| GET | `/api/sessions` | Yes | List marking sessions |
-| POST | `/api/sessions` | Yes | Create a marking session |
-| GET | `/api/sessions/:id/scripts` | Yes | List scripts in a session |
-| POST | `/api/sessions/:id/scripts` | Yes | Upload a script image (`multipart/form-data`, field `image`) — runs OCR automatically and saves extracted text |
-| PUT | `/api/results/:answerId/confirm` | Yes | Lecturer confirms/edits a score |
-| PUT | `/api/results/scripts/:scriptId/flag` | Yes | Flag a script for review |
+## What this backend does
+- Auth (signup/login, JWT, bcrypt)
+- Marking guides with numbered questions and optional lettered subparts (1a, 1b...), draft/publish
+- Marking sessions (course/exam) with department and faculty
+- Multi page script uploads: each page OCR'd via Google Vision, combined per script
+- Automatic student name/reg number detection from the front page (Groq), with manual override
+- LLM scoring of a script against a marking guide (Groq, Llama 3.3 70B) — always a suggestion, never final
+- Human confirmation of scores (updates status to REVIEWED)
+- Continuous Assessment score entry per student
+- Excel and PDF export of a session's results, with course/department/faculty header and computed grades
 
-Send the JWT on protected routes as: `Authorization: Bearer <token>`
-
-## Not built yet (next phase)
-- LLM scoring integration (compare extracted OCR text to the marking guide and suggest a score)
-
-## Deploying later (Railway)
-1. Push this backend folder to its own GitHub repo (or a `backend/` folder
-   in a monorepo).
-2. On https://railway.app → New Project → Deploy from GitHub repo.
-3. Add the same environment variables (`DATABASE_URL`, `JWT_SECRET`,
-   `FRONTEND_URL` — set this to your real Vercel URL once you have it).
-4. Railway will run `npm install` then `npm start` automatically.
-5. Copy the Railway-generated URL and put it in the frontend's
-   `VITE_API_URL` environment variable on Vercel.
+## Not built yet
+- OTP based two factor login
+- AI assistant chat with voice input/output
+- Role based UI/API restrictions (Lecturer/Reviewer/Admin) — `requireRole()` exists in
+  `src/middleware/auth.js` but is not yet applied to any route

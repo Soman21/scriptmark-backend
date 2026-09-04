@@ -27,7 +27,6 @@ function drawTableHeader(doc, y) {
   return y + ROW_HEIGHT
 }
 
-// Writes a results report as a PDF directly to the given writable stream (res).
 export function writeResultsPdf(res, session, scripts) {
   const doc = new PDFDocument({ margin: LEFT_MARGIN, size: 'A4' })
   doc.pipe(res)

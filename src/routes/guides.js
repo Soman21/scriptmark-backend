@@ -5,16 +5,14 @@ import { requireAuth } from '../middleware/auth.js'
 const router = express.Router()
 router.use(requireAuth)
 
-// GET /api/guides - list all guides created by anyone in the institution
 router.get('/', async (req, res) => {
   const guides = await prisma.markingGuide.findMany({
-    include: { questions: true, createdBy: { select: { name: true } } },
+    include: { questions: { orderBy: { order: 'asc' } }, createdBy: { select: { name: true } } },
     orderBy: { updatedAt: 'desc' },
   })
   res.json(guides)
 })
 
-// GET /api/guides/:id
 router.get('/:id', async (req, res) => {
   const guide = await prisma.markingGuide.findUnique({
     where: { id: req.params.id },
@@ -25,9 +23,7 @@ router.get('/:id', async (req, res) => {
 })
 
 // POST /api/guides - create a guide with its questions
-// body: { title, subject, questions: [{ text, modelAnswer, keywords, maxMarks }], isDraft }
-// When isDraft is true, validation is relaxed — an incomplete guide can still be saved
-// so the lecturer can come back and finish it later.
+// body: { title, subject, questions, isDraft }
 router.post('/', async (req, res) => {
   try {
     const { title, subject, questions, isDraft } = req.body
@@ -68,9 +64,6 @@ router.post('/', async (req, res) => {
 })
 
 // PUT /api/guides/:id - full edit: title, subject, isDraft, and replace all questions.
-// Note: replacing questions deletes the old ones (cascade removes any ScriptAnswer
-// rows tied to them). This is fine for guides not yet used to score scripts, but
-// editing a guide that already has scored scripts will clear those links.
 router.put('/:id', async (req, res) => {
   try {
     const { title, subject, isDraft, questions } = req.body
@@ -103,7 +96,6 @@ router.put('/:id', async (req, res) => {
   }
 })
 
-// DELETE /api/guides/:id
 router.delete('/:id', async (req, res) => {
   try {
     await prisma.markingGuide.delete({ where: { id: req.params.id } })

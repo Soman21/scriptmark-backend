@@ -7,18 +7,16 @@ import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { extractTextFromImage } from '../lib/vision.js'
 import { computeGrade } from '../lib/grading.js'
 import { writeResultsPdf } from '../lib/pdfExport.js'
+import { extractStudentInfo } from '../lib/groq.js'
 
 const router = express.Router()
 router.use(requireAuth)
 
-// Keep uploaded files in memory briefly, then forward straight to Supabase Storage —
-// we never write them to disk on the server.
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB per page image
+  limits: { fileSize: 10 * 1024 * 1024 },
 })
 
-// GET /api/sessions - list marking sessions
 router.get('/', async (req, res) => {
   const sessions = await prisma.markingSession.findMany({
     include: {
@@ -30,7 +28,6 @@ router.get('/', async (req, res) => {
   res.json(sessions)
 })
 
-// POST /api/sessions - create a new marking session ("Start Scanning Session")
 router.post('/', async (req, res) => {
   try {
     const { title, guideId, department, faculty } = req.body
@@ -53,7 +50,6 @@ router.post('/', async (req, res) => {
   }
 })
 
-// GET /api/sessions/:id - a single session, including its linked guide (if any)
 router.get('/:id', async (req, res) => {
   const session = await prisma.markingSession.findUnique({
     where: { id: req.params.id },
@@ -63,7 +59,6 @@ router.get('/:id', async (req, res) => {
   res.json(session)
 })
 
-// PUT /api/sessions/:id - update a session (e.g. link a marking guide to it)
 router.put('/:id', async (req, res) => {
   try {
     const { title, department, faculty, guideId } = req.body
@@ -82,7 +77,33 @@ router.put('/:id', async (req, res) => {
   }
 })
 
-// GET /api/sessions/:id/scripts - scripts within a session, in upload order
+router.get('/scripts/:scriptId', async (req, res) => {
+  const script = await prisma.script.findUnique({
+    where: { id: req.params.scriptId },
+    include: { pages: { orderBy: { pageNumber: 'asc' } }, answers: { include: { question: true } } },
+  })
+  if (!script) return res.status(404).json({ error: 'Script not found.' })
+  res.json(script)
+})
+
+router.put('/scripts/:scriptId/studentInfo', async (req, res) => {
+  try {
+    const { studentName, regNumber } = req.body
+    const identifier = [studentName, regNumber].filter(Boolean).join(' — ') || null
+    const script = await prisma.script.update({
+      where: { id: req.params.scriptId },
+      data: {
+        studentName: studentName || null,
+        regNumber: regNumber || null,
+        studentIdentifier: identifier,
+      },
+    })
+    res.json(script)
+  } catch (err) {
+    res.status(404).json({ error: 'Script not found.' })
+  }
+})
+
 router.get('/:id/scripts', async (req, res) => {
   const scripts = await prisma.script.findMany({
     where: { sessionId: req.params.id },
@@ -96,15 +117,8 @@ router.get('/:id/scripts', async (req, res) => {
 })
 
 // POST /api/sessions/:id/scripts - upload a page of a script.
-//
-// A real exam script is often many pages. To support that:
-// - If the request includes an existing "scriptId", the uploaded image is treated
-//   as the NEXT PAGE of that script — its OCR text is appended to the script's
-//   combined ocrText, rather than creating a brand new script.
-// - If no "scriptId" is given, a brand new Script (and its first page) is created.
-//
-// multipart/form-data fields: image (required), scriptId (optional),
-// studentName, regNumber (optional, only used when creating a new script)
+// studentName/regNumber are OPTIONAL when starting a new script — if left blank,
+// the system tries to read them automatically from the front page's OCR text.
 router.post('/:id/scripts', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
@@ -115,10 +129,12 @@ router.post('/:id/scripts', upload.single('image'), async (req, res) => {
     const imageUrl = await uploadScriptImage(req.file.buffer, req.file.originalname, req.file.mimetype)
 
     let script
+    let isFirstPageOfNewScript = false
     if (scriptId) {
       script = await prisma.script.findFirst({ where: { id: scriptId, sessionId: req.params.id } })
       if (!script) return res.status(404).json({ error: 'That script was not found in this session.' })
     } else {
+      isFirstPageOfNewScript = true
       const identifier = [studentName, regNumber].filter(Boolean).join(' — ') || null
       script = await prisma.script.create({
         data: {
@@ -126,7 +142,7 @@ router.post('/:id/scripts', upload.single('image'), async (req, res) => {
           studentName: studentName || null,
           regNumber: regNumber || null,
           studentIdentifier: identifier,
-          imageUrl, // first page doubles as the preview image
+          imageUrl,
           status: 'PENDING',
         },
       })
@@ -135,7 +151,6 @@ router.post('/:id/scripts', upload.single('image'), async (req, res) => {
     const existingPageCount = await prisma.scriptPage.count({ where: { scriptId: script.id } })
     const pageNumber = existingPageCount + 1
 
-    // Run OCR on this specific page
     let pageText = ''
     let pageConfidence = 0
     try {
@@ -158,8 +173,24 @@ router.post('/:id/scripts', upload.single('image'), async (req, res) => {
       data: { scriptId: script.id, pageNumber, imageUrl, ocrText: pageText, ocrConfidence: pageConfidence },
     })
 
-    // Recombine ALL pages' text in order into the script's single ocrText field,
-    // which is what gets sent to the LLM for scoring.
+    // Front page of a brand new script, no name/reg typed in: try to read them
+    // automatically from the OCR text. Never overrides a value already typed in.
+    let detected = null
+    if (isFirstPageOfNewScript && !studentName && !regNumber) {
+      detected = await extractStudentInfo(pageText)
+      if (detected.name || detected.regNumber) {
+        const identifier = [detected.name, detected.regNumber].filter(Boolean).join(' — ') || null
+        await prisma.script.update({
+          where: { id: script.id },
+          data: {
+            studentName: detected.name,
+            regNumber: detected.regNumber,
+            studentIdentifier: identifier,
+          },
+        })
+      }
+    }
+
     const allPages = await prisma.scriptPage.findMany({
       where: { scriptId: script.id },
       orderBy: { pageNumber: 'asc' },
@@ -173,26 +204,13 @@ router.post('/:id/scripts', upload.single('image'), async (req, res) => {
       include: { pages: { orderBy: { pageNumber: 'asc' } } },
     })
 
-    res.status(201).json(updated)
+    res.status(201).json({ script: updated, detectedStudentInfo: detected })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not process the uploaded page.' })
   }
 })
 
-// GET /api/sessions/scripts/:scriptId - a single script (used to resume an
-// in-progress multi-page scan after navigating away and coming back)
-router.get('/scripts/:scriptId', async (req, res) => {
-  const script = await prisma.script.findUnique({
-    where: { id: req.params.scriptId },
-    include: { pages: { orderBy: { pageNumber: 'asc' } }, answers: { include: { question: true } } },
-  })
-  if (!script) return res.status(404).json({ error: 'Script not found.' })
-  res.json(script)
-})
-
-// PUT /api/sessions/scripts/:scriptId/caScore - lecturer manually enters the
-// Continuous Assessment score for a student (separate from the exam script score).
 router.put('/scripts/:scriptId/caScore', async (req, res) => {
   try {
     const { caScore } = req.body
@@ -206,7 +224,6 @@ router.put('/scripts/:scriptId/caScore', async (req, res) => {
   }
 })
 
-// DELETE /api/sessions/:id/scripts/:scriptId - discard a scanned script (all its pages go too)
 router.delete('/:id/scripts/:scriptId', async (req, res) => {
   try {
     await prisma.script.delete({ where: { id: req.params.scriptId } })
@@ -216,7 +233,6 @@ router.delete('/:id/scripts/:scriptId', async (req, res) => {
   }
 })
 
-// GET /api/sessions/:id/export?format=xlsx|pdf - generate a results report for the course/session
 router.get('/:id/export', async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
@@ -240,7 +256,6 @@ router.get('/:id/export', async (req, res) => {
     const workbook = new ExcelJS.Workbook()
     const sheet = workbook.addWorksheet('Results')
 
-    // Header block: course title, department, faculty
     sheet.mergeCells('A1:F1')
     sheet.getCell('A1').value = session.title
     sheet.getCell('A1').font = { size: 16, bold: true }
@@ -250,7 +265,6 @@ router.get('/:id/export', async (req, res) => {
     sheet.mergeCells('A3:F3')
     sheet.getCell('A3').value = `Faculty: ${session.faculty || '—'}`
 
-    // Blank row, then table header
     sheet.addRow([])
     sheet.addRow(['Student Name', 'Reg Number', 'CA Score', 'Exam Score', 'Total', 'Grade'])
     const tableHeaderRow = sheet.lastRow
