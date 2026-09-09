@@ -28,3 +28,4 @@ export async function sendEmail({ to, subject, html }) {
 export function sixDigitCode() {
   return String(Math.floor(100000 + Math.random() * 900000))
 }
+// Testing deployment
