@@ -2,6 +2,7 @@ import express from 'express'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import prisma from '../lib/prisma.js'
+import { sendEmail, sixDigitCode } from '../lib/email.js'
 
 const router = express.Router()
 
@@ -74,6 +75,92 @@ router.post('/login', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Something went wrong logging you in.' })
+  }
+})
+
+
+// --- Forgot password ---
+// POST /api/auth/forgotPassword - body: { email }
+// Always responds the same way whether or not the email exists, so an
+// attacker can't use this to discover which emails have accounts.
+router.post('/forgotPassword', async (req, res) => {
+  try {
+    const { email } = req.body
+    if (!email) return res.status(400).json({ error: 'Email is required.' })
+
+    const user = await prisma.user.findUnique({ where: { email } })
+    if (user) {
+      const code = sixDigitCode()
+      const codeHash = await bcrypt.hash(code, 10)
+      await prisma.verificationCode.create({
+        data: {
+          userId: user.id,
+          codeHash,
+          purpose: 'PASSWORD_RESET',
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000), // 15 minutes
+        },
+      })
+
+      try {
+        await sendEmail({
+          to: user.email,
+          subject: 'Your ScriptMark password reset code',
+          html: `<p>Hi ${user.name},</p><p>Your password reset code is:</p><p style="font-size:28px;font-weight:bold;letter-spacing:4px;">${code}</p><p>This code expires in 15 minutes. If you did not request this, you can ignore this email.</p>`,
+        })
+      } catch (emailErr) {
+        console.error('Failed to send reset email:', emailErr)
+      }
+    }
+
+    res.json({ message: 'If that email has an account, a reset code has been sent.' })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Something went wrong.' })
+  }
+})
+
+// POST /api/auth/resetPassword - body: { email, code, newPassword }
+router.post('/resetPassword', async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ error: 'Email, code, and new password are all required.' })
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters.' })
+    }
+
+    const user = await prisma.user.findUnique({ where: { email } })
+    if (!user) {
+      return res.status(400).json({ error: 'Invalid or expired code.' })
+    }
+
+    const recentCodes = await prisma.verificationCode.findMany({
+      where: { userId: user.id, purpose: 'PASSWORD_RESET', used: false, expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'desc' },
+      take: 5,
+    })
+
+    let matchedCode = null
+    for (const c of recentCodes) {
+      if (await bcrypt.compare(code, c.codeHash)) {
+        matchedCode = c
+        break
+      }
+    }
+
+    if (!matchedCode) {
+      return res.status(400).json({ error: 'Invalid or expired code.' })
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10)
+    await prisma.user.update({ where: { id: user.id }, data: { passwordHash } })
+    await prisma.verificationCode.update({ where: { id: matchedCode.id }, data: { used: true } })
+
+    res.json({ message: 'Password updated. You can now log in with your new password.' })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Something went wrong.' })
   }
 })
 

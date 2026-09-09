@@ -39,32 +39,27 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
         where: { scriptId: script.id, questionId: r.questionId },
       })
 
+      const answerData = {
+        suggestedScore: r.suggestedScore,
+        reasoning: r.reasoning,
+        confidence: r.confidence || null,
+        extractedText: r.answerText || script.ocrText,
+      }
+
       const answer = existing
-        ? await prisma.scriptAnswer.update({
-            where: { id: existing.id },
-            data: {
-              suggestedScore: r.suggestedScore,
-              reasoning: r.reasoning,
-              extractedText: script.ocrText,
-            },
-          })
+        ? await prisma.scriptAnswer.update({ where: { id: existing.id }, data: answerData })
         : await prisma.scriptAnswer.create({
-            data: {
-              scriptId: script.id,
-              questionId: r.questionId,
-              suggestedScore: r.suggestedScore,
-              reasoning: r.reasoning,
-              extractedText: script.ocrText,
-            },
+            data: { scriptId: script.id, questionId: r.questionId, ...answerData },
           })
 
       savedAnswers.push(answer)
     }
 
     const totalSuggested = savedAnswers.reduce((sum, a) => sum + (a.suggestedScore || 0), 0)
+    const hasLowConfidence = savedAnswers.some((a) => a.confidence === 'low')
     const updatedScript = await prisma.script.update({
       where: { id: script.id },
-      data: { totalScore: totalSuggested },
+      data: { totalScore: totalSuggested, hasLowConfidenceScore: hasLowConfidence },
     })
 
     res.json({ script: updatedScript, answers: savedAnswers, questions: guide.questions })

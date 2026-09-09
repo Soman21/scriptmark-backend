@@ -1,6 +1,3 @@
-// ScriptMark database schema
-// Run `npx prisma migrate dev` after setting DATABASE_URL to generate tables.
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,6 +5,7 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 enum Role {
@@ -25,6 +23,7 @@ enum SessionStatus {
 enum ScriptStatus {
   PENDING
   DIGITIZED
+  SCORED
   REVIEWED
   FLAGGED
 }
@@ -37,8 +36,22 @@ model User {
   role         Role     @default(LECTURER)
   createdAt    DateTime @default(now())
 
-  markingGuides  MarkingGuide[]
-  markingSessions MarkingSession[]
+  markingGuides    MarkingGuide[]
+  markingSessions  MarkingSession[]
+  verificationCodes VerificationCode[]
+}
+
+// Reusable "send a code, verify it" mechanism — used for password reset now,
+// and for OTP login later, distinguished by purpose.
+model VerificationCode {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String
+  purpose   String   // "PASSWORD_RESET" | "LOGIN_OTP"
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
 }
 
 model MarkingGuide {
@@ -56,23 +69,23 @@ model MarkingGuide {
 }
 
 model Question {
-  id           String  @id @default(cuid())
-  guideId      String
-  guide        MarkingGuide @relation(fields: [guideId], references: [id], onDelete: Cascade)
-  number       String   @default("1") // e.g. "1", "2" — groups sub-parts together
-  subLabel     String?  // e.g. "a", "b", "c" — null means this question has no sub-parts
-  text         String
-  modelAnswer  String
-  keywords     String   // comma-separated
-  maxMarks     Int
-  order        Int      @default(0)
+  id          String       @id @default(cuid())
+  guideId     String
+  guide       MarkingGuide @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  number      String       @default("1")
+  subLabel    String?
+  text        String
+  modelAnswer String
+  keywords    String
+  maxMarks    Int
+  order       Int          @default(0)
 
   scriptAnswers ScriptAnswer[]
 }
 
 model MarkingSession {
   id          String        @id @default(cuid())
-  title       String        // used as the course title on exported reports
+  title       String
   department  String?
   faculty     String?
   guideId     String?
@@ -86,27 +99,26 @@ model MarkingSession {
 }
 
 model Script {
-  id                String       @id @default(cuid())
-  sessionId         String
-  session           MarkingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  studentIdentifier String?      // free-text fallback (kept for backward compatibility)
-  studentName       String?
-  regNumber         String?
-  caScore           Float?       // Continuous Assessment score, entered manually by the lecturer
-  imageUrl          String?      // first/primary page image, kept for quick preview
-  ocrText           String?      // combined OCR text across ALL pages of this script
-  ocrConfidence     Float?       // average confidence across pages
-  status            ScriptStatus @default(PENDING)
-  totalScore        Float?
-  uploadedAt        DateTime     @default(now())
+  id                    String       @id @default(cuid())
+  sessionId             String
+  session               MarkingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  studentIdentifier     String?
+  studentName           String?
+  regNumber             String?
+  caScore               Float?
+  imageUrl              String?
+  ocrText               String?
+  ocrConfidence         Float?
+  status                ScriptStatus @default(PENDING)
+  totalScore            Float?
+  hasLowConfidenceScore Boolean      @default(false)
+  uploadedAt            DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
 
   pages   ScriptPage[]
   answers ScriptAnswer[]
 }
 
-// A single physical page of a (possibly multi-page) exam script. A real exam script
-// can be 12+ pages; each page is uploaded and OCR'd separately, then combined onto
-// the parent Script's ocrText for scoring.
 model ScriptPage {
   id            String   @id @default(cuid())
   scriptId      String
@@ -119,14 +131,15 @@ model ScriptPage {
 }
 
 model ScriptAnswer {
-  id              String   @id @default(cuid())
-  scriptId        String
-  script          Script   @relation(fields: [scriptId], references: [id], onDelete: Cascade)
-  questionId      String
-  question        Question @relation(fields: [questionId], references: [id])
-  extractedText   String?
-  suggestedScore  Float?
-  confirmedScore  Float?
-  reasoning       String?
-  confirmedAt     DateTime?
+  id             String    @id @default(cuid())
+  scriptId       String
+  script         Script    @relation(fields: [scriptId], references: [id], onDelete: Cascade)
+  questionId     String
+  question       Question  @relation(fields: [questionId], references: [id])
+  extractedText  String?
+  suggestedScore Float?
+  confidence     String?
+  confirmedScore Float?
+  reasoning      String?
+  confirmedAt    DateTime?
 }

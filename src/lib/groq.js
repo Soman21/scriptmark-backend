@@ -15,8 +15,16 @@ subpart as its own separate item to score, using its own max marks.
 For each question given, read the student's extracted answer text and compare it to the
 model answer and keywords. Judge conceptual correctness, not exact wording match.
 
+For each question, also copy out the specific portion of the student's text that answers
+THAT question (not the whole script) — this lets a human reviewer see exactly what you
+scored, side by side with the expected answer.
+
+Also rate your own confidence in the suggested score as "high", "medium", or "low".
+Use "low" whenever the student's answer is ambiguous, the OCR text looks garbled or
+incomplete, or the question and answer are hard to match up confidently.
+
 Respond with ONLY a JSON object of this exact shape, and nothing else:
-{"results": [{"questionId": "the question's id", "suggestedScore": number, "reasoning": "a short, specific explanation"}]}`
+{"results": [{"questionId": "the question's id", "suggestedScore": number, "answerText": "the relevant portion of the student's text for this question", "confidence": "high" | "medium" | "low", "reasoning": "a short, specific explanation"}]}`
 
 // questions: array of { id, number, subLabel, text, modelAnswer, keywords, maxMarks }
 // ocrText: the full text extracted from the student's script via OCR
