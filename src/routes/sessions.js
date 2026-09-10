@@ -339,6 +339,25 @@ router.post('/:id/scripts/bulkConfirm', async (req, res) => {
   }
 })
 
+// POST /api/sessions/:id/scripts/uploadPage - uploads ONE image and returns
+// its URL. Used when the lecturer rotates or crops a page in the split
+// review screen: the browser bakes the edit into a new image client-side,
+// then sends just that final result here. Untouched pages never hit this
+// route at all, so splitting/reviewing stays free of any extra cost unless
+// a page is actually edited.
+router.post('/:id/scripts/uploadPage', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No image was uploaded (expected field name "image").' })
+    }
+    const imageUrl = await uploadScriptImage(req.file.buffer, req.file.originalname || 'edited_page.png', req.file.mimetype || 'image/png')
+    res.json({ imageUrl })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not upload the edited page: ' + err.message })
+  }
+})
+
 // POST /api/sessions/:id/scripts/batchUpload - upload several separate files
 // in one go, where EACH FILE is already one individual student's complete
 // script: a single image, or a PDF (short or long) belonging to just that
