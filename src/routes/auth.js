@@ -67,6 +67,89 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password.' })
     }
 
+    // Password checks out, but the real login token isn't issued yet. A one
+    // time code goes to the user's email, and a short lived pending token
+    // (separate from a real session token, only good for completing this one
+    // OTP step) is returned so the frontend can carry it into /verifyOtp.
+    const code = sixDigitCode()
+    const codeHash = await bcrypt.hash(code, 10)
+    await prisma.verificationCode.create({
+      data: {
+        userId: user.id,
+        codeHash,
+        purpose: 'OTP_LOGIN',
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
+      },
+    })
+
+    try {
+      await sendEmail({
+        to: user.email,
+        subject: 'Your ScriptMark login code',
+        html: `<p>Hi ${user.name},</p><p>Your login code is:</p><p style="font-size:28px;font-weight:bold;letter-spacing:4px;">${code}</p><p>This code expires in 10 minutes. If this was not you, you can ignore this email and your password will stay unchanged.</p>`,
+      })
+    } catch (emailErr) {
+      console.error('Failed to send login code email:', emailErr)
+      return res.status(500).json({ error: 'Could not send a login code right now. Please try again shortly.' })
+    }
+
+    const pendingToken = jwt.sign({ userId: user.id, purpose: 'otp_pending' }, process.env.JWT_SECRET, {
+      expiresIn: '10m',
+    })
+
+    res.json({ otpRequired: true, pendingToken, email: user.email })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Something went wrong logging you in.' })
+  }
+})
+
+// POST /api/auth/verifyOtp - body: { pendingToken, code }
+// Completes login: checks the pending token is genuine and not expired,
+// checks the code matches a recent unused OTP_LOGIN code for that user, then
+// issues the real session token.
+router.post('/verifyOtp', async (req, res) => {
+  try {
+    const { pendingToken, code } = req.body
+    if (!pendingToken || !code) {
+      return res.status(400).json({ error: 'A login code is required.' })
+    }
+
+    let payload
+    try {
+      payload = jwt.verify(pendingToken, process.env.JWT_SECRET)
+    } catch {
+      return res.status(401).json({ error: 'This login attempt has expired. Please log in again.' })
+    }
+    if (payload.purpose !== 'otp_pending') {
+      return res.status(401).json({ error: 'This login attempt has expired. Please log in again.' })
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: payload.userId } })
+    if (!user) {
+      return res.status(401).json({ error: 'This login attempt has expired. Please log in again.' })
+    }
+
+    const recentCodes = await prisma.verificationCode.findMany({
+      where: { userId: user.id, purpose: 'OTP_LOGIN', used: false, expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'desc' },
+      take: 5,
+    })
+
+    let matchedCode = null
+    for (const c of recentCodes) {
+      if (await bcrypt.compare(code, c.codeHash)) {
+        matchedCode = c
+        break
+      }
+    }
+
+    if (!matchedCode) {
+      return res.status(400).json({ error: 'That code is incorrect or has expired.' })
+    }
+
+    await prisma.verificationCode.update({ where: { id: matchedCode.id }, data: { used: true } })
+
     const token = signToken(user)
     res.json({
       token,
@@ -74,7 +157,7 @@ router.post('/login', async (req, res) => {
     })
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'Something went wrong logging you in.' })
+    res.status(500).json({ error: 'Something went wrong verifying your code.' })
   }
 })
 
