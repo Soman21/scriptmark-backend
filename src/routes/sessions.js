@@ -2,7 +2,7 @@ import express from 'express'
 import multer from 'multer'
 import ExcelJS from 'exceljs'
 import prisma from '../lib/prisma.js'
-import { requireAuth } from '../middleware/auth.js'
+import { requireAuth, requireRole } from '../middleware/auth.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { extractTextFromImage } from '../lib/vision.js'
 import { computeGrade } from '../lib/grading.js'
@@ -39,7 +39,7 @@ router.get('/', async (req, res) => {
   res.json(sessions)
 })
 
-router.post('/', async (req, res) => {
+router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const { title, guideId, department, faculty } = req.body
     if (!title) return res.status(400).json({ error: 'A session title is required.' })
@@ -70,7 +70,7 @@ router.get('/:id', async (req, res) => {
   res.json(session)
 })
 
-router.put('/:id', async (req, res) => {
+router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const { title, department, faculty, guideId } = req.body
     const session = await prisma.markingSession.update({
@@ -97,7 +97,7 @@ router.get('/scripts/:scriptId', async (req, res) => {
   res.json(script)
 })
 
-router.put('/scripts/:scriptId/studentInfo', async (req, res) => {
+router.put('/scripts/:scriptId/studentInfo', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const { studentName, regNumber } = req.body
     const identifier = [studentName, regNumber].filter(Boolean).join(' — ') || null
@@ -130,7 +130,7 @@ router.get('/:id/scripts', async (req, res) => {
 // POST /api/sessions/:id/scripts - upload a page of a script.
 // studentName/regNumber are OPTIONAL when starting a new script — if left blank,
 // the system tries to read them automatically from the front page's OCR text.
-router.post('/:id/scripts', upload.single('image'), async (req, res) => {
+router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No image file was uploaded (expected field name "image").' })
@@ -222,7 +222,7 @@ router.post('/:id/scripts', upload.single('image'), async (req, res) => {
   }
 })
 
-router.put('/scripts/:scriptId/caScore', async (req, res) => {
+router.put('/scripts/:scriptId/caScore', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const { caScore } = req.body
     const script = await prisma.script.update({
@@ -235,7 +235,7 @@ router.put('/scripts/:scriptId/caScore', async (req, res) => {
   }
 })
 
-router.delete('/:id/scripts/:scriptId', async (req, res) => {
+router.delete('/:id/scripts/:scriptId', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     await prisma.script.delete({ where: { id: req.params.scriptId } })
     res.status(204).end()
@@ -258,7 +258,7 @@ router.delete('/:id/scripts/:scriptId', async (req, res) => {
 // reg numbers will appear once Marking digitizes each script, not here.
 //
 // multipart/form-data: pdf (required), pagesPerSubmission (required)
-router.post('/:id/scripts/bulkSplit', uploadPdf.single('pdf'), async (req, res) => {
+router.post('/:id/scripts/bulkSplit', requireRole('LECTURER', 'ADMIN'), uploadPdf.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No PDF file was uploaded (expected field name "pdf").' })
@@ -297,7 +297,7 @@ router.post('/:id/scripts/bulkSplit', uploadPdf.single('pdf'), async (req, res) 
 // is created as PENDING, and gets digitized + scored automatically once
 // Marking starts (see /mark below). This is what keeps Confirm & Upload fast.
 // body: { groups: [{ studentName, regNumber, pages: [{ imageUrl }] }] }
-router.post('/:id/scripts/bulkConfirm', async (req, res) => {
+router.post('/:id/scripts/bulkConfirm', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const { groups } = req.body
     if (!Array.isArray(groups) || groups.length === 0) {
@@ -345,7 +345,7 @@ router.post('/:id/scripts/bulkConfirm', async (req, res) => {
 // then sends just that final result here. Untouched pages never hit this
 // route at all, so splitting/reviewing stays free of any extra cost unless
 // a page is actually edited.
-router.post('/:id/scripts/uploadPage', upload.single('image'), async (req, res) => {
+router.post('/:id/scripts/uploadPage', requireRole('LECTURER', 'ADMIN'), upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No image was uploaded (expected field name "image").' })
@@ -366,7 +366,7 @@ router.post('/:id/scripts/uploadPage', upload.single('image'), async (req, res) 
 // Script + ScriptPage records directly. Same as the other upload paths, no
 // OCR happens here; digitizing and scoring happen automatically in Marking.
 // multipart/form-data: files (multiple, each image/* or application/pdf)
-router.post('/:id/scripts/batchUpload', uploadBatch.array('files', 50), async (req, res) => {
+router.post('/:id/scripts/batchUpload', requireRole('LECTURER', 'ADMIN'), uploadBatch.array('files', 50), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: 'No files were uploaded (expected field name "files").' })
@@ -410,7 +410,7 @@ router.post('/:id/scripts/batchUpload', uploadBatch.array('files', 50), async (r
 // Responds immediately; the actual work continues on the server afterward,
 // independent of whether the lecturer stays on the page. Poll
 // GET /:id/markingStatus for live progress.
-router.post('/:id/mark', async (req, res) => {
+router.post('/:id/mark', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
     if (!session) return res.status(404).json({ error: 'Session not found.' })

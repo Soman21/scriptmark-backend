@@ -123,6 +123,70 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
   }
 }
 
+const PARSE_GUIDE_SYSTEM_PROMPT = `You are given the raw text of an existing exam marking scheme document,
+uploaded by a lecturer. Your job is to extract it into a structured list of questions.
+
+Rules:
+- Preserve the original question numbering as written (e.g. "1", "2", "3").
+- If a question has lettered subparts (e.g. "1a", "1b", "1c"), give each subpart its own
+  entry, with "number" set to the shared number ("1") and "subLabel" set to just the letter
+  ("a", "b", "c"). If a question has no subparts, leave subLabel as null.
+- "text" is the question prompt itself.
+- "modelAnswer" is the expected answer or marking notes for that question, exactly as given
+  in the document. If the document only lists keywords/points rather than a full answer,
+  use those as the model answer text.
+- "keywords" is a short comma separated list of key terms or concepts this answer should
+  contain, inferred from the model answer if not explicitly listed separately.
+- "maxMarks" is the mark allocated to that question or subpart, as a number. If subparts
+  don't state individual marks but the parent question does, split the total evenly across
+  subparts unless the document implies otherwise.
+- If you cannot confidently find any of these for a given item, use a reasonable best guess
+  rather than leaving it blank, since a human will review every field afterward anyway.
+- Ignore headers, footers, page numbers, and instructions not part of a specific question.
+
+Respond with ONLY a JSON object of this exact shape, nothing else:
+{"title": "a short title for this guide, guessed from the document", "subject": "the subject or course name if mentioned, else null", "questions": [{"number": "1", "subLabel": null, "text": "...", "modelAnswer": "...", "keywords": "...", "maxMarks": 10}]}`
+
+// rawText: plain text extracted from an uploaded PDF or DOCX marking scheme.
+// Returns a structure the frontend can drop straight into the same editable
+// question builder used for manual entry, so the lecturer reviews and can
+// change anything before it's actually saved.
+export async function parseMarkingSchemeDocument(rawText) {
+  const res = await fetch(GROQ_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: PARSE_GUIDE_SYSTEM_PROMPT },
+        { role: 'user', content: rawText.slice(0, 30000) }, // keep well within context limits
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
+    }),
+  })
+
+  if (!res.ok) {
+    const errText = await res.text()
+    throw new Error(`Groq API error (${res.status}): ${errText}`)
+  }
+
+  const data = await res.json()
+  const content = data.choices?.[0]?.message?.content
+  if (!content) throw new Error('Groq returned an empty response.')
+
+  const parsed = JSON.parse(content)
+  return {
+    title: parsed.title || '',
+    subject: parsed.subject || '',
+    questions: Array.isArray(parsed.questions) ? parsed.questions : [],
+  }
+}
+
+
 const ASSISTANT_SYSTEM_PROMPT = `You are the ScriptMark AI Assistant, a helpful guide built into an
 exam script marking system used by lecturers, reviewers, and admins at a university.
 

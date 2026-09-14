@@ -1,6 +1,14 @@
 import express from 'express'
+import multer from 'multer'
 import prisma from '../lib/prisma.js'
-import { requireAuth } from '../middleware/auth.js'
+import { requireAuth, requireRole } from '../middleware/auth.js'
+import { extractTextFromDocument } from '../lib/docParse.js'
+import { parseMarkingSchemeDocument } from '../lib/groq.js'
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+})
 
 const router = express.Router()
 router.use(requireAuth)
@@ -22,9 +30,37 @@ router.get('/:id', async (req, res) => {
   res.json(guide)
 })
 
+// POST /api/guides/parse - upload an existing marking scheme (PDF or DOCX),
+// get back structured questions to review in the SAME editable question
+// builder used for manual entry. Nothing is saved here — this only returns
+// a suggestion for the lecturer to check and adjust before actually saving
+// the guide via the regular POST / below.
+router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No document was uploaded (expected field name "document").' })
+    }
+
+    const rawText = await extractTextFromDocument(req.file.buffer, req.file.mimetype)
+    if (!rawText || !rawText.trim()) {
+      return res.status(400).json({ error: 'Could not find any readable text in that document.' })
+    }
+
+    const parsed = await parseMarkingSchemeDocument(rawText)
+    if (parsed.questions.length === 0) {
+      return res.status(400).json({ error: 'Could not identify any questions in that document. Please check the formatting or enter them manually.' })
+    }
+
+    res.json(parsed)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not parse this document: ' + err.message })
+  }
+})
+
 // POST /api/guides - create a guide with its questions
 // body: { title, subject, questions, isDraft }
-router.post('/', async (req, res) => {
+router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const { title, subject, questions, isDraft } = req.body
 
@@ -64,7 +100,7 @@ router.post('/', async (req, res) => {
 })
 
 // PUT /api/guides/:id - full edit: title, subject, isDraft, and replace all questions.
-router.put('/:id', async (req, res) => {
+router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const { title, subject, isDraft, questions } = req.body
 
@@ -96,7 +132,7 @@ router.put('/:id', async (req, res) => {
   }
 })
 
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     await prisma.markingGuide.delete({ where: { id: req.params.id } })
     res.status(204).end()
