@@ -84,6 +84,7 @@ router.post('/login', async (req, res) => {
 
     try {
       await sendEmail({
+        
         to: user.email,
         subject: 'Your ScriptMark login code',
         html: `<p>Hi ${user.name},</p><p>Your login code is:</p><p style="font-size:28px;font-weight:bold;letter-spacing:4px;">${code}</p><p>This code expires in 10 minutes. If this was not you, you can ignore this email and your password will stay unchanged.</p>`,

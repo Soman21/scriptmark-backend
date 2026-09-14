@@ -1,10 +1,10 @@
-// Sends emails via Nodemailer over Gmail's SMTP server, authenticated with a
-// Google App Password (not your real Gmail password). Unlike Resend's free
-// tier, this can send to ANY recipient right away, no domain verification
-// needed. Gmail always overwrites the sender address to match whichever
-// account authenticated, so emails arrive from GMAIL_USER, not a custom
-// "noreply@..." address. Free up to 500 emails/day, which is far more than
-// this project needs.
+// Sends emails via Nodemailer, using Brevo's SMTP relay on port 2525.
+// Render's free tier blocks outbound traffic on the standard SMTP ports
+// (25, 465, 587), which is why Gmail SMTP could not work there. Port 2525
+// is not one of the blocked ports, and Brevo documents it specifically as
+// the workaround for hosts that block the standard ones. Brevo also does
+// not require domain verification, only a single verified sender address,
+// and the free plan allows 300 emails/day with no expiration.
 import nodemailer from 'nodemailer'
 
 let transporter = null
@@ -12,10 +12,12 @@ let transporter = null
 function getTransporter() {
   if (!transporter) {
     transporter = nodemailer.createTransport({
-      service: 'gmail',
+      host: 'smtp-relay.brevo.com',
+      port: 2525,
+      secure: false, // 2525 and 587 are unencrypted at connect, then upgrade via STARTTLS
       auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_APP_PASSWORD,
+        user: process.env.BREVO_SMTP_USER, // your Brevo login email
+        pass: process.env.BREVO_SMTP_KEY, // the SMTP key from Brevo, not your account password
       },
     })
   }
@@ -25,14 +27,14 @@ function getTransporter() {
 export async function sendEmail({ to, subject, html }) {
   try {
     const info = await getTransporter().sendMail({
-      from: `ScriptMark <${process.env.GMAIL_USER}>`,
+      from: `ScriptMark <${process.env.BREVO_SENDER_EMAIL}>`, // must be a verified sender in Brevo
       to,
       subject,
       html,
     })
     return info
   } catch (err) {
-    throw new Error(`Gmail SMTP error: ${err.message}`)
+    throw new Error(`Brevo SMTP error: ${err.message}`)
   }
 }
 
