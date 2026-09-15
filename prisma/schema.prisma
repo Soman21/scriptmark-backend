@@ -36,9 +36,26 @@ model User {
   role         Role     @default(LECTURER)
   createdAt    DateTime @default(now())
 
-  markingGuides    MarkingGuide[]
-  markingSessions  MarkingSession[]
+  markingGuides     MarkingGuide[]
+  markingSessions   MarkingSession[]
   verificationCodes VerificationCode[]
+  markerOfSessions  SessionMarker[]
+  assignedQuestions Question[]         @relation("AssignedQuestions")
+  changedAnswers    ScriptAnswer[]     @relation("ChangedAnswers")
+}
+
+// A lecturer attached to a session as one of its markers, separate from
+// whoever created the session (the Coordinator, via createdById below).
+// A user can be both the Coordinator and a marker on the same session.
+model SessionMarker {
+  id        String         @id @default(cuid())
+  sessionId String
+  session   MarkingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User           @relation(fields: [userId], references: [id])
+  createdAt DateTime       @default(now())
+
+  @@unique([sessionId, userId])
 }
 
 // Reusable "send a code, verify it" mechanism — used for password reset now,
@@ -80,6 +97,9 @@ model Question {
   maxMarks    Int
   order       Int          @default(0)
 
+  assignedMarkerId String?
+  assignedMarker   User?   @relation("AssignedQuestions", fields: [assignedMarkerId], references: [id])
+
   scriptAnswers ScriptAnswer[]
 }
 
@@ -88,6 +108,14 @@ model MarkingSession {
   title       String
   department  String?
   faculty     String?
+  courseCode       String?
+  examinationType  String?
+  academicSession  String?
+  semester         String?
+  // Coordinator is NOT a separate role — whoever created the session (below)
+  // administers it. autoAcceptHighConfidence controls whether high-confidence
+  // AI scores skip human review entirely for this session, per that decision.
+  autoAcceptHighConfidence Boolean @default(true)
   guideId     String?
   guide       MarkingGuide? @relation(fields: [guideId], references: [id])
   createdById String
@@ -96,6 +124,7 @@ model MarkingSession {
   createdAt   DateTime      @default(now())
 
   scripts Script[]
+  markers SessionMarker[]
 }
 
 model Script {
@@ -142,4 +171,17 @@ model ScriptAnswer {
   confirmedScore Float?
   reasoning      String?
   confirmedAt    DateTime?
+
+  // True when confirmedScore was set automatically by the high-confidence
+  // auto-accept rule, rather than by a human clicking confirm.
+  autoAccepted Boolean @default(false)
+
+  // Audit trail: populated only when an ALREADY-confirmed score is changed
+  // again afterward (e.g. a Coordinator overriding a lecturer's confirmed
+  // score). The first confirmation is never treated as an "override".
+  previousScore  Float?
+  changeReason   String?
+  changedById    String?
+  changedBy      User?     @relation("ChangedAnswers", fields: [changedById], references: [id])
+  changedAt      DateTime?
 }

@@ -14,7 +14,12 @@ const router = express.Router()
 router.use(requireAuth)
 
 router.get('/', async (req, res) => {
+  // Same rule as sessions: Lecturers see their own guides, Reviewers and
+  // Admins see everyone's, since reviewing needs visibility into the guide
+  // a script is being scored against even if a Reviewer didn't create it.
+  const where = req.user.role === 'LECTURER' ? { createdById: req.user.id } : {}
   const guides = await prisma.markingGuide.findMany({
+    where,
     include: { questions: { orderBy: { order: 'asc' } }, createdBy: { select: { name: true } } },
     orderBy: { updatedAt: 'desc' },
   })
@@ -27,6 +32,9 @@ router.get('/:id', async (req, res) => {
     include: { questions: { orderBy: { order: 'asc' } } },
   })
   if (!guide) return res.status(404).json({ error: 'Marking guide not found.' })
+  if (req.user.role === 'LECTURER' && guide.createdById !== req.user.id) {
+    return res.status(403).json({ error: 'You do not have permission to view this guide.' })
+  }
   res.json(guide)
 })
 
@@ -77,6 +85,40 @@ router.post('/generateAnswers', requireRole('LECTURER', 'ADMIN'), async (req, re
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not generate answers: ' + err.message })
+  }
+})
+
+// PUT /api/guides/:id/assignments - bulk-assign questions/subparts to
+// lecturers for marking. Works for a single question just as well as many
+// at once, since it takes an array either way.
+// body: { assignments: [{ questionId, assignedMarkerId }] }
+router.put('/:id/assignments', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+  try {
+    const guide = await prisma.markingGuide.findUnique({ where: { id: req.params.id } })
+    if (!guide) return res.status(404).json({ error: 'Marking guide not found.' })
+
+    const { assignments } = req.body
+    if (!Array.isArray(assignments) || assignments.length === 0) {
+      return res.status(400).json({ error: 'No assignments were provided.' })
+    }
+
+    await Promise.all(
+      assignments.map(({ questionId, assignedMarkerId }) =>
+        prisma.question.update({
+          where: { id: questionId },
+          data: { assignedMarkerId: assignedMarkerId || null },
+        })
+      )
+    )
+
+    const questions = await prisma.question.findMany({
+      where: { guideId: req.params.id },
+      orderBy: { order: 'asc' },
+    })
+    res.json({ questions })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not save assignments: ' + err.message })
   }
 })
 

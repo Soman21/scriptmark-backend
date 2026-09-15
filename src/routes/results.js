@@ -69,10 +69,21 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
   }
 })
 
-// PUT /api/results/:answerId/confirm - lecturer confirms/edits a suggested score
+// PUT /api/results/:answerId/confirm - lecturer confirms/edits a suggested score.
+// If this answer was ALREADY confirmed once before (a human or the
+// auto-accept rule already decided on it), changing it again is an
+// "override" and requires a reason, recorded in the audit trail below.
 router.put('/:answerId/confirm', async (req, res) => {
   try {
-    const { confirmedScore, extractedText } = req.body
+    const { confirmedScore, extractedText, reason } = req.body
+
+    const existing = await prisma.scriptAnswer.findUnique({ where: { id: req.params.answerId } })
+    if (!existing) return res.status(404).json({ error: 'Answer not found.' })
+
+    const isOverride = existing.confirmedAt != null
+    if (isOverride && !reason) {
+      return res.status(400).json({ error: 'A reason is required when changing a score that was already confirmed.' })
+    }
 
     const answer = await prisma.scriptAnswer.update({
       where: { id: req.params.answerId },
@@ -80,6 +91,15 @@ router.put('/:answerId/confirm', async (req, res) => {
         confirmedScore: Number(confirmedScore),
         extractedText: extractedText ?? undefined,
         confirmedAt: new Date(),
+        autoAccepted: false, // a human just made the call, this is no longer an unreviewed auto-accept
+        ...(isOverride
+          ? {
+              previousScore: existing.confirmedScore,
+              changeReason: reason,
+              changedById: req.user.id,
+              changedAt: new Date(),
+            }
+          : {}),
       },
     })
 
@@ -97,6 +117,33 @@ router.put('/:answerId/confirm', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(404).json({ error: 'Answer not found.' })
+  }
+})
+
+// GET /api/results/myQueue?sessionId=... - question-centric review: every
+// answer assigned to the CURRENT user across all scripts in a session, so a
+// lecturer can review just their own questions without opening every script.
+router.get('/myQueue', async (req, res) => {
+  try {
+    const { sessionId } = req.query
+    if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' })
+
+    const answers = await prisma.scriptAnswer.findMany({
+      where: {
+        question: { assignedMarkerId: req.user.id },
+        script: { sessionId },
+      },
+      include: {
+        question: true,
+        script: { select: { id: true, studentName: true, regNumber: true, studentIdentifier: true } },
+      },
+      orderBy: [{ question: { order: 'asc' } }],
+    })
+
+    res.json({ answers })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load your marking queue: ' + err.message })
   }
 })
 

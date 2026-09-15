@@ -13,6 +13,19 @@ import { pdfToPageImages } from '../lib/pdfSplit.js'
 const router = express.Router()
 router.use(requireAuth)
 
+// Shared by every /:id/... route below: Lecturers can only reach their own
+// sessions, Reviewers and Admins can reach any session. Attaches the loaded
+// session to req.markingSession so routes don't have to re-fetch it.
+async function requireSessionAccess(req, res, next) {
+  const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
+  if (!session) return res.status(404).json({ error: 'Session not found.' })
+  if (req.user.role === 'LECTURER' && session.createdById !== req.user.id) {
+    return res.status(403).json({ error: 'You do not have permission to access this session.' })
+  }
+  req.markingSession = session
+  next()
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
@@ -28,8 +41,26 @@ const uploadBatch = multer({
   limits: { fileSize: 25 * 1024 * 1024 },
 })
 
+// GET /api/sessions/lecturers - list Lecturer/Admin users, for the marker
+// selection dropdowns when creating a session or assigning questions. Must
+// stay ABOVE any /:id route below, or Express would treat "lecturers" as an
+// :id value instead.
+router.get('/lecturers', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+  const lecturers = await prisma.user.findMany({
+    where: { role: { in: ['LECTURER', 'ADMIN'] } },
+    select: { id: true, name: true, email: true, role: true },
+    orderBy: { name: 'asc' },
+  })
+  res.json(lecturers)
+})
+
 router.get('/', async (req, res) => {
+  // Lecturers get their own private workspace; Reviewers and Admins need to
+  // see everyone's sessions since reviewing someone else's uploads is the
+  // whole point of that role.
+  const where = req.user.role === 'LECTURER' ? { createdById: req.user.id } : {}
   const sessions = await prisma.markingSession.findMany({
+    where,
     include: {
       guide: { select: { title: true } },
       _count: { select: { scripts: true } },
@@ -41,8 +72,24 @@ router.get('/', async (req, res) => {
 
 router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
-    const { title, guideId, department, faculty } = req.body
+    const {
+      title,
+      guideId,
+      department,
+      faculty,
+      courseCode,
+      examinationType,
+      academicSession,
+      semester,
+      autoAcceptHighConfidence,
+      markerUserIds,
+    } = req.body
     if (!title) return res.status(400).json({ error: 'A session title is required.' })
+
+    // Whoever creates the session is its de facto Coordinator (via
+    // createdById) — always included as a marker too, plus anyone else
+    // chosen for this session.
+    const markerIds = new Set([req.user.id, ...(Array.isArray(markerUserIds) ? markerUserIds : [])])
 
     const session = await prisma.markingSession.create({
       data: {
@@ -50,9 +97,16 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         guideId: guideId || null,
         department: department || null,
         faculty: faculty || null,
+        courseCode: courseCode || null,
+        examinationType: examinationType || null,
+        academicSession: academicSession || null,
+        semester: semester || null,
+        autoAcceptHighConfidence: autoAcceptHighConfidence !== false, // default true
         createdById: req.user.id,
         status: 'ACTIVE',
+        markers: { create: [...markerIds].map((userId) => ({ userId })) },
       },
+      include: { markers: { include: { user: { select: { id: true, name: true, email: true } } } } },
     })
     res.status(201).json(session)
   } catch (err) {
@@ -67,12 +121,25 @@ router.get('/:id', async (req, res) => {
     include: { guide: { include: { questions: { orderBy: { order: 'asc' } } } } },
   })
   if (!session) return res.status(404).json({ error: 'Session not found.' })
+  if (req.user.role === 'LECTURER' && session.createdById !== req.user.id) {
+    return res.status(403).json({ error: 'You do not have permission to view this session.' })
+  }
   res.json(session)
 })
 
 router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
-    const { title, department, faculty, guideId } = req.body
+    const {
+      title,
+      department,
+      faculty,
+      guideId,
+      courseCode,
+      examinationType,
+      academicSession,
+      semester,
+      autoAcceptHighConfidence,
+    } = req.body
     const session = await prisma.markingSession.update({
       where: { id: req.params.id },
       data: {
@@ -80,11 +147,61 @@ router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         ...(department !== undefined ? { department } : {}),
         ...(faculty !== undefined ? { faculty } : {}),
         ...(guideId !== undefined ? { guideId } : {}),
+        ...(courseCode !== undefined ? { courseCode } : {}),
+        ...(examinationType !== undefined ? { examinationType } : {}),
+        ...(academicSession !== undefined ? { academicSession } : {}),
+        ...(semester !== undefined ? { semester } : {}),
+        ...(autoAcceptHighConfidence !== undefined ? { autoAcceptHighConfidence } : {}),
       },
     })
     res.json(session)
   } catch (err) {
     res.status(404).json({ error: 'Session not found.' })
+  }
+})
+
+// GET /api/sessions/:id/markers - the lecturers currently attached to this
+// session, for populating "Assigned Marker" dropdowns in the guide builder.
+router.get('/:id/markers', async (req, res) => {
+  const markers = await prisma.sessionMarker.findMany({
+    where: { sessionId: req.params.id },
+    include: { user: { select: { id: true, name: true, email: true } } },
+  })
+  res.json(markers.map((m) => m.user))
+})
+
+// PUT /api/sessions/:id/markers - replace the full marker list for this
+// session. Restricted to the session's own Coordinator (its creator) or an
+// Admin, since changing who's marking a session is a coordination decision.
+// body: { markerUserIds: [...] }
+router.put('/:id/markers', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+  try {
+    const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
+    if (!session) return res.status(404).json({ error: 'Session not found.' })
+    if (req.user.role === 'LECTURER' && session.createdById !== req.user.id) {
+      return res.status(403).json({ error: 'Only this session\'s Coordinator or an Admin can change its markers.' })
+    }
+
+    const { markerUserIds } = req.body
+    if (!Array.isArray(markerUserIds)) {
+      return res.status(400).json({ error: 'markerUserIds must be an array of user ids.' })
+    }
+    const ids = new Set([session.createdById, ...markerUserIds]) // Coordinator always stays a marker
+
+    await prisma.sessionMarker.deleteMany({ where: { sessionId: session.id } })
+    await prisma.sessionMarker.createMany({
+      data: [...ids].map((userId) => ({ sessionId: session.id, userId })),
+      skipDuplicates: true,
+    })
+
+    const markers = await prisma.sessionMarker.findMany({
+      where: { sessionId: session.id },
+      include: { user: { select: { id: true, name: true, email: true } } },
+    })
+    res.json(markers.map((m) => m.user))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not update markers: ' + err.message })
   }
 })
 
@@ -436,14 +553,14 @@ router.post('/:id/mark', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
     // Fire-and-forget: do not await this. It keeps running in the Node
     // process on Railway after the response has already gone back, so it
     // survives the lecturer navigating away or closing the tab.
-    runMarkingQueue(scripts, guide).catch((err) => console.error('Marking queue failed:', err))
+    runMarkingQueue(scripts, guide, session).catch((err) => console.error('Marking queue failed:', err))
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not start marking: ' + err.message })
   }
 })
 
-async function runMarkingQueue(scripts, guide) {
+async function runMarkingQueue(scripts, guide, session) {
   for (const script of scripts) {
     try {
       let ocrText = script.ocrText
@@ -494,11 +611,17 @@ async function runMarkingQueue(scripts, guide) {
         const existing = await prisma.scriptAnswer.findFirst({
           where: { scriptId: script.id, questionId: r.questionId },
         })
+        // High-confidence auto-accept: if this session has it enabled and the
+        // AI is confident, the score is confirmed immediately, no human
+        // review step needed. Anything not high-confidence still goes
+        // through the normal human confirm flow untouched.
+        const autoAccept = session.autoAcceptHighConfidence && r.confidence === 'high'
         const answerData = {
           suggestedScore: r.suggestedScore,
           reasoning: r.reasoning,
           confidence: r.confidence || null,
           extractedText: r.answerText || ocrText,
+          ...(autoAccept ? { confirmedScore: r.suggestedScore, confirmedAt: new Date(), autoAccepted: true } : {}),
         }
         if (existing) {
           await prisma.scriptAnswer.update({ where: { id: existing.id }, data: answerData })
@@ -545,6 +668,61 @@ router.get('/:id/markingStatus', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not load marking status: ' + err.message })
+  }
+})
+
+// GET /api/sessions/:id/coordinatorOverview - session-wide progress plus a
+// per-marker breakdown, for the Coordinator's oversight dashboard. Anyone
+// can call this (Results/Marking pages already gate who sees the link to
+// it), it just returns aggregate counts, nothing sensitive per-student.
+router.get('/:id/coordinatorOverview', async (req, res) => {
+  try {
+    const session = await prisma.markingSession.findUnique({
+      where: { id: req.params.id },
+      include: { markers: { include: { user: { select: { id: true, name: true, email: true } } } } },
+    })
+    if (!session) return res.status(404).json({ error: 'Session not found.' })
+
+    const scriptCount = await prisma.script.count({ where: { sessionId: session.id } })
+    const answers = await prisma.scriptAnswer.findMany({
+      where: { script: { sessionId: session.id } },
+      select: {
+        confidence: true,
+        confirmedAt: true,
+        autoAccepted: true,
+        question: { select: { assignedMarkerId: true } },
+      },
+    })
+
+    const aiMarked = answers.length
+    const autoAccepted = answers.filter((a) => a.autoAccepted).length
+    const humanReviewRequired = answers.filter((a) => !a.autoAccepted).length
+    const humanReviewCompleted = answers.filter((a) => !a.autoAccepted && a.confirmedAt).length
+    const pendingReview = humanReviewRequired - humanReviewCompleted
+
+    const perMarker = session.markers.map(({ user }) => {
+      const assignedAnswers = answers.filter((a) => a.question.assignedMarkerId === user.id)
+      const reviewed = assignedAnswers.filter((a) => a.confirmedAt).length
+      return {
+        user,
+        assigned: assignedAnswers.length,
+        reviewed,
+        pending: assignedAnswers.length - reviewed,
+      }
+    })
+
+    res.json({
+      scriptCount,
+      aiMarked,
+      autoAccepted,
+      humanReviewRequired,
+      humanReviewCompleted,
+      pendingReview,
+      perMarker,
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load the coordinator overview: ' + err.message })
   }
 })
 
