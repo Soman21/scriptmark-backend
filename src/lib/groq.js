@@ -1,9 +1,9 @@
-// Uses Groq's free, OpenAI-compatible API to run an open-source LLM (Llama 3.3 70B)
+// Uses Groq's free, OpenAI-compatible API to run an open-source LLM
 // for suggesting scores. This is ALWAYS a suggestion — a human lecturer/reviewer
 // must confirm the score before it counts (see results.js "/confirm" route).
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
-const MODEL = 'llama-3.3-70b-versatile'
+const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
 
 const SYSTEM_PROMPT = `You are an assistant that helps a human lecturer grade exam scripts.
 You NEVER assign a final grade — you only suggest a score and explain your reasoning.
@@ -135,13 +135,17 @@ Rules:
 - "modelAnswer" is the expected answer or marking notes for that question, exactly as given
   in the document. If the document only lists keywords/points rather than a full answer,
   use those as the model answer text.
+- IMPORTANT: if this document is just a question paper with no answers or marking notes at
+  all for a given question, leave "modelAnswer" as an empty string "" for that question,
+  rather than writing an answer yourself. Do not invent an answer that is not actually
+  present in the document in some form. A human will decide separately whether to have AI
+  generate answers for anything left blank.
 - "keywords" is a short comma separated list of key terms or concepts this answer should
-  contain, inferred from the model answer if not explicitly listed separately.
+  contain, based on the model answer. If modelAnswer is blank, leave keywords blank too.
 - "maxMarks" is the mark allocated to that question or subpart, as a number. If subparts
   don't state individual marks but the parent question does, split the total evenly across
-  subparts unless the document implies otherwise.
-- If you cannot confidently find any of these for a given item, use a reasonable best guess
-  rather than leaving it blank, since a human will review every field afterward anyway.
+  subparts unless the document implies otherwise. Marks are usually printed even on a bare
+  question paper, so still fill this in even when modelAnswer is blank.
 - Ignore headers, footers, page numbers, and instructions not part of a specific question.
 
 Respond with ONLY a JSON object of this exact shape, nothing else:
@@ -184,6 +188,55 @@ export async function parseMarkingSchemeDocument(rawText) {
     subject: parsed.subject || '',
     questions: Array.isArray(parsed.questions) ? parsed.questions : [],
   }
+}
+
+const GENERATE_ANSWERS_SYSTEM_PROMPT = `You are given a list of exam questions that currently have
+no model answer written for them (this usually happens when a lecturer uploaded a bare question
+paper rather than a full marking scheme). Write a strong, exam-appropriate model answer for each
+one, sized appropriately for its allocated marks, plus a short comma separated list of the key
+terms or concepts that answer should contain.
+
+Respond with ONLY a JSON object of this exact shape, nothing else, in the same order given:
+{"answers": [{"index": 0, "modelAnswer": "...", "keywords": "..."}]}`
+
+// questions: array of { index, number, subLabel, text, maxMarks } for just the questions that
+// came back blank from parsing. Returns model answers for exactly those, to merge back in.
+export async function generateModelAnswers(questions) {
+  const questionsBlock = questions
+    .map((q) => {
+      const label = q.subLabel ? `Question ${q.number}${q.subLabel}` : `Question ${q.number}`
+      return `Index: ${q.index}\n${label} (${q.maxMarks} marks): ${q.text}`
+    })
+    .join('\n\n')
+
+  const res = await fetch(GROQ_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: GENERATE_ANSWERS_SYSTEM_PROMPT },
+        { role: 'user', content: questionsBlock },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.3,
+    }),
+  })
+
+  if (!res.ok) {
+    const errText = await res.text()
+    throw new Error(`Groq API error (${res.status}): ${errText}`)
+  }
+
+  const data = await res.json()
+  const content2 = data.choices?.[0]?.message?.content
+  if (!content2) throw new Error('Groq returned an empty response.')
+
+  const result = JSON.parse(content2)
+  return Array.isArray(result.answers) ? result.answers : []
 }
 
 

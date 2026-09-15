@@ -3,7 +3,7 @@ import multer from 'multer'
 import prisma from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { extractTextFromDocument } from '../lib/docParse.js'
-import { parseMarkingSchemeDocument } from '../lib/groq.js'
+import { parseMarkingSchemeDocument, generateModelAnswers } from '../lib/groq.js'
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -51,7 +51,7 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
       return res.status(400).json({ error: 'Could not identify any questions in that document. Please check the formatting or enter them manually.' })
     }
 
-    res.json(parsed)
+    res.json({ ...parsed, previewText: rawText.slice(0, 8000) })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not parse this document: ' + err.message })
@@ -60,6 +60,26 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
 
 // POST /api/guides - create a guide with its questions
 // body: { title, subject, questions, isDraft }
+// POST /api/guides/generateAnswers - given a set of questions that came back
+// with no model answer (a bare question paper was uploaded), generate one
+// for each with AI. This is an explicit, separate step the lecturer chooses
+// to run, not something that happens silently during parsing.
+// body: { questions: [{ index, number, subLabel, text, maxMarks }] }
+router.post('/generateAnswers', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+  try {
+    const { questions } = req.body
+    if (!Array.isArray(questions) || questions.length === 0) {
+      return res.status(400).json({ error: 'No questions were provided.' })
+    }
+
+    const answers = await generateModelAnswers(questions)
+    res.json({ answers })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not generate answers: ' + err.message })
+  }
+})
+
 router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const { title, subject, questions, isDraft } = req.body
