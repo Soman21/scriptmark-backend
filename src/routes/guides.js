@@ -88,37 +88,93 @@ router.post('/generateAnswers', requireRole('LECTURER', 'ADMIN'), async (req, re
   }
 })
 
-// PUT /api/guides/:id/assignments - bulk-assign questions/subparts to
-// lecturers for marking. Works for a single question just as well as many
-// at once, since it takes an array either way.
-// body: { assignments: [{ questionId, assignedMarkerId }] }
-router.put('/:id/assignments', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+// GET /api/guides/:id/claimStatus - the guide's questions with who (if
+// anyone) has claimed each one, plus the roster of markers on the session
+// this guide belongs to, and whether the current user is that session's
+// Coordinator (its creator). Used to render the Claim Questions screen.
+router.get('/:id/claimStatus', async (req, res) => {
   try {
-    const guide = await prisma.markingGuide.findUnique({ where: { id: req.params.id } })
+    const guide = await prisma.markingGuide.findUnique({
+      where: { id: req.params.id },
+      include: {
+        questions: {
+          orderBy: { order: 'asc' },
+          include: { assignedMarker: { select: { id: true, name: true } } },
+        },
+      },
+    })
     if (!guide) return res.status(404).json({ error: 'Marking guide not found.' })
 
-    const { assignments } = req.body
-    if (!Array.isArray(assignments) || assignments.length === 0) {
-      return res.status(400).json({ error: 'No assignments were provided.' })
-    }
+    const session = await prisma.markingSession.findFirst({ where: { guideId: guide.id } })
+    if (!session) return res.status(404).json({ error: 'No session is using this guide yet.' })
 
-    await Promise.all(
-      assignments.map(({ questionId, assignedMarkerId }) =>
-        prisma.question.update({
-          where: { id: questionId },
-          data: { assignedMarkerId: assignedMarkerId || null },
-        })
-      )
-    )
-
-    const questions = await prisma.question.findMany({
-      where: { guideId: req.params.id },
-      orderBy: { order: 'asc' },
+    const markers = await prisma.sessionMarker.findMany({
+      where: { sessionId: session.id },
+      include: { user: { select: { id: true, name: true, email: true } } },
     })
-    res.json({ questions })
+
+    res.json({
+      questions: guide.questions,
+      markers: markers.map((m) => m.user),
+      isCoordinator: session.createdById === req.user.id,
+      sessionId: session.id,
+    })
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'Could not save assignments: ' + err.message })
+    res.status(500).json({ error: 'Could not load claim status: ' + err.message })
+  }
+})
+
+// PUT /api/guides/:id/questions/:questionId/claim - claim, unclaim, or
+// (Coordinator/Admin only) reassign a question.
+// body: { targetUserId?: string | null }
+//   - Omitted targetUserId means "claim this for myself."
+//   - null means "unclaim/release it."
+//   - A lecturer can only act on a question that's unclaimed or already
+//     theirs. Only the session's Coordinator or an Admin can hand a question
+//     to someone else, or take it away from another marker.
+router.put('/:id/questions/:questionId/claim', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+  try {
+    const question = await prisma.question.findUnique({ where: { id: req.params.questionId } })
+    if (!question || question.guideId !== req.params.id) {
+      return res.status(404).json({ error: 'Question not found.' })
+    }
+
+    const session = await prisma.markingSession.findFirst({ where: { guideId: req.params.id } })
+    if (!session) return res.status(404).json({ error: 'No session is using this guide yet.' })
+
+    const isCoordinator = session.createdById === req.user.id || req.user.role === 'ADMIN'
+    const { targetUserId } = req.body
+    const wantsSelf = targetUserId === undefined
+    const finalTargetId = wantsSelf ? req.user.id : targetUserId // null here means "unclaim"
+
+    const alreadyTaken = question.assignedMarkerId && question.assignedMarkerId !== req.user.id
+    if (!isCoordinator && (alreadyTaken || !wantsSelf)) {
+      return res.status(403).json({
+        error: alreadyTaken
+          ? 'This question is already claimed by someone else. Ask your Coordinator to reassign it if needed.'
+          : 'Only this session\'s Coordinator can assign a question to someone else.',
+      })
+    }
+
+    if (finalTargetId) {
+      const isMarker = await prisma.sessionMarker.findUnique({
+        where: { sessionId_userId: { sessionId: session.id, userId: finalTargetId } },
+      })
+      if (!isMarker) {
+        return res.status(400).json({ error: 'That person needs to join this session with its code first.' })
+      }
+    }
+
+    const updated = await prisma.question.update({
+      where: { id: question.id },
+      data: { assignedMarkerId: finalTargetId },
+      include: { assignedMarker: { select: { id: true, name: true } } },
+    })
+    res.json(updated)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not update this claim: ' + err.message })
   }
 })
 

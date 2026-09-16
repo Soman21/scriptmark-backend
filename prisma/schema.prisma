@@ -107,6 +107,7 @@ model MarkingSession {
   id          String        @id @default(cuid())
   title       String
   department  String?
+  joinCode    String?       @unique
   faculty     String?
   courseCode       String?
   examinationType  String?

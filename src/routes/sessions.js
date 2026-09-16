@@ -13,6 +13,19 @@ import { pdfToPageImages } from '../lib/pdfSplit.js'
 const router = express.Router()
 router.use(requireAuth)
 
+// Short, human-typeable join code (uppercase letters and digits, no
+// ambiguous characters like 0/O or 1/I), regenerated on collision.
+async function generateUniqueJoinCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  for (let attempt = 0; attempt < 10; attempt++) {
+    let code = ''
+    for (let i = 0; i < 6; i++) code += alphabet[Math.floor(Math.random() * alphabet.length)]
+    const existing = await prisma.markingSession.findUnique({ where: { joinCode: code } })
+    if (!existing) return code
+  }
+  throw new Error('Could not generate a unique join code, please try again.')
+}
+
 // Shared by every /:id/... route below: Lecturers can only reach their own
 // sessions, Reviewers and Admins can reach any session. Attaches the loaded
 // session to req.markingSession so routes don't have to re-fetch it.
@@ -54,6 +67,34 @@ router.get('/lecturers', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   res.json(lecturers)
 })
 
+// POST /api/sessions/join - a lecturer enters a session's join code to be
+// added as one of its markers, no Coordinator approval step needed, the
+// code itself is the access control. Must also stay ABOVE any /:id route.
+router.post('/join', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+  try {
+    const { code } = req.body
+    if (!code || !code.trim()) {
+      return res.status(400).json({ error: 'Enter a join code.' })
+    }
+
+    const session = await prisma.markingSession.findUnique({ where: { joinCode: code.trim().toUpperCase() } })
+    if (!session) {
+      return res.status(404).json({ error: 'No session found with that code. Check it and try again.' })
+    }
+
+    await prisma.sessionMarker.upsert({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+      update: {},
+      create: { sessionId: session.id, userId: req.user.id },
+    })
+
+    res.json({ id: session.id, title: session.title })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not join this session: ' + err.message })
+  }
+})
+
 router.get('/', async (req, res) => {
   // Lecturers get their own private workspace; Reviewers and Admins need to
   // see everyone's sessions since reviewing someone else's uploads is the
@@ -82,14 +123,10 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
       academicSession,
       semester,
       autoAcceptHighConfidence,
-      markerUserIds,
     } = req.body
     if (!title) return res.status(400).json({ error: 'A session title is required.' })
 
-    // Whoever creates the session is its de facto Coordinator (via
-    // createdById) — always included as a marker too, plus anyone else
-    // chosen for this session.
-    const markerIds = new Set([req.user.id, ...(Array.isArray(markerUserIds) ? markerUserIds : [])])
+    const joinCode = await generateUniqueJoinCode()
 
     const session = await prisma.markingSession.create({
       data: {
@@ -104,7 +141,11 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         autoAcceptHighConfidence: autoAcceptHighConfidence !== false, // default true
         createdById: req.user.id,
         status: 'ACTIVE',
-        markers: { create: [...markerIds].map((userId) => ({ userId })) },
+        joinCode,
+        // Whoever creates the session is its de facto Coordinator, and is
+        // automatically its first marker too. Other lecturers join later
+        // themselves using the join code, rather than being picked here.
+        markers: { create: [{ userId: req.user.id }] },
       },
       include: { markers: { include: { user: { select: { id: true, name: true, email: true } } } } },
     })
