@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "SessionMarker" ADD COLUMN     "accessLevel" TEXT NOT NULL DEFAULT 'LIMITED',
+ADD COLUMN     "status" TEXT NOT NULL DEFAULT 'APPROVED';

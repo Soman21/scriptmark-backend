@@ -109,14 +109,21 @@ router.get('/:id/claimStatus', async (req, res) => {
     if (!session) return res.status(404).json({ error: 'No session is using this guide yet.' })
 
     const markers = await prisma.sessionMarker.findMany({
-      where: { sessionId: session.id },
+      where: { sessionId: session.id, status: 'APPROVED' },
       include: { user: { select: { id: true, name: true, email: true } } },
     })
 
+    const myMembership = markers.find((m) => m.userId === req.user.id)
+    const canManage =
+      req.user.role === 'ADMIN' ||
+      session.createdById === req.user.id ||
+      (myMembership && myMembership.accessLevel === 'FULL')
+
     res.json({
       questions: guide.questions,
-      markers: markers.map((m) => m.user),
+      markers: markers.map((m) => ({ ...m.user, accessLevel: m.accessLevel })),
       isCoordinator: session.createdById === req.user.id,
+      canManage,
       sessionId: session.id,
     })
   } catch (err) {

@@ -53,6 +53,12 @@ model SessionMarker {
   session   MarkingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   userId    String
   user      User           @relation(fields: [userId], references: [id])
+  // PENDING until the Coordinator (or a Full-access marker) approves a
+  // request; joining with the code skips straight to APPROVED.
+  status       String   @default("APPROVED")
+  // LIMITED (default): can only claim/edit their own questions. FULL: can
+  // see and act across the whole session, same as the Coordinator.
+  accessLevel  String   @default("LIMITED")
   createdAt DateTime       @default(now())
 
   @@unique([sessionId, userId])

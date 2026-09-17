@@ -9,6 +9,7 @@ import { computeGrade } from '../lib/grading.js'
 import { writeResultsPdf } from '../lib/pdfExport.js'
 import { extractStudentInfo, scoreScriptAgainstGuide } from '../lib/groq.js'
 import { pdfToPageImages } from '../lib/pdfSplit.js'
+import { sendEmail } from '../lib/email.js'
 
 const router = express.Router()
 router.use(requireAuth)
@@ -85,7 +86,7 @@ router.post('/join', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
     await prisma.sessionMarker.upsert({
       where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
       update: {},
-      create: { sessionId: session.id, userId: req.user.id },
+      create: { sessionId: session.id, userId: req.user.id, status: 'APPROVED', accessLevel: 'LIMITED' },
     })
 
     res.json({ id: session.id, title: session.title })
@@ -93,6 +94,24 @@ router.post('/join', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
     console.error(err)
     res.status(500).json({ error: 'Could not join this session: ' + err.message })
   }
+})
+
+// GET /api/sessions/browsable - ACTIVE sessions the current user is not
+// already a marker on, for the "Request Access" flow when they don't have
+// a join code. Must stay ABOVE any /:id route below.
+router.get('/browsable', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+  const myMemberships = await prisma.sessionMarker.findMany({
+    where: { userId: req.user.id },
+    select: { sessionId: true },
+  })
+  const excludeIds = myMemberships.map((m) => m.sessionId)
+
+  const sessions = await prisma.markingSession.findMany({
+    where: { status: 'ACTIVE', id: { notIn: excludeIds } },
+    select: { id: true, title: true, courseCode: true, createdBy: { select: { name: true } } },
+    orderBy: { createdAt: 'desc' },
+  })
+  res.json(sessions)
 })
 
 router.get('/', async (req, res) => {
@@ -145,7 +164,7 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         // Whoever creates the session is its de facto Coordinator, and is
         // automatically its first marker too. Other lecturers join later
         // themselves using the join code, rather than being picked here.
-        markers: { create: [{ userId: req.user.id }] },
+        markers: { create: [{ userId: req.user.id, status: 'APPROVED', accessLevel: 'FULL' }] },
       },
       include: { markers: { include: { user: { select: { id: true, name: true, email: true } } } } },
     })
@@ -203,46 +222,214 @@ router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
 
 // GET /api/sessions/:id/markers - the lecturers currently attached to this
 // session, for populating "Assigned Marker" dropdowns in the guide builder.
+// GET /api/sessions/:id/markers - APPROVED markers only, with their access
+// level, for the Claim Questions page and marker management.
 router.get('/:id/markers', async (req, res) => {
   const markers = await prisma.sessionMarker.findMany({
-    where: { sessionId: req.params.id },
+    where: { sessionId: req.params.id, status: 'APPROVED' },
     include: { user: { select: { id: true, name: true, email: true } } },
   })
-  res.json(markers.map((m) => m.user))
+  res.json(markers.map((m) => ({ ...m.user, accessLevel: m.accessLevel })))
 })
 
-// PUT /api/sessions/:id/markers - replace the full marker list for this
-// session. Restricted to the session's own Coordinator (its creator) or an
-// Admin, since changing who's marking a session is a coordination decision.
-// body: { markerUserIds: [...] }
-router.put('/:id/markers', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+// Whether userId can manage this session's membership: its Coordinator, an
+// Admin, or any of its own APPROVED Full-access markers.
+async function canManageMarkers(session, userId, userRole) {
+  if (userRole === 'ADMIN') return true
+  if (session.createdById === userId) return true
+  const marker = await prisma.sessionMarker.findUnique({
+    where: { sessionId_userId: { sessionId: session.id, userId } },
+  })
+  return !!marker && marker.status === 'APPROVED' && marker.accessLevel === 'FULL'
+}
+
+// GET /api/sessions/browsable - ACTIVE sessions the current user is not
+// already a marker on, for the "Request Access" flow when they don't have
+// a join code.
+// POST /api/sessions/:id/requestAccess - ask to join a session without a
+// code. Sits PENDING until the Coordinator or a Full-access marker decides.
+router.post('/:id/requestAccess', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+  try {
+    const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
+    if (!session) return res.status(404).json({ error: 'Session not found.' })
+
+    const existing = await prisma.sessionMarker.findUnique({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+    })
+    if (existing) {
+      return res.status(400).json({
+        error: existing.status === 'PENDING' ? 'You already have a pending request for this session.' : 'You already have access to this session.',
+      })
+    }
+
+    await prisma.sessionMarker.create({
+      data: { sessionId: session.id, userId: req.user.id, status: 'PENDING', accessLevel: 'LIMITED' },
+    })
+    res.status(201).json({ message: 'Request sent. The Coordinator will review it.' })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not send that request: ' + err.message })
+  }
+})
+
+// GET /api/sessions/:id/pendingRequests - who's waiting to be let in.
+router.get('/:id/pendingRequests', async (req, res) => {
+  try {
+    const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
+    if (!session) return res.status(404).json({ error: 'Session not found.' })
+    if (!(await canManageMarkers(session, req.user.id, req.user.role))) {
+      return res.status(403).json({ error: 'You do not have permission to view this.' })
+    }
+
+    const pending = await prisma.sessionMarker.findMany({
+      where: { sessionId: session.id, status: 'PENDING' },
+      include: { user: { select: { id: true, name: true, email: true } } },
+    })
+    res.json(pending.map((m) => m.user))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load pending requests: ' + err.message })
+  }
+})
+
+// PUT /api/sessions/:id/markers/:userId/approve
+router.put('/:id/markers/:userId/approve', async (req, res) => {
+  try {
+    const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
+    if (!session) return res.status(404).json({ error: 'Session not found.' })
+    if (!(await canManageMarkers(session, req.user.id, req.user.role))) {
+      return res.status(403).json({ error: 'You do not have permission to approve markers.' })
+    }
+
+    await prisma.sessionMarker.update({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.params.userId } },
+      data: { status: 'APPROVED' },
+    })
+
+    const requester = await prisma.user.findUnique({ where: { id: req.params.userId } })
+    if (requester) {
+      sendEmail({
+        to: requester.email,
+        subject: `You've been added to ${session.title}`,
+        html: `<p>Hi ${requester.name},</p><p>Your request to join <strong>${session.title}</strong> on ScriptMark has been approved. You can now claim questions to mark.</p>`,
+      }).catch((err) => console.error('Approval email failed:', err))
+    }
+
+    res.json({ message: 'Approved.' })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not approve this request: ' + err.message })
+  }
+})
+
+// PUT /api/sessions/:id/markers/:userId/deny
+router.put('/:id/markers/:userId/deny', async (req, res) => {
+  try {
+    const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
+    if (!session) return res.status(404).json({ error: 'Session not found.' })
+    if (!(await canManageMarkers(session, req.user.id, req.user.role))) {
+      return res.status(403).json({ error: 'You do not have permission to deny markers.' })
+    }
+
+    const requester = await prisma.user.findUnique({ where: { id: req.params.userId } })
+
+    await prisma.sessionMarker.delete({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.params.userId } },
+    })
+
+    if (requester) {
+      sendEmail({
+        to: requester.email,
+        subject: `Your request to join ${session.title} was declined`,
+        html: `<p>Hi ${requester.name},</p><p>Your request to join <strong>${session.title}</strong> on ScriptMark was not approved. You can reach out to the Coordinator directly if you think this was a mistake.</p>`,
+      }).catch((err) => console.error('Denial email failed:', err))
+    }
+
+    res.json({ message: 'Denied.' })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not deny this request: ' + err.message })
+  }
+})
+
+// PUT /api/sessions/:id/markers/:userId/accessLevel - body: { accessLevel: 'LIMITED' | 'FULL' }
+router.put('/:id/markers/:userId/accessLevel', async (req, res) => {
+  try {
+    const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
+    if (!session) return res.status(404).json({ error: 'Session not found.' })
+    if (!(await canManageMarkers(session, req.user.id, req.user.role))) {
+      return res.status(403).json({ error: 'You do not have permission to change access levels.' })
+    }
+
+    const { accessLevel } = req.body
+    if (!['LIMITED', 'FULL'].includes(accessLevel)) {
+      return res.status(400).json({ error: 'accessLevel must be LIMITED or FULL.' })
+    }
+
+    await prisma.sessionMarker.update({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.params.userId } },
+      data: { accessLevel },
+    })
+    res.json({ message: 'Access level updated.' })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not update access level: ' + err.message })
+  }
+})
+
+// DELETE /api/sessions/:id/markers/:userId - revoke access. Kept to the
+// Coordinator or an Admin specifically, not every Full-access marker, since
+// removing someone is a bigger call than granting them more access.
+router.delete('/:id/markers/:userId', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
     if (!session) return res.status(404).json({ error: 'Session not found.' })
     if (req.user.role === 'LECTURER' && session.createdById !== req.user.id) {
-      return res.status(403).json({ error: 'Only this session\'s Coordinator or an Admin can change its markers.' })
+      return res.status(403).json({ error: 'Only this session\'s Coordinator or an Admin can revoke access.' })
+    }
+    if (req.params.userId === session.createdById) {
+      return res.status(400).json({ error: 'The Coordinator cannot be removed from their own session.' })
     }
 
-    const { markerUserIds } = req.body
-    if (!Array.isArray(markerUserIds)) {
-      return res.status(400).json({ error: 'markerUserIds must be an array of user ids.' })
-    }
-    const ids = new Set([session.createdById, ...markerUserIds]) // Coordinator always stays a marker
-
-    await prisma.sessionMarker.deleteMany({ where: { sessionId: session.id } })
-    await prisma.sessionMarker.createMany({
-      data: [...ids].map((userId) => ({ sessionId: session.id, userId })),
-      skipDuplicates: true,
+    await prisma.sessionMarker.delete({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.params.userId } },
     })
-
-    const markers = await prisma.sessionMarker.findMany({
-      where: { sessionId: session.id },
-      include: { user: { select: { id: true, name: true, email: true } } },
-    })
-    res.json(markers.map((m) => m.user))
+    res.json({ message: 'Access revoked.' })
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'Could not update markers: ' + err.message })
+    res.status(500).json({ error: 'Could not revoke access: ' + err.message })
+  }
+})
+
+// POST /api/sessions/:id/inviteByEmail - emails the join code directly to
+// someone the Coordinator (or a Full-access marker) already has in mind,
+// rather than requiring them to copy and share the code manually elsewhere.
+// body: { email }
+router.post('/:id/inviteByEmail', async (req, res) => {
+  try {
+    const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
+    if (!session) return res.status(404).json({ error: 'Session not found.' })
+    if (!(await canManageMarkers(session, req.user.id, req.user.role))) {
+      return res.status(403).json({ error: 'You do not have permission to invite markers to this session.' })
+    }
+
+    const { email } = req.body
+    if (!email || !email.trim()) {
+      return res.status(400).json({ error: 'Enter an email address to invite.' })
+    }
+
+    const inviter = await prisma.user.findUnique({ where: { id: req.user.id } })
+
+    await sendEmail({
+      to: email.trim(),
+      subject: `You've been invited to mark ${session.title} on ScriptMark`,
+      html: `<p>Hi,</p><p>${inviter.name} has invited you to help mark <strong>${session.title}</strong>${session.courseCode ? ` (${session.courseCode})` : ''} on ScriptMark.</p><p>If you don't have an account yet, sign up first, then log in and use this join code:</p><p style="font-size:28px;font-weight:bold;letter-spacing:4px;">${session.joinCode}</p><p>Once you're in, you can claim which questions you'll be marking.</p>`,
+    })
+
+    res.json({ message: 'Invite sent.' })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not send that invite: ' + err.message })
   }
 })
 
