@@ -71,6 +71,28 @@ router.get('/lecturers', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
 // POST /api/sessions/join - a lecturer enters a session's join code to be
 // added as one of its markers, no Coordinator approval step needed, the
 // code itself is the access control. Must also stay ABOVE any /:id route.
+// Emails the Coordinator and every Full-access marker that someone needs a
+// decision on their access. Used both for a brand new request, and for a
+// previously-revoked person trying to get back in via the join code.
+async function notifySessionManagers(session, requester) {
+  const managers = await prisma.sessionMarker.findMany({
+    where: { sessionId: session.id, status: 'APPROVED', accessLevel: 'FULL' },
+    include: { user: { select: { email: true, name: true } } },
+  })
+  const coordinator = await prisma.user.findUnique({ where: { id: session.createdById } })
+  const recipients = new Map()
+  if (coordinator) recipients.set(coordinator.email, coordinator.name)
+  managers.forEach((m) => recipients.set(m.user.email, m.user.name))
+
+  for (const [email, name] of recipients) {
+    sendEmail({
+      to: email,
+      subject: `${requester.name} wants to join ${session.title}`,
+      html: `<p>Hi ${name},</p><p>${requester.name} (${requester.email}) has requested to join <strong>${session.title}</strong> as a marker on ScriptMark.</p><p>Open Claim Questions in the session to approve or deny it.</p>`,
+    }).catch((err) => console.error('Request notification email failed:', err))
+  }
+}
+
 router.post('/join', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const { code } = req.body
@@ -81,6 +103,28 @@ router.post('/join', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
     const session = await prisma.markingSession.findUnique({ where: { joinCode: code.trim().toUpperCase() } })
     if (!session) {
       return res.status(404).json({ error: 'No session found with that code. Check it and try again.' })
+    }
+
+    const existing = await prisma.sessionMarker.findUnique({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+    })
+
+    if (existing?.status === 'REVOKED') {
+      // The code alone can't undo a revoke. This routes them back through
+      // approval instead of letting them straight back in.
+      await prisma.sessionMarker.update({
+        where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+        data: { status: 'PENDING' },
+      })
+      const requester = await prisma.user.findUnique({ where: { id: req.user.id } })
+      await notifySessionManagers(session, requester)
+      return res.status(403).json({
+        error: 'Your access to this session was previously revoked. A new request has been sent to the Coordinator for review.',
+      })
+    }
+
+    if (existing?.status === 'PENDING') {
+      return res.status(403).json({ error: 'Your request to join this session is still awaiting approval.' })
     }
 
     await prisma.sessionMarker.upsert({
@@ -256,15 +300,28 @@ router.post('/:id/requestAccess', requireRole('LECTURER', 'ADMIN'), async (req, 
     const existing = await prisma.sessionMarker.findUnique({
       where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
     })
-    if (existing) {
+    if (existing && existing.status !== 'REVOKED') {
       return res.status(400).json({
         error: existing.status === 'PENDING' ? 'You already have a pending request for this session.' : 'You already have access to this session.',
       })
     }
 
-    await prisma.sessionMarker.create({
-      data: { sessionId: session.id, userId: req.user.id, status: 'PENDING', accessLevel: 'LIMITED' },
-    })
+    if (existing?.status === 'REVOKED') {
+      await prisma.sessionMarker.update({
+        where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+        data: { status: 'PENDING' },
+      })
+    } else {
+      await prisma.sessionMarker.create({
+        data: { sessionId: session.id, userId: req.user.id, status: 'PENDING', accessLevel: 'LIMITED' },
+      })
+    }
+
+    // Tell whoever can actually approve this, since otherwise a request just
+    // sits invisible until someone happens to open Claim Questions.
+    const requester = await prisma.user.findUnique({ where: { id: req.user.id } })
+    await notifySessionManagers(session, requester)
+
     res.status(201).json({ message: 'Request sent. The Coordinator will review it.' })
   } catch (err) {
     console.error(err)
@@ -391,8 +448,13 @@ router.delete('/:id/markers/:userId', requireRole('LECTURER', 'ADMIN'), async (r
       return res.status(400).json({ error: 'The Coordinator cannot be removed from their own session.' })
     }
 
-    await prisma.sessionMarker.delete({
+    // Marked REVOKED rather than deleted, so the fact this person was
+    // removed persists. If they try the join code again, /join checks for
+    // this and routes them back through approval instead of letting them
+    // straight back in.
+    await prisma.sessionMarker.update({
       where: { sessionId_userId: { sessionId: session.id, userId: req.params.userId } },
+      data: { status: 'REVOKED' },
     })
     res.json({ message: 'Access revoked.' })
   } catch (err) {
