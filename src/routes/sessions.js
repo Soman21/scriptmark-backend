@@ -10,8 +10,65 @@ import { writeResultsPdf } from '../lib/pdfExport.js'
 import { extractStudentInfo, scoreScriptAgainstGuide } from '../lib/groq.js'
 import { pdfToPageImages } from '../lib/pdfSplit.js'
 import { sendEmail } from '../lib/email.js'
+import jwt from 'jsonwebtoken'
 
 const router = express.Router()
+// GET /api/sessions/approveByLink and /denyByLink - the one-click buttons in
+// the request-notification email. Deliberately placed BEFORE requireAuth
+// below: whoever clicks these has no login session, the signed token itself
+// (checked inside) is what authorizes the action, not a cookie or header.
+router.get('/approveByLink', async (req, res) => {
+  await handleActionByLink(req, res, 'approve')
+})
+
+router.get('/denyByLink', async (req, res) => {
+  await handleActionByLink(req, res, 'deny')
+})
+
+async function handleActionByLink(req, res, expectedAction) {
+  const linkPage = (title, message, ok) => `
+    <html><body style="font-family:sans-serif;max-width:480px;margin:80px auto;text-align:center;">
+      <h2 style="color:${ok ? '#059669' : '#e11d48'};">${title}</h2>
+      <p style="color:#475569;">${message}</p>
+    </body></html>`
+
+  try {
+    const { token } = req.query
+    if (!token) return res.status(400).send(linkPage('Missing link', 'This link is incomplete.', false))
+
+    let payload
+    try {
+      payload = jwt.verify(token, process.env.JWT_SECRET)
+    } catch {
+      return res.status(400).send(linkPage('Link expired', 'This link has expired or is no longer valid. Open Claim Questions in the app instead.', false))
+    }
+    if (payload.action !== expectedAction) {
+      return res.status(400).send(linkPage('Invalid link', 'This link is not valid for this action.', false))
+    }
+
+    const session = await prisma.markingSession.findUnique({ where: { id: payload.sessionId } })
+    if (!session) return res.status(404).send(linkPage('Session not found', 'This session no longer exists.', false))
+
+    const marker = await prisma.sessionMarker.findUnique({
+      where: { sessionId_userId: { sessionId: session.id, userId: payload.userId } },
+    })
+    if (!marker || marker.status !== 'PENDING') {
+      return res.status(400).send(linkPage('Already handled', 'This request has already been decided, or no longer exists.', false))
+    }
+
+    if (expectedAction === 'approve') {
+      await approveMarkerCore(session, payload.userId)
+      res.send(linkPage('Access granted', `They've been added to ${session.title} and notified by email.`, true))
+    } else {
+      await denyMarkerCore(session, payload.userId)
+      res.send(linkPage('Request denied', `They've been notified by email.`, true))
+    }
+  } catch (err) {
+    console.error(err)
+    res.status(500).send(linkPage('Something went wrong', err.message, false))
+  }
+}
+
 router.use(requireAuth)
 
 // Short, human-typeable join code (uppercase letters and digits, no
@@ -74,7 +131,7 @@ router.get('/lecturers', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
 // Emails the Coordinator and every Full-access marker that someone needs a
 // decision on their access. Used both for a brand new request, and for a
 // previously-revoked person trying to get back in via the join code.
-async function notifySessionManagers(session, requester) {
+async function notifySessionManagers(req, session, requester) {
   const managers = await prisma.sessionMarker.findMany({
     where: { sessionId: session.id, status: 'APPROVED', accessLevel: 'FULL' },
     include: { user: { select: { email: true, name: true } } },
@@ -84,16 +141,25 @@ async function notifySessionManagers(session, requester) {
   if (coordinator) recipients.set(coordinator.email, coordinator.name)
   managers.forEach((m) => recipients.set(m.user.email, m.user.name))
 
+  const baseUrl = `${req.protocol}://${req.get('host')}`
+  // Short-lived, single-purpose tokens: possessing the link IS the
+  // authorization for exactly this one decision, nothing else. They expire
+  // in 7 days, matching how long a request realistically stays relevant.
+  const approveToken = jwt.sign({ action: 'approve', sessionId: session.id, userId: requester.id }, process.env.JWT_SECRET, { expiresIn: '7d' })
+  const denyToken = jwt.sign({ action: 'deny', sessionId: session.id, userId: requester.id }, process.env.JWT_SECRET, { expiresIn: '7d' })
+  const approveUrl = `${baseUrl}/api/sessions/approveByLink?token=${approveToken}`
+  const denyUrl = `${baseUrl}/api/sessions/denyByLink?token=${denyToken}`
+
   for (const [email, name] of recipients) {
     sendEmail({
       to: email,
       subject: `${requester.name} wants to join ${session.title}`,
-      html: `<p>Hi ${name},</p><p>${requester.name} (${requester.email}) has requested to join <strong>${session.title}</strong> as a marker on ScriptMark.</p><p>Open Claim Questions in the session to approve or deny it.</p>`,
+      html: `<p>Hi ${name},</p><p>${requester.name} (${requester.email}) has requested to join <strong>${session.title}</strong> as a marker on ScriptMark.</p><p style="margin:20px 0;"><a href="${approveUrl}" style="background:#059669;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:bold;margin-right:10px;">Grant Access</a><a href="${denyUrl}" style="background:#f1f5f9;color:#475569;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">Deny</a></p><p>Or open Claim Questions in the session to review it there instead.</p>`,
     }).catch((err) => console.error('Request notification email failed:', err))
   }
 }
 
-router.post('/join', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+router.post('/join', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, res) => {
   try {
     const { code } = req.body
     if (!code || !code.trim()) {
@@ -117,7 +183,7 @@ router.post('/join', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         data: { status: 'PENDING' },
       })
       const requester = await prisma.user.findUnique({ where: { id: req.user.id } })
-      await notifySessionManagers(session, requester)
+      await notifySessionManagers(req, session, requester)
       return res.status(403).json({
         error: 'Your access to this session was previously revoked. A new request has been sent to the Coordinator for review.',
       })
@@ -143,7 +209,7 @@ router.post('/join', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
 // GET /api/sessions/browsable - ACTIVE sessions the current user is not
 // already a marker on, for the "Request Access" flow when they don't have
 // a join code. Must stay ABOVE any /:id route below.
-router.get('/browsable', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+router.get('/browsable', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, res) => {
   const myMemberships = await prisma.sessionMarker.findMany({
     where: { userId: req.user.id },
     select: { sessionId: true },
@@ -159,10 +225,17 @@ router.get('/browsable', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
 })
 
 router.get('/', async (req, res) => {
-  // Lecturers get their own private workspace; Reviewers and Admins need to
-  // see everyone's sessions since reviewing someone else's uploads is the
-  // whole point of that role.
-  const where = req.user.role === 'LECTURER' ? { createdById: req.user.id } : {}
+  // Visibility is based on actual membership now, not role: you see a
+  // session if you created it or you're an approved marker on it. Only
+  // Admin sees everything unconditionally.
+  let where = {}
+  if (req.user.role !== 'ADMIN') {
+    const memberships = await prisma.sessionMarker.findMany({
+      where: { userId: req.user.id, status: 'APPROVED' },
+      select: { sessionId: true },
+    })
+    where = { OR: [{ createdById: req.user.id }, { id: { in: memberships.map((m) => m.sessionId) } }] }
+  }
   const sessions = await prisma.markingSession.findMany({
     where,
     include: {
@@ -225,13 +298,18 @@ router.get('/:id', async (req, res) => {
     include: { guide: { include: { questions: { orderBy: { order: 'asc' } } } } },
   })
   if (!session) return res.status(404).json({ error: 'Session not found.' })
-  if (req.user.role === 'LECTURER' && session.createdById !== req.user.id) {
-    return res.status(403).json({ error: 'You do not have permission to view this session.' })
+  if (req.user.role !== 'ADMIN' && session.createdById !== req.user.id) {
+    const membership = await prisma.sessionMarker.findUnique({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+    })
+    if (!membership || membership.status !== 'APPROVED') {
+      return res.status(403).json({ error: 'You do not have permission to view this session.' })
+    }
   }
   res.json(session)
 })
 
-router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+router.put('/:id', requireRole('LECTURER', 'ADMIN'), requireMembership, async (req, res) => {
   try {
     const {
       title,
@@ -268,7 +346,7 @@ router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
 // session, for populating "Assigned Marker" dropdowns in the guide builder.
 // GET /api/sessions/:id/markers - APPROVED markers only, with their access
 // level, for the Claim Questions page and marker management.
-router.get('/:id/markers', async (req, res) => {
+router.get('/:id/markers', requireMembership, async (req, res) => {
   const markers = await prisma.sessionMarker.findMany({
     where: { sessionId: req.params.id, status: 'APPROVED' },
     include: { user: { select: { id: true, name: true, email: true } } },
@@ -287,12 +365,66 @@ async function canManageMarkers(session, userId, userRole) {
   return !!marker && marker.status === 'APPROVED' && marker.accessLevel === 'FULL'
 }
 
+// Gate for any /:id/... route that should only be reachable by people who
+// actually belong to that session: its creator, an Admin, or an APPROVED
+// marker on it. Deliberately NOT applied to /:id/requestAccess, since a
+// non-member asking to join is the entire point of that route.
+async function requireMembership(req, res, next) {
+  try {
+    const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
+    if (!session) return res.status(404).json({ error: 'Session not found.' })
+    if (req.user.role === 'ADMIN' || session.createdById === req.user.id) {
+      req.markingSession = session
+      return next()
+    }
+    const membership = await prisma.sessionMarker.findUnique({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+    })
+    if (!membership || membership.status !== 'APPROVED') {
+      return res.status(403).json({ error: 'You do not have permission to access this session.' })
+    }
+    req.markingSession = session
+    next()
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not verify session access: ' + err.message })
+  }
+}
+
+// Same idea, for routes keyed by :scriptId instead of a session :id — looks
+// up the script's session first, then applies the same membership check.
+async function requireScriptMembership(req, res, next) {
+  try {
+    const script = await prisma.script.findUnique({ where: { id: req.params.scriptId } })
+    if (!script) return res.status(404).json({ error: 'Script not found.' })
+    const session = await prisma.markingSession.findUnique({ where: { id: script.sessionId } })
+    if (!session) return res.status(404).json({ error: 'Session not found.' })
+    if (req.user.role === 'ADMIN' || session.createdById === req.user.id) {
+      req.markingSession = session
+      req.script = script
+      return next()
+    }
+    const membership = await prisma.sessionMarker.findUnique({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+    })
+    if (!membership || membership.status !== 'APPROVED') {
+      return res.status(403).json({ error: 'You do not have permission to access this script.' })
+    }
+    req.markingSession = session
+    req.script = script
+    next()
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not verify session access: ' + err.message })
+  }
+}
+
 // GET /api/sessions/browsable - ACTIVE sessions the current user is not
 // already a marker on, for the "Request Access" flow when they don't have
 // a join code.
 // POST /api/sessions/:id/requestAccess - ask to join a session without a
 // code. Sits PENDING until the Coordinator or a Full-access marker decides.
-router.post('/:id/requestAccess', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+router.post('/:id/requestAccess', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
     if (!session) return res.status(404).json({ error: 'Session not found.' })
@@ -320,7 +452,7 @@ router.post('/:id/requestAccess', requireRole('LECTURER', 'ADMIN'), async (req, 
     // Tell whoever can actually approve this, since otherwise a request just
     // sits invisible until someone happens to open Claim Questions.
     const requester = await prisma.user.findUnique({ where: { id: req.user.id } })
-    await notifySessionManagers(session, requester)
+    await notifySessionManagers(req, session, requester)
 
     res.status(201).json({ message: 'Request sent. The Coordinator will review it.' })
   } catch (err) {
@@ -350,6 +482,35 @@ router.get('/:id/pendingRequests', async (req, res) => {
 })
 
 // PUT /api/sessions/:id/markers/:userId/approve
+async function approveMarkerCore(session, userId) {
+  await prisma.sessionMarker.update({
+    where: { sessionId_userId: { sessionId: session.id, userId } },
+    data: { status: 'APPROVED' },
+  })
+  const requester = await prisma.user.findUnique({ where: { id: userId } })
+  if (requester) {
+    sendEmail({
+      to: requester.email,
+      subject: `You've been added to ${session.title}`,
+      html: `<p>Hi ${requester.name},</p><p>Your request to join <strong>${session.title}</strong> on ScriptMark has been approved. You can now claim questions to mark.</p>`,
+    }).catch((err) => console.error('Approval email failed:', err))
+  }
+}
+
+async function denyMarkerCore(session, userId) {
+  const requester = await prisma.user.findUnique({ where: { id: userId } })
+  await prisma.sessionMarker.delete({
+    where: { sessionId_userId: { sessionId: session.id, userId } },
+  })
+  if (requester) {
+    sendEmail({
+      to: requester.email,
+      subject: `Your request to join ${session.title} was declined`,
+      html: `<p>Hi ${requester.name},</p><p>Your request to join <strong>${session.title}</strong> on ScriptMark was not approved. You can reach out to the Coordinator directly if you think this was a mistake.</p>`,
+    }).catch((err) => console.error('Denial email failed:', err))
+  }
+}
+
 router.put('/:id/markers/:userId/approve', async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
@@ -358,20 +519,7 @@ router.put('/:id/markers/:userId/approve', async (req, res) => {
       return res.status(403).json({ error: 'You do not have permission to approve markers.' })
     }
 
-    await prisma.sessionMarker.update({
-      where: { sessionId_userId: { sessionId: session.id, userId: req.params.userId } },
-      data: { status: 'APPROVED' },
-    })
-
-    const requester = await prisma.user.findUnique({ where: { id: req.params.userId } })
-    if (requester) {
-      sendEmail({
-        to: requester.email,
-        subject: `You've been added to ${session.title}`,
-        html: `<p>Hi ${requester.name},</p><p>Your request to join <strong>${session.title}</strong> on ScriptMark has been approved. You can now claim questions to mark.</p>`,
-      }).catch((err) => console.error('Approval email failed:', err))
-    }
-
+    await approveMarkerCore(session, req.params.userId)
     res.json({ message: 'Approved.' })
   } catch (err) {
     console.error(err)
@@ -388,20 +536,7 @@ router.put('/:id/markers/:userId/deny', async (req, res) => {
       return res.status(403).json({ error: 'You do not have permission to deny markers.' })
     }
 
-    const requester = await prisma.user.findUnique({ where: { id: req.params.userId } })
-
-    await prisma.sessionMarker.delete({
-      where: { sessionId_userId: { sessionId: session.id, userId: req.params.userId } },
-    })
-
-    if (requester) {
-      sendEmail({
-        to: requester.email,
-        subject: `Your request to join ${session.title} was declined`,
-        html: `<p>Hi ${requester.name},</p><p>Your request to join <strong>${session.title}</strong> on ScriptMark was not approved. You can reach out to the Coordinator directly if you think this was a mistake.</p>`,
-      }).catch((err) => console.error('Denial email failed:', err))
-    }
-
+    await denyMarkerCore(session, req.params.userId)
     res.json({ message: 'Denied.' })
   } catch (err) {
     console.error(err)
@@ -495,7 +630,7 @@ router.post('/:id/inviteByEmail', async (req, res) => {
   }
 })
 
-router.get('/scripts/:scriptId', async (req, res) => {
+router.get('/scripts/:scriptId', requireScriptMembership, async (req, res) => {
   const script = await prisma.script.findUnique({
     where: { id: req.params.scriptId },
     include: { pages: { orderBy: { pageNumber: 'asc' } }, answers: { include: { question: true } } },
@@ -504,7 +639,7 @@ router.get('/scripts/:scriptId', async (req, res) => {
   res.json(script)
 })
 
-router.put('/scripts/:scriptId/studentInfo', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+router.put('/scripts/:scriptId/studentInfo', requireRole('LECTURER', 'ADMIN'), requireScriptMembership, async (req, res) => {
   try {
     const { studentName, regNumber } = req.body
     const identifier = [studentName, regNumber].filter(Boolean).join(' — ') || null
@@ -522,7 +657,7 @@ router.put('/scripts/:scriptId/studentInfo', requireRole('LECTURER', 'ADMIN'), a
   }
 })
 
-router.get('/:id/scripts', async (req, res) => {
+router.get('/:id/scripts', requireMembership, async (req, res) => {
   const scripts = await prisma.script.findMany({
     where: { sessionId: req.params.id },
     include: {
@@ -537,7 +672,7 @@ router.get('/:id/scripts', async (req, res) => {
 // POST /api/sessions/:id/scripts - upload a page of a script.
 // studentName/regNumber are OPTIONAL when starting a new script — if left blank,
 // the system tries to read them automatically from the front page's OCR text.
-router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), upload.single('image'), async (req, res) => {
+router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No image file was uploaded (expected field name "image").' })
@@ -629,7 +764,7 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), upload.single('ima
   }
 })
 
-router.put('/scripts/:scriptId/caScore', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+router.put('/scripts/:scriptId/caScore', requireRole('LECTURER', 'ADMIN'), requireScriptMembership, async (req, res) => {
   try {
     const { caScore } = req.body
     const script = await prisma.script.update({
@@ -642,7 +777,7 @@ router.put('/scripts/:scriptId/caScore', requireRole('LECTURER', 'ADMIN'), async
   }
 })
 
-router.delete('/:id/scripts/:scriptId', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+router.delete('/:id/scripts/:scriptId', requireRole('LECTURER', 'ADMIN'), requireMembership, async (req, res) => {
   try {
     await prisma.script.delete({ where: { id: req.params.scriptId } })
     res.status(204).end()
@@ -665,7 +800,7 @@ router.delete('/:id/scripts/:scriptId', requireRole('LECTURER', 'ADMIN'), async 
 // reg numbers will appear once Marking digitizes each script, not here.
 //
 // multipart/form-data: pdf (required), pagesPerSubmission (required)
-router.post('/:id/scripts/bulkSplit', requireRole('LECTURER', 'ADMIN'), uploadPdf.single('pdf'), async (req, res) => {
+router.post('/:id/scripts/bulkSplit', requireRole('LECTURER', 'ADMIN'), requireMembership, uploadPdf.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No PDF file was uploaded (expected field name "pdf").' })
@@ -704,7 +839,7 @@ router.post('/:id/scripts/bulkSplit', requireRole('LECTURER', 'ADMIN'), uploadPd
 // is created as PENDING, and gets digitized + scored automatically once
 // Marking starts (see /mark below). This is what keeps Confirm & Upload fast.
 // body: { groups: [{ studentName, regNumber, pages: [{ imageUrl }] }] }
-router.post('/:id/scripts/bulkConfirm', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+router.post('/:id/scripts/bulkConfirm', requireRole('LECTURER', 'ADMIN'), requireMembership, async (req, res) => {
   try {
     const { groups } = req.body
     if (!Array.isArray(groups) || groups.length === 0) {
@@ -752,7 +887,7 @@ router.post('/:id/scripts/bulkConfirm', requireRole('LECTURER', 'ADMIN'), async 
 // then sends just that final result here. Untouched pages never hit this
 // route at all, so splitting/reviewing stays free of any extra cost unless
 // a page is actually edited.
-router.post('/:id/scripts/uploadPage', requireRole('LECTURER', 'ADMIN'), upload.single('image'), async (req, res) => {
+router.post('/:id/scripts/uploadPage', requireRole('LECTURER', 'ADMIN'), requireMembership, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No image was uploaded (expected field name "image").' })
@@ -773,7 +908,7 @@ router.post('/:id/scripts/uploadPage', requireRole('LECTURER', 'ADMIN'), upload.
 // Script + ScriptPage records directly. Same as the other upload paths, no
 // OCR happens here; digitizing and scoring happen automatically in Marking.
 // multipart/form-data: files (multiple, each image/* or application/pdf)
-router.post('/:id/scripts/batchUpload', requireRole('LECTURER', 'ADMIN'), uploadBatch.array('files', 50), async (req, res) => {
+router.post('/:id/scripts/batchUpload', requireRole('LECTURER', 'ADMIN'), requireMembership, uploadBatch.array('files', 50), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: 'No files were uploaded (expected field name "files").' })
@@ -817,7 +952,7 @@ router.post('/:id/scripts/batchUpload', requireRole('LECTURER', 'ADMIN'), upload
 // Responds immediately; the actual work continues on the server afterward,
 // independent of whether the lecturer stays on the page. Poll
 // GET /:id/markingStatus for live progress.
-router.post('/:id/mark', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+router.post('/:id/mark', requireRole('LECTURER', 'ADMIN'), requireMembership, async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
     if (!session) return res.status(404).json({ error: 'Session not found.' })
@@ -936,7 +1071,7 @@ async function runMarkingQueue(scripts, guide, session) {
 // GET /api/sessions/:id/markingStatus - polled by the Marking page for live
 // progress: how many scripts are marked (SCORED or REVIEWED) out of the
 // total, plus a per-script summary for the queue table.
-router.get('/:id/markingStatus', async (req, res) => {
+router.get('/:id/markingStatus', requireMembership, async (req, res) => {
   try {
     const scripts = await prisma.script.findMany({
       where: { sessionId: req.params.id },
@@ -965,7 +1100,7 @@ router.get('/:id/markingStatus', async (req, res) => {
 // per-marker breakdown, for the Coordinator's oversight dashboard. Anyone
 // can call this (Results/Marking pages already gate who sees the link to
 // it), it just returns aggregate counts, nothing sensitive per-student.
-router.get('/:id/coordinatorOverview', async (req, res) => {
+router.get('/:id/coordinatorOverview', requireMembership, async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({
       where: { id: req.params.id },
@@ -1016,7 +1151,7 @@ router.get('/:id/coordinatorOverview', async (req, res) => {
   }
 })
 
-router.get('/:id/export', async (req, res) => {
+router.get('/:id/export', requireMembership, async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
     if (!session) return res.status(404).json({ error: 'Session not found.' })
@@ -1088,7 +1223,7 @@ router.get('/:id/export', async (req, res) => {
 
 // GET /api/sessions/:id/analytics - real cohort-level stats for this session,
 // computed from actual confirmed/suggested scores.
-router.get('/:id/analytics', async (req, res) => {
+router.get('/:id/analytics', requireMembership, async (req, res) => {
   try {
     const scripts = await prisma.script.findMany({
       where: { sessionId: req.params.id },
