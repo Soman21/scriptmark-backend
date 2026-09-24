@@ -4,6 +4,7 @@ import prisma from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { extractTextFromDocument } from '../lib/docParse.js'
 import { parseMarkingSchemeDocument, generateModelAnswers } from '../lib/groq.js'
+import { uploadScriptImage } from '../lib/supabaseStorage.js'
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -59,7 +60,11 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
       return res.status(400).json({ error: 'Could not identify any questions in that document. Please check the formatting or enter them manually.' })
     }
 
-    res.json({ ...parsed, previewText: rawText.slice(0, 8000) })
+    // Keep the original file too, not just the extracted text, so markers
+    // can preview it in its real layout later, on the Claim Questions page.
+    const documentUrl = await uploadScriptImage(req.file.buffer, req.file.originalname, req.file.mimetype)
+
+    res.json({ ...parsed, previewText: rawText.slice(0, 8000), documentUrl, documentMimeType: req.file.mimetype })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not parse this document: ' + err.message })
@@ -121,6 +126,8 @@ router.get('/:id/claimStatus', async (req, res) => {
 
     res.json({
       questions: guide.questions,
+      questionPaperUrl: guide.questionPaperUrl,
+      questionPaperMimeType: guide.questionPaperMimeType,
       markers: markers.map((m) => ({ ...m.user, accessLevel: m.accessLevel })),
       isCoordinator: session.createdById === req.user.id,
       canManage,
@@ -187,7 +194,7 @@ router.put('/:id/questions/:questionId/claim', requireRole('LECTURER', 'ADMIN'),
 
 router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
-    const { title, subject, questions, isDraft } = req.body
+    const { title, subject, questions, isDraft, questionPaperUrl, questionPaperMimeType } = req.body
 
     if (!title) {
       return res.status(400).json({ error: 'A title is required, even for a draft.' })
@@ -202,6 +209,8 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         subject,
         isDraft: !!isDraft,
         createdById: req.user.id,
+        questionPaperUrl: questionPaperUrl || null,
+        questionPaperMimeType: questionPaperMimeType || null,
         questions: {
           create: (questions || []).map((q, i) => ({
             number: q.number || '1',
@@ -227,7 +236,7 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
 // PUT /api/guides/:id - full edit: title, subject, isDraft, and replace all questions.
 router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
-    const { title, subject, isDraft, questions } = req.body
+    const { title, subject, isDraft, questions, questionPaperUrl, questionPaperMimeType } = req.body
 
     const guide = await prisma.markingGuide.update({
       where: { id: req.params.id },
@@ -235,6 +244,8 @@ router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         title,
         subject,
         isDraft: !!isDraft,
+        ...(questionPaperUrl !== undefined ? { questionPaperUrl } : {}),
+        ...(questionPaperMimeType !== undefined ? { questionPaperMimeType } : {}),
         questions: {
           deleteMany: {},
           create: (questions || []).map((q, i) => ({

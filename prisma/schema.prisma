@@ -87,6 +87,11 @@ model MarkingGuide {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
+  // The actual uploaded question paper file, kept so markers can preview it
+  // in its original layout later, not just the AI-extracted text.
+  questionPaperUrl      String?
+  questionPaperMimeType String?
+
   questions Question[]
   sessions  MarkingSession[]
 }
