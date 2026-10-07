@@ -111,6 +111,17 @@ model Question {
   assignedMarkerId String?
   assignedMarker   User?   @relation("AssignedQuestions", fields: [assignedMarkerId], references: [id])
 
+  // Flagged during guide parsing (or manually by the lecturer) when a question
+  // involves calculation/working that standard OCR is likely to mangle. Such
+  // questions get an extra vision model re transcription pass before scoring,
+  // see groq.js transcribeCalculationFromImage.
+  isCalculationHeavy Boolean @default(false)
+
+  // Optional step by step marking rubric: an array of { description, marks }
+  // objects whose marks should sum to maxMarks. When present, the AI scores
+  // and awards marks per step instead of one flat holistic score.
+  steps Json?
+
   scriptAnswers ScriptAnswer[]
 }
 
@@ -135,6 +146,19 @@ model MarkingSession {
   status      SessionStatus @default(DRAFT)
   createdAt   DateTime      @default(now())
 
+  // Roster used to correct OCR-guessed student name/reg number at marking
+  // time. A single merged list, built from whichever documents get uploaded
+  // (attendance sheet at script-upload time, official class list nearer
+  // export, either order, either both or just one) — see roster.js. Each
+  // entry: { id, name, regNumber, flagged, conflict: null | { name, regNumber, uploadId } }.
+  // No relation table on purpose: entries are only ever read/written as a
+  // whole list against a session, never queried individually.
+  classList        Json?
+  // One entry per upload that has ever contributed to classList, so a
+  // flagged entry's conflict can point back to the actual source document
+  // for the lecturer to preview. { id, documentUrl, mimeType, previewText, uploadedAt }.
+  classListUploads Json?
+
   scripts Script[]
   markers SessionMarker[]
 }
@@ -146,6 +170,13 @@ model Script {
   studentIdentifier     String?
   studentName           String?
   regNumber             String?
+  // Soft reference (not a Prisma relation, since classList lives as JSON on
+  // the session) to the classList entry this script was matched to by reg
+  // number, if any. Used to look the entry back up when checking whether a
+  // script's identity is still resting on an unresolved flagged conflict,
+  // e.g. before allowing export. Null means no roster was uploaded yet, or
+  // nothing in it matched this script's OCR-detected reg number.
+  classListEntryId     String?
   caScore               Float?
   imageUrl              String?
   ocrText               String?
@@ -196,4 +227,15 @@ model ScriptAnswer {
   changedById    String?
   changedBy      User?     @relation("ChangedAnswers", fields: [changedById], references: [id])
   changedAt      DateTime?
+
+  // Populated only for isCalculationHeavy questions: the vision model's
+  // re transcription of the page image(s), used in place of the standard
+  // OCR text for that question's scoring pass. Shown to the reviewer so
+  // they can check what the AI actually read, not just trust the score.
+  visionTranscript String?
+
+  // Populated only when the question has a steps rubric: an array of
+  // { description, marks, awarded, reasoning } mirroring Question.steps,
+  // for transparency during review.
+  stepBreakdown Json?
 }

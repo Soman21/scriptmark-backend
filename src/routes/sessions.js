@@ -5,9 +5,12 @@ import prisma from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { extractTextFromImage } from '../lib/vision.js'
+import { extractTextFromDocument } from '../lib/docParse.js'
 import { computeGrade } from '../lib/grading.js'
 import { writeResultsPdf } from '../lib/pdfExport.js'
-import { extractStudentInfo, scoreScriptAgainstGuide } from '../lib/groq.js'
+import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, parseClassList } from '../lib/groq.js'
+import { matchRegNumber, mergeClassListEntries, normalizeRegNumber, findUnresolvedScripts } from '../lib/roster.js'
+import { computeSessionAnalytics } from '../lib/analytics.js'
 import { pdfToPageImages } from '../lib/pdfSplit.js'
 import { sendEmail } from '../lib/email.js'
 import jwt from 'jsonwebtoken'
@@ -298,15 +301,27 @@ router.get('/:id', async (req, res) => {
     include: { guide: { include: { questions: { orderBy: { order: 'asc' } } } } },
   })
   if (!session) return res.status(404).json({ error: 'Session not found.' })
-  if (req.user.role !== 'ADMIN' && session.createdById !== req.user.id) {
-    const membership = await prisma.sessionMarker.findUnique({
+
+  const isCreator = session.createdById === req.user.id
+  let myMembership = null
+  if (req.user.role !== 'ADMIN' && !isCreator) {
+    myMembership = await prisma.sessionMarker.findUnique({
       where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
     })
-    if (!membership || membership.status !== 'APPROVED') {
+    if (!myMembership || myMembership.status !== 'APPROVED') {
       return res.status(403).json({ error: 'You do not have permission to view this session.' })
     }
   }
-  res.json(session)
+
+  // Tells the frontend what this specific user can do in this specific
+  // session, so the workspace tab bar can be built from real membership
+  // rather than the user's global account role (a LECTURER account is not
+  // automatically the coordinator of every session they can see).
+  res.json({
+    ...session,
+    isCreator,
+    accessLevel: isCreator || req.user.role === 'ADMIN' ? 'FULL' : myMembership.accessLevel,
+  })
 })
 
 router.put('/:id', requireRole('LECTURER', 'ADMIN'), requireMembership, async (req, res) => {
@@ -1015,6 +1030,24 @@ async function runMarkingQueue(scripts, guide, session) {
           regNumber = regNumber || detected.regNumber
         }
 
+        // If the session has a roster (attendance sheet and/or official
+        // class list, merged), a matching reg number overrides both the
+        // manually typed and AI-detected name/reg number with the roster's
+        // canonical values — reg number is the one field OCR/manual entry
+        // gets reliably enough to match on, name is not. Still matches even
+        // if the roster entry is itself currently flagged, so the script
+        // stays associated with it and picks up the corrected name
+        // automatically once the lecturer resolves the flag.
+        let classListEntryId = null
+        if (regNumber && Array.isArray(session.classList) && session.classList.length > 0) {
+          const match = matchRegNumber(regNumber, session.classList)
+          if (match) {
+            studentName = match.entry.name
+            regNumber = match.entry.regNumber
+            classListEntryId = match.entry.id
+          }
+        }
+
         await prisma.script.update({
           where: { id: script.id },
           data: {
@@ -1023,12 +1056,45 @@ async function runMarkingQueue(scripts, guide, session) {
             status: 'DIGITIZED',
             studentName,
             regNumber,
+            classListEntryId,
             studentIdentifier: [studentName, regNumber].filter(Boolean).join(' — ') || script.studentIdentifier,
           },
         })
       }
 
       const results = await scoreScriptAgainstGuide(ocrText, guide.questions)
+
+      // For calculation heavy questions, standard OCR is unreliable on
+      // mathematical notation, so re transcribe that question's answer
+      // directly from the page image(s) with the vision model and re score
+      // just that question against the corrected transcript. Runs after the
+      // normal batch score above so a vision failure just leaves the
+      // original OCR based result in place rather than losing the question.
+      const pageImageUrls = script.pages.map((p) => p.imageUrl).filter(Boolean)
+      const calcHeavyQuestions = guide.questions.filter((q) => q.isCalculationHeavy)
+      for (const q of calcHeavyQuestions) {
+        try {
+          const visionTranscript = await transcribeCalculationFromImage(pageImageUrls, {
+            text: q.text,
+            maxMarks: q.maxMarks,
+          })
+          if (!visionTranscript) continue
+
+          const [rescored] = await scoreScriptAgainstGuide(visionTranscript, [q])
+          if (!rescored) continue
+
+          const idx = results.findIndex((r) => r.questionId === q.id)
+          const withTranscript = { ...rescored, visionTranscript }
+          if (idx >= 0) {
+            results[idx] = withTranscript
+          } else {
+            results.push(withTranscript)
+          }
+        } catch (err) {
+          console.error(`Calculation heavy re transcription failed for question ${q.id}:`, err)
+        }
+      }
+
       let totalSuggested = 0
       let hasLowConfidence = false
 
@@ -1046,6 +1112,8 @@ async function runMarkingQueue(scripts, guide, session) {
           reasoning: r.reasoning,
           confidence: r.confidence || null,
           extractedText: r.answerText || ocrText,
+          visionTranscript: r.visionTranscript || null,
+          stepBreakdown: r.stepBreakdown || null,
           ...(autoAccept ? { confirmedScore: r.suggestedScore, confirmedAt: new Date(), autoAccepted: true } : {}),
         }
         if (existing) {
@@ -1151,6 +1219,122 @@ router.get('/:id/coordinatorOverview', requireMembership, async (req, res) => {
   }
 })
 
+// POST /api/sessions/:id/classList - upload a document (typed class list,
+// PDF/DOCX, or a scanned/photographed attendance sheet, image) containing
+// student names and reg numbers. Extracts, structures via Groq, and merges
+// into whatever roster the session already has (see roster.js) — does NOT
+// replace it, since attendance and the official list are usually different
+// subsets of the same class and both are worth keeping. Can be called at
+// any point in a session's life, any number of times, in either order.
+router.post('/:id/classList', requireMembership, uploadPdf.single('document'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No document was uploaded (expected field name "document").' })
+    }
+
+    const isImage = req.file.mimetype.startsWith('image/')
+    let rawText
+    if (isImage) {
+      const { text } = await extractTextFromImage(req.file.buffer)
+      rawText = text
+    } else {
+      rawText = await extractTextFromDocument(req.file.buffer, req.file.mimetype)
+    }
+
+    if (!rawText || !rawText.trim()) {
+      return res.status(400).json({ error: 'Could not find any readable text in that document.' })
+    }
+
+    const rows = await parseClassList(rawText)
+    if (rows.length === 0) {
+      return res.status(400).json({ error: 'Could not identify any student names and reg numbers in that document.' })
+    }
+
+    const documentUrl = await uploadScriptImage(req.file.buffer, req.file.originalname, req.file.mimetype)
+    const uploadId = `clu_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+
+    const { merged, addedCount, flaggedCount } = mergeClassListEntries(req.markingSession.classList, rows, uploadId)
+
+    const uploads = Array.isArray(req.markingSession.classListUploads) ? [...req.markingSession.classListUploads] : []
+    uploads.push({
+      id: uploadId,
+      documentUrl,
+      mimeType: req.file.mimetype,
+      previewText: isImage ? null : rawText.slice(0, 8000),
+      uploadedAt: new Date().toISOString(),
+    })
+
+    const session = await prisma.markingSession.update({
+      where: { id: req.params.id },
+      data: { classList: merged, classListUploads: uploads },
+    })
+
+    // Retroactively re-match already-digitized scripts too, since a roster
+    // very plausibly arrives after scripts have already been marked (the
+    // whole reason the class list can be uploaded any time, not just up
+    // front). Only touches scripts with no roster match yet, so it never
+    // overwrites a match, or a name, the lecturer has already resolved.
+    const unmatchedScripts = await prisma.script.findMany({
+      where: { sessionId: req.params.id, classListEntryId: null, regNumber: { not: null } },
+    })
+    let rematchedCount = 0
+    for (const s of unmatchedScripts) {
+      const match = matchRegNumber(s.regNumber, merged)
+      if (!match) continue
+      await prisma.script.update({
+        where: { id: s.id },
+        data: { studentName: match.entry.name, regNumber: match.entry.regNumber, classListEntryId: match.entry.id },
+      })
+      rematchedCount++
+    }
+
+    res.json({
+      classList: session.classList,
+      classListUploads: session.classListUploads,
+      addedCount,
+      flaggedCount,
+      rematchedCount,
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not process that document: ' + err.message })
+  }
+})
+
+router.get('/:id/classList', requireMembership, async (req, res) => {
+  res.json({
+    classList: req.markingSession.classList || [],
+    classListUploads: req.markingSession.classListUploads || [],
+  })
+})
+
+// PUT /api/sessions/:id/classList/:entryId - resolve a flagged (conflicting)
+// entry: the lecturer picks one of the two candidate names/reg numbers, or
+// types a fresh correction. Also propagates the corrected name/reg number to
+// any script already matched to this entry, so Results doesn't keep showing
+// a name the lecturer just fixed.
+// body: { name, regNumber }
+router.put('/:id/classList/:entryId', requireMembership, async (req, res) => {
+  const { name, regNumber } = req.body
+  if (!name?.trim() || !regNumber?.trim()) {
+    return res.status(400).json({ error: 'Both name and reg number are required.' })
+  }
+
+  const list = Array.isArray(req.markingSession.classList) ? [...req.markingSession.classList] : []
+  const idx = list.findIndex((e) => e.id === req.params.entryId)
+  if (idx === -1) return res.status(404).json({ error: 'That roster entry was not found.' })
+
+  list[idx] = { ...list[idx], name: name.trim(), regNumber: regNumber.trim(), flagged: false, conflict: null }
+
+  await prisma.markingSession.update({ where: { id: req.params.id }, data: { classList: list } })
+  await prisma.script.updateMany({
+    where: { sessionId: req.params.id, classListEntryId: req.params.entryId },
+    data: { studentName: name.trim(), regNumber: regNumber.trim() },
+  })
+
+  res.json({ classList: list })
+})
+
 router.get('/:id/export', requireMembership, async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
@@ -1160,6 +1344,18 @@ router.get('/:id/export', requireMembership, async (req, res) => {
       where: { sessionId: req.params.id },
       orderBy: { studentName: 'asc' },
     })
+
+    // A script matched to a roster entry that's still flagged (conflicting
+    // name/reg number between two uploads) must be resolved before export,
+    // since the export is the institutional record — silently picking one
+    // of two candidate names would be exactly the wrong place to guess.
+    const unresolvedScripts = findUnresolvedScripts(scripts, session.classList)
+    if (unresolvedScripts.length > 0) {
+      return res.status(409).json({
+        error: `${unresolvedScripts.length} student${unresolvedScripts.length !== 1 ? 's have' : ' has'} a name conflict in the class list that needs review before exporting.`,
+        unresolvedScripts: unresolvedScripts.map((s) => ({ id: s.id, classListEntryId: s.classListEntryId })),
+      })
+    }
 
     const format = req.query.format === 'pdf' ? 'pdf' : 'xlsx'
     const safeName = session.title.replace(/[^a-z0-9]/gi, '_')
@@ -1225,79 +1421,8 @@ router.get('/:id/export', requireMembership, async (req, res) => {
 // computed from actual confirmed/suggested scores.
 router.get('/:id/analytics', requireMembership, async (req, res) => {
   try {
-    const scripts = await prisma.script.findMany({
-      where: { sessionId: req.params.id },
-      include: { answers: { include: { question: true } } },
-    })
-
-    const scored = scripts.filter((s) => s.totalScore != null)
-    const totalScripts = scripts.length
-    const flaggedCount = scripts.filter((s) => s.status === 'FLAGGED').length
-    const lowConfidenceCount = scripts.filter((s) => s.hasLowConfidenceScore).length
-
-    const average = scored.length
-      ? scored.reduce((sum, s) => sum + s.totalScore, 0) / scored.length
-      : null
-    const highest = scored.length ? Math.max(...scored.map((s) => s.totalScore)) : null
-
-    // Score distribution in 0-20, 21-40, ... 81-100 buckets, as a percentage
-    // of each script's max possible marks (so guides with different totals
-    // are comparable).
-    const buckets = [0, 0, 0, 0, 0]
-    scored.forEach((s) => {
-      const maxPossible = s.answers.reduce((sum, a) => sum + (a.question?.maxMarks || 0), 0)
-      if (!maxPossible) return
-      const pct = (s.totalScore / maxPossible) * 100
-      const bucketIndex = Math.min(4, Math.floor(pct / 20))
-      buckets[bucketIndex]++
-    })
-
-    // Per-question average, to surface commonly-missed questions.
-    const questionStats = {}
-    scripts.forEach((s) => {
-      s.answers.forEach((a) => {
-        if (!a.question) return
-        const key = a.question.id
-        if (!questionStats[key]) {
-          questionStats[key] = {
-            number: a.question.number,
-            subLabel: a.question.subLabel,
-            text: a.question.text,
-            maxMarks: a.question.maxMarks,
-            scores: [],
-          }
-        }
-        const score = a.confirmedScore ?? a.suggestedScore
-        if (score != null) questionStats[key].scores.push(score)
-      })
-    })
-    const perQuestion = Object.values(questionStats).map((q) => ({
-      number: q.number,
-      subLabel: q.subLabel,
-      text: q.text,
-      maxMarks: q.maxMarks,
-      averagePercent: q.scores.length
-        ? Math.round((q.scores.reduce((a, b) => a + b, 0) / q.scores.length / q.maxMarks) * 100)
-        : null,
-      responseCount: q.scores.length,
-    }))
-
-    res.json({
-      totalScripts,
-      scoredCount: scored.length,
-      flaggedCount,
-      lowConfidenceCount,
-      average: average != null ? Math.round(average * 10) / 10 : null,
-      highest,
-      distribution: [
-        { range: '0-20', value: buckets[0] },
-        { range: '21-40', value: buckets[1] },
-        { range: '41-60', value: buckets[2] },
-        { range: '61-80', value: buckets[3] },
-        { range: '81-100', value: buckets[4] },
-      ],
-      perQuestion,
-    })
+    const analytics = await computeSessionAnalytics(req.params.id)
+    res.json(analytics)
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not compute analytics.' })
