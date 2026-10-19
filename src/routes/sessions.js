@@ -13,6 +13,8 @@ import { matchRegNumber, mergeClassListEntries, normalizeRegNumber, findUnresolv
 import { computeSessionAnalytics } from '../lib/analytics.js'
 import { courseDetailsToFill } from '../lib/frontPage.js'
 import { loadEvaluationRows, buildEvaluationReport, evaluationCsv } from '../lib/evaluation.js'
+import { loadCohortReport, loadSessionComparison } from '../lib/cohort.js'
+import { accessibleSessionsWhere } from '../lib/access.js'
 import { pdfToPageImages } from '../lib/pdfSplit.js'
 import { sendEmail } from '../lib/email.js'
 import jwt from 'jsonwebtoken'
@@ -214,6 +216,18 @@ router.post('/join', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, r
 // GET /api/sessions/browsable - ACTIVE sessions the current user is not
 // already a marker on, for the "Request Access" flow when they don't have
 // a join code. Must stay ABOVE any /:id route below.
+// GET /api/sessions/cohort/compare - every session the user can see, side by
+// side (mean, spread, pass rate), for comparing courses and semesters.
+router.get('/cohort/compare', async (req, res) => {
+  try {
+    const where = await accessibleSessionsWhere(prisma, req.user)
+    res.json(await loadSessionComparison(where))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not compare sessions.' })
+  }
+})
+
 router.get('/browsable', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, res) => {
   const myMemberships = await prisma.sessionMarker.findMany({
     where: { userId: req.user.id },
@@ -1461,6 +1475,17 @@ router.get('/:id/analytics', requireMembership, async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not compute analytics.' })
+  }
+})
+
+// GET /api/sessions/:id/cohort - grade distribution, entry year and
+// programme breakdowns, and item analysis for one session (see cohort.js).
+router.get('/:id/cohort', requireMembership, async (req, res) => {
+  try {
+    res.json(await loadCohortReport(req.params.id))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not compute the cohort analytics.' })
   }
 })
 
