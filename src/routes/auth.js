@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import prisma from '../lib/prisma.js'
 import { sendEmail, sixDigitCode } from '../lib/email.js'
+import { requireAuth } from '../middleware/auth.js'
 
 const router = express.Router()
 
@@ -245,6 +246,50 @@ router.post('/resetPassword', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Something went wrong.' })
+  }
+})
+
+// PUT /api/auth/me - body: { name }. Updates the signed in user's display
+// name. The name travels inside the token, so a fresh token comes back too.
+router.put('/me', requireAuth, async (req, res) => {
+  try {
+    const name = typeof req.body.name === 'string' ? req.body.name.trim() : ''
+    if (!name) return res.status(400).json({ error: 'Name cannot be empty.' })
+    if (name.length > 100) return res.status(400).json({ error: 'Name must be 100 characters or fewer.' })
+
+    const user = await prisma.user.update({ where: { id: req.user.id }, data: { name } })
+    res.json({ token: signToken(user), user: { id: user.id, name: user.name, email: user.email, role: user.role } })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not update your profile.' })
+  }
+})
+
+// PUT /api/auth/password - body: { currentPassword, newPassword }. Same 8
+// character minimum as a password reset; the current password must match.
+router.put('/password', requireAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current and new password are both required.' })
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters.' })
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } })
+    if (!user || !(await bcrypt.compare(currentPassword, user.passwordHash))) {
+      return res.status(400).json({ error: 'Your current password is not correct.' })
+    }
+    if (await bcrypt.compare(newPassword, user.passwordHash)) {
+      return res.status(400).json({ error: 'The new password must be different from the current one.' })
+    }
+
+    await prisma.user.update({ where: { id: user.id }, data: { passwordHash: await bcrypt.hash(newPassword, 10) } })
+    res.json({ ok: true })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not change your password.' })
   }
 })
 
