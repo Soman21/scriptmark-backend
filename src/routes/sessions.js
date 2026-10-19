@@ -1302,16 +1302,21 @@ router.get('/:id/markingStatus', requireMembership, async (req, res) => {
 })
 
 // GET /api/sessions/:id/coordinatorOverview - session-wide progress plus a
-// per-marker breakdown, for the Coordinator's oversight dashboard. Anyone
-// can call this (Results/Marking pages already gate who sees the link to
-// it), it just returns aggregate counts, nothing sensitive per-student.
+// per-marker breakdown, for the Coordinator's oversight dashboard. Only the
+// coordinator, a Full access marker or the Admin can see how others are doing.
 router.get('/:id/coordinatorOverview', requireMembership, async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({
       where: { id: req.params.id },
-      include: { markers: { include: { user: { select: { id: true, name: true, email: true } } } } },
+      include: {
+        markers: { where: { status: 'APPROVED' }, include: { user: { select: { id: true, name: true, email: true } } } },
+        guide: { include: { questions: { select: { id: true, number: true, subLabel: true, assignedMarkerId: true }, orderBy: { order: 'asc' } } } },
+      },
     })
     if (!session) return res.status(404).json({ error: 'Session not found.' })
+    if (!(await canManageMarkers(session, req.user.id, req.user.role))) {
+      return res.status(403).json({ error: 'Only the coordinator of this session can see the overview.' })
+    }
 
     const scriptCount = await prisma.script.count({ where: { sessionId: session.id } })
     const answers = await prisma.scriptAnswer.findMany({
@@ -1333,13 +1338,20 @@ router.get('/:id/coordinatorOverview', requireMembership, async (req, res) => {
     const perMarker = session.markers.map(({ user }) => {
       const assignedAnswers = answers.filter((a) => a.question.assignedMarkerId === user.id)
       const reviewed = assignedAnswers.filter((a) => a.confirmedAt).length
+      const auto = assignedAnswers.filter((a) => a.autoAccepted).length
       return {
         user,
         assigned: assignedAnswers.length,
         reviewed,
+        autoAccepted: auto,
+        confirmedByMarker: reviewed - auto,
         pending: assignedAnswers.length - reviewed,
+        questions: (session.guide?.questions || []).filter((q) => q.assignedMarkerId === user.id).length,
       }
     })
+    const unclaimedQuestions = (session.guide?.questions || [])
+      .filter((q) => !q.assignedMarkerId)
+      .map((q) => `${q.number}${q.subLabel || ''}`)
 
     res.json({
       scriptCount,
@@ -1349,6 +1361,7 @@ router.get('/:id/coordinatorOverview', requireMembership, async (req, res) => {
       humanReviewCompleted,
       pendingReview,
       perMarker,
+      unclaimedQuestions,
     })
   } catch (err) {
     console.error(err)

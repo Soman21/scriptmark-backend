@@ -185,6 +185,12 @@ test("an approved marker sees Bola's session and its guide, and nothing of Chidi
   assert.equal((await call('GET', `/guides/${b.guide.id}`, t)).status, 200)
   assert.deepEqual((await call('GET', '/guides', t)).body.map((g) => g.id), [b.guide.id])
   assert.equal((await call('GET', `/guides/${c.guide.id}`, t)).status, 403)
+  // a Limited marker cannot open the coordinator overview, the coordinator can
+  assert.equal((await call('GET', `/sessions/${b.session.id}/coordinatorOverview`, t)).status, 403)
+  const ov = await call('GET', `/sessions/${b.session.id}/coordinatorOverview`, users.bola)
+  assert.equal(ov.status, 200)
+  assert.ok(Array.isArray(ov.body.unclaimedQuestions))
+  for (const m of ov.body.perMarker) assert.equal(m.autoAccepted + m.confirmedByMarker + m.pending, m.assigned)
 })
 
 test("the AI Assistant only finds the asking lecturer's sessions and students", { skip }, async () => {
