@@ -123,7 +123,7 @@ async function toolPrepareExport(user, { sessionId, format }) {
   if (unresolved.length > 0) {
     return {
       eligible: false,
-      reason: `${unresolved.length} student${unresolved.length !== 1 ? 's have' : ' has'} an unresolved name conflict in the class list — resolve them on the Results page before exporting.`,
+      reason: `${unresolved.length} student${unresolved.length !== 1 ? 's have' : ' has'} an unresolved name conflict in the class list. Resolve them on the Results page before exporting.`,
     }
   }
   return { eligible: true, sessionId, sessionTitle: session.title, format: format || 'both' }
@@ -156,8 +156,13 @@ const MAX_TOOL_ITERATIONS = 4
 // not a restriction, since the assistant can look up any session the user has access to.
 router.post('/chat', async (req, res) => {
   try {
-    const { messages, activeSessionId } = req.body
-    if (!Array.isArray(messages) || messages.length === 0) {
+    const { activeSessionId } = req.body
+    // Only the conversation itself comes from the browser. Anything else,
+    // like a system message, could rewrite the assistant's rules.
+    const messages = (Array.isArray(req.body.messages) ? req.body.messages : [])
+      .filter((m) => (m?.role === 'user' || m?.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+      .map((m) => ({ role: m.role, content: m.content }))
+    if (messages.length === 0 || messages.at(-1).role !== 'user') {
       return res.status(400).json({ error: 'At least one message is required.' })
     }
 
@@ -177,7 +182,8 @@ router.post('/chat', async (req, res) => {
       const message = await chatWithAssistantTools(working)
 
       if (!message.tool_calls || message.tool_calls.length === 0) {
-        return res.json({ reply: message.content, action })
+        const reply = message.content?.trim() || "Sorry, I couldn't put an answer together. Could you ask that another way?"
+        return res.json({ reply, action })
       }
 
       working.push({ role: 'assistant', content: message.content || null, tool_calls: message.tool_calls })
@@ -206,7 +212,8 @@ router.post('/chat', async (req, res) => {
     })
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'The assistant could not respond: ' + err.message })
+    // The details (often a raw provider error) stay in the server log.
+    res.status(502).json({ error: 'The AI Assistant could not answer just now. Please try again in a moment.' })
   }
 })
 

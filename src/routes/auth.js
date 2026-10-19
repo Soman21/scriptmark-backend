@@ -7,6 +7,12 @@ import { requireAuth } from '../middleware/auth.js'
 
 const router = express.Router()
 
+// Emails are matched without regard to case or stray spaces, so
+// Ann@Unizik.edu.ng and ann@unizik.edu.ng are the same account.
+const normalizeEmail = (email) => String(email || '').trim().toLowerCase()
+const findUserByEmail = (email) =>
+  prisma.user.findFirst({ where: { email: { equals: normalizeEmail(email), mode: 'insensitive' } } })
+
 function signToken(user) {
   return jwt.sign(
     { id: user.id, email: user.email, name: user.name, role: user.role },
@@ -17,13 +23,14 @@ function signToken(user) {
 
 router.post('/signup', async (req, res) => {
   try {
-    const { name, email, password, role } = req.body
+    const { name, password, role } = req.body
+    const email = normalizeEmail(req.body.email)
 
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Name, email, and password are required.' })
     }
 
-    const existing = await prisma.user.findUnique({ where: { email } })
+    const existing = await findUserByEmail(email)
     if (existing) {
       return res.status(409).json({ error: 'An account with that email already exists.' })
     }
@@ -32,10 +39,12 @@ router.post('/signup', async (req, res) => {
 
     const user = await prisma.user.create({
       data: {
-        name,
+        name: String(name).trim(),
         email,
         passwordHash,
-        role: ['LECTURER', 'REVIEWER', 'ADMIN'].includes(role) ? role : 'LECTURER',
+        // Admin sees every session and guide, so it is never self chosen at
+        // sign up; it can only be granted directly in the database.
+        role: role === 'REVIEWER' ? 'REVIEWER' : 'LECTURER',
       },
     })
 
@@ -58,7 +67,7 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required.' })
     }
 
-    const user = await prisma.user.findUnique({ where: { email } })
+    const user = await findUserByEmail(email)
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password.' })
     }
@@ -173,7 +182,7 @@ router.post('/forgotPassword', async (req, res) => {
     const { email } = req.body
     if (!email) return res.status(400).json({ error: 'Email is required.' })
 
-    const user = await prisma.user.findUnique({ where: { email } })
+    const user = await findUserByEmail(email)
     if (user) {
       const code = sixDigitCode()
       const codeHash = await bcrypt.hash(code, 10)
@@ -215,7 +224,7 @@ router.post('/resetPassword', async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 8 characters.' })
     }
 
-    const user = await prisma.user.findUnique({ where: { email } })
+    const user = await findUserByEmail(email)
     if (!user) {
       return res.status(400).json({ error: 'Invalid or expired code.' })
     }
