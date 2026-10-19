@@ -748,6 +748,15 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
     if (isFirstPageOfNewScript && !studentName && !regNumber) {
       detected = await extractStudentInfo(pageText, req.markingSession.classList)
       await fillBlankCourseDetails(req.markingSession, detected)
+      // With an attendance sheet or class list already uploaded, the name
+      // comes from it straight away, so the lecturer sees the right student
+      // while still scanning rather than only after marking.
+      let classListEntryId = null
+      const match = detected.regNumber ? matchRegNumber(detected.regNumber, req.markingSession.classList) : null
+      if (match) {
+        detected = { ...detected, name: match.entry.name, regNumber: match.entry.regNumber }
+        classListEntryId = match.entry.id
+      }
       if (detected.name || detected.regNumber) {
         const identifier = [detected.name, detected.regNumber].filter(Boolean).join(' — ') || null
         await prisma.script.update({
@@ -756,6 +765,7 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
             studentName: detected.name,
             regNumber: detected.regNumber,
             studentIdentifier: identifier,
+            classListEntryId,
           },
         })
       }
