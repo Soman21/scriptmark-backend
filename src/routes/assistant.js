@@ -1,8 +1,9 @@
 import express from 'express'
 import prisma from '../lib/prisma.js'
 import { requireAuth } from '../middleware/auth.js'
-import { chatWithAssistantTools } from '../lib/groq.js'
-import { accessibleSessionsWhere, canAccessSession } from '../lib/access.js'
+import { chatWithAssistantTools, reviewScriptChat } from '../lib/groq.js'
+import { buildReviewContext, cleanReviewReply } from '../lib/review.js'
+import { accessibleSessionsWhere, canAccessSession, canAccessScript } from '../lib/access.js'
 import { findUnresolvedScripts } from '../lib/roster.js'
 import { computeSessionAnalytics } from '../lib/analytics.js'
 
@@ -214,6 +215,37 @@ router.post('/chat', async (req, res) => {
     console.error(err)
     // The details (often a raw provider error) stay in the server log.
     res.status(502).json({ error: 'The AI Assistant could not answer just now. Please try again in a moment.' })
+  }
+})
+
+// POST /api/assistant/review - body: { scriptId, messages }
+// The assistant beside a script in Results: explains its scores and can
+// propose one changed score, which the frontend only puts in the score box.
+router.post('/review', async (req, res) => {
+  try {
+    const { scriptId } = req.body
+    if (!scriptId || !(await canAccessScript(prisma, req.user, scriptId)).session) {
+      return res.status(403).json({ error: 'You do not have access to this script.' })
+    }
+    const messages = (Array.isArray(req.body.messages) ? req.body.messages : [])
+      .filter((m) => (m?.role === 'user' || m?.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }))
+      .slice(-12)
+    if (messages.length === 0 || messages.at(-1).role !== 'user') {
+      return res.status(400).json({ error: 'At least one message is required.' })
+    }
+    const script = await prisma.script.findUnique({
+      where: { id: scriptId },
+      include: { answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } } },
+    })
+    if (!script.answers.length) return res.status(400).json({ error: 'This script has not been marked yet.' })
+
+    const raw = await reviewScriptChat(buildReviewContext(script), messages)
+    const { reply, proposal } = cleanReviewReply(raw, script.answers)
+    res.json({ reply: reply || "Sorry, I couldn't put an answer together. Could you ask that another way?", proposal })
+  } catch (err) {
+    console.error(err)
+    res.status(502).json({ error: 'The marking assistant could not answer just now. Please try again in a moment.' })
   }
 })
 
