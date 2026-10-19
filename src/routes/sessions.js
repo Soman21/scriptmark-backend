@@ -6,6 +6,7 @@ import { requireAuth, requireRole } from '../middleware/auth.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { extractTextFromImage } from '../lib/vision.js'
 import { extractTextFromDocument } from '../lib/docParse.js'
+import { withDuplicateFlags, findDuplicates } from '../lib/duplicates.js'
 import { resultRow, RESULT_COLUMNS } from '../lib/resultRows.js'
 import { writeResultsPdf } from '../lib/pdfExport.js'
 import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, parseClassList } from '../lib/groq.js'
@@ -695,7 +696,7 @@ router.put('/scripts/:scriptId/studentInfo', requireRole('LECTURER', 'ADMIN'), r
         studentIdentifier: identifier,
       },
     })
-    res.json(script)
+    res.json({ ...script, duplicates: await findDuplicates(prisma, script) })
   } catch (err) {
     res.status(404).json({ error: 'Script not found.' })
   }
@@ -710,7 +711,7 @@ router.get('/:id/scripts', requireMembership, async (req, res) => {
     },
     orderBy: { uploadedAt: 'asc' },
   })
-  res.json(scripts)
+  res.json(withDuplicateFlags(scripts))
 })
 
 // POST /api/sessions/:id/scripts - upload a page of a script.
@@ -812,7 +813,8 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
       include: { pages: { orderBy: { pageNumber: 'asc' } } },
     })
 
-    res.status(201).json({ script: updated, detectedStudentInfo: detected })
+    const duplicates = isFirstPageOfNewScript ? await findDuplicates(prisma, updated) : []
+    res.status(201).json({ script: updated, detectedStudentInfo: detected, duplicates })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not process the uploaded page.' })
@@ -1292,7 +1294,7 @@ router.get('/:id/markingStatus', requireMembership, async (req, res) => {
     })
     const total = scripts.length
     const markedCount = scripts.filter((s) => s.status === 'SCORED' || s.status === 'REVIEWED').length
-    res.json({ total, markedCount, scripts })
+    res.json({ total, markedCount, scripts: withDuplicateFlags(scripts) })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not load marking status: ' + err.message })

@@ -376,3 +376,20 @@ test('the marking assistant only opens scripts you can see and never saves a sco
   const after = await prisma.scriptAnswer.findUnique({ where: { id: b.answer.id } })
   assert.deepEqual([after.confirmedScore, after.suggestedScore], [before.confirmedScore, before.suggestedScore])
 })
+
+test('a second script with the same reg number is flagged as scanned twice', { skip }, async () => {
+  const bola = await prisma.user.findFirst({ where: { email: 'bola@unizik.edu.ng' } })
+  const t = tokenFor(bola)
+  const b = await setupCourse(t, 'Duplicate check')
+  const reg = b.script.regNumber || '2019364002'
+  await prisma.script.update({ where: { id: b.script.id }, data: { regNumber: reg } })
+  const second = await prisma.script.create({ data: { sessionId: b.session.id, status: 'PENDING' } })
+  const typed = await call('PUT', `/sessions/scripts/${second.id}/studentInfo`, t, { studentName: 'Same Student', regNumber: reg.slice(0, 4) + '/' + reg.slice(4) })
+  assert.equal(typed.status, 200)
+  assert.deepEqual(typed.body.duplicates.map((d) => d.id), [b.script.id])
+  const status = (await call('GET', `/sessions/${b.session.id}/markingStatus`, t)).body
+  const flagged = status.scripts.filter((s) => s.duplicateOf.length)
+  assert.deepEqual(flagged.map((s) => s.id).sort(), [b.script.id, second.id].sort())
+  const list = (await call('GET', `/sessions/${b.session.id}/scripts`, t)).body
+  assert.equal(list.filter((s) => s.duplicateOf.length).length, 2)
+})
