@@ -4,10 +4,12 @@
 // produced the conflicting value, since that's the only case a lecturer ever
 // needs to see a source document again.
 
-// UNIZIK reg numbers follow YYYY/NNNNNN. A wrong year means a different
-// student entirely, not an OCR slip, so fuzziness is only ever allowed
-// within the numeric segment after the slash, never in the year.
-const REG_NUMBER_PATTERN = /^(\d{4})\/(\d+)$/
+// UNIZIK reg numbers start with a 4 digit entry year, then a serial, with
+// or without a slash (2021/245678, 2017364085), and postgraduate numbers
+// end in letters (2025366001FN). A wrong year or a different letter suffix
+// means a different student entirely, not an OCR slip, so fuzziness is only
+// ever allowed within the serial digits, never in the year or the suffix.
+const REG_NUMBER_PATTERN = /^(\d{4})\/?(\d+)([A-Z]*)$/
 
 export function normalizeRegNumber(raw) {
   if (!raw) return ''
@@ -49,6 +51,7 @@ export function matchRegNumber(detectedRegNumber, entries) {
     const candidate = normalizeRegNumber(e.regNumber)
     const candidateMatch = candidate.match(REG_NUMBER_PATTERN)
     if (!candidateMatch || candidateMatch[1] !== targetMatch[1]) continue // year must match exactly
+    if (candidateMatch[3] !== targetMatch[3]) continue // so must the letter suffix
 
     const distance = editDistance(targetMatch[2], candidateMatch[2])
     if (distance < bestDistance) {
@@ -62,21 +65,26 @@ export function matchRegNumber(detectedRegNumber, entries) {
 }
 
 // OCR on handwriting often reads a 0 as O or a 1 as l/I/|. Only these
-// confusions are undone, and only in the digit part, so a real letter in a
-// non UNIZIK style number never gets silently changed into a digit.
-const DIGIT_LOOKALIKES = { O: '0', o: '0', D: '0', I: '1', l: '1', '|': '1', i: '1' }
+// confusions are undone, and only in the serial digits, so the letters of a
+// postgraduate suffix like FN are never changed into digits.
+const DIGIT_LOOKALIKES = { O: '0', o: '0', I: '1', l: '1', '|': '1' }
 
-// Turns a raw OCR or AI reading into a clean YYYY/NNNNNN reg number, or
-// null if it does not have that shape. A short tail (like the "2024" in a
-// "2023/2024" session line) is rejected, since a reg number's serial part
-// is always longer than a year.
+// Year, optional slash, serial (digits or digit lookalikes, ending in a real
+// digit or a lookalike), then an optional suffix of up to 3 letters.
+const REG_SHAPE = /^((?:19|20)\d{2})(\/?)([0-9OoIl|]{5,8})([A-Za-z]{0,3})$/
+
+// Turns a raw OCR or AI reading into a clean reg number, or null if it does
+// not have a reg number's shape. Spaces are removed, the suffix is upper
+// cased, and the slash is kept only if it was written. A short tail (like
+// the "2024" in a "2023/2024" session line) is rejected, since a reg
+// number's serial part is always longer than a year.
 export function cleanRegNumber(raw) {
   if (!raw) return null
   const compact = String(raw).replace(/\s+/g, '').replace(/\\/g, '/')
-  const parts = compact.match(/^((?:19|20)\d{2})\/([0-9OoDIil|]{5,7})$/)
+  const parts = compact.match(REG_SHAPE)
   if (!parts) return null
-  const serial = parts[2].replace(/[OoDIil|]/g, (c) => DIGIT_LOOKALIKES[c])
-  return `${parts[1]}/${serial}`
+  const serial = parts[3].replace(/[OoIl|]/g, (c) => DIGIT_LOOKALIKES[c])
+  return `${parts[1]}${parts[2]}${serial}${parts[4].toUpperCase()}`
 }
 
 // Every reg number shaped string on a page, cleaned, in reading order and
@@ -85,9 +93,9 @@ export function cleanRegNumber(raw) {
 export function findRegNumberCandidates(pageText) {
   if (!pageText) return []
   const found = []
-  const pattern = /(?<!\d)((?:19|20)\d{2})\s*[\/\\]\s*([0-9OoDIil|](?:\s?[0-9OoDIil|]){4,6})(?![0-9OoDIil|])/g
+  const pattern = /(?<![0-9A-Za-z])((?:19|20)\d{2})[ \t]*([\/\\]?)[ \t]*([0-9OoIl|](?:[ \t]?[0-9OoIl|]){4,7})[ \t]?([A-Za-z]{0,3})(?![0-9A-Za-z|])/g
   for (const m of pageText.matchAll(pattern)) {
-    const cleaned = cleanRegNumber(`${m[1]}/${m[2]}`)
+    const cleaned = cleanRegNumber(`${m[1]}${m[2]}${m[3]}${m[4]}`)
     if (cleaned && !found.includes(cleaned)) found.push(cleaned)
   }
   return found

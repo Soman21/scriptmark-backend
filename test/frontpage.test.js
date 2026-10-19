@@ -4,7 +4,7 @@
 // fake fetch so no real Groq requests are made. Run with: npm test
 import { test, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { cleanRegNumber, findRegNumberCandidates, pickRegNumber } from '../src/lib/roster.js'
+import { cleanRegNumber, findRegNumberCandidates, pickRegNumber, matchRegNumber } from '../src/lib/roster.js'
 import { extractStudentInfo } from '../src/lib/groq.js'
 
 // Value lines come BEFORE their labels, as on the booklet.
@@ -57,6 +57,13 @@ test('cleanRegNumber removes spaces and fixes O and l read in place of digits', 
   assert.equal(cleanRegNumber('2019\\1l2345'), '2019/112345')
 })
 
+test('cleanRegNumber keeps undergraduate numbers without a slash and postgraduate letter suffixes', () => {
+  assert.equal(cleanRegNumber('2017364085'), '2017364085')
+  assert.equal(cleanRegNumber('2017 3640 85'), '2017364085')
+  assert.equal(cleanRegNumber('2025366001FN'), '2025366001FN')
+  assert.equal(cleanRegNumber('2025366OO1 fn'), '2025366001FN')
+})
+
 test('cleanRegNumber rejects the session line, the booklet serial and junk', () => {
   assert.equal(cleanRegNumber('2025/2026'), null)
   assert.equal(cleanRegNumber('25/B1/89487'), null)
@@ -66,6 +73,26 @@ test('cleanRegNumber rejects the session line, the booklet serial and junk', () 
 
 test('findRegNumberCandidates finds only the handwritten reg number on the booklet', () => {
   assert.deepEqual(findRegNumberCandidates(bookletText), ['2021/245670'])
+})
+
+test('findRegNumberCandidates finds slashless and suffixed numbers without grabbing the next word', () => {
+  const text = "2017364085\nSTUDENT'S REG. NO\n2025366001 FN\nSTUDENT'S SIGNATURE\n2025/2026 SESSION\nS/N: 25/B1/89487"
+  assert.deepEqual(findRegNumberCandidates(text), ['2017364085', '2025366001FN'])
+})
+
+test('matchRegNumber treats a slash read in or left out as the same number', () => {
+  const list = [{ id: 'u', name: 'UG STUDENT', regNumber: '2017364085' }]
+  assert.equal(matchRegNumber('2017/364085', list)?.entry.id, 'u')
+})
+
+test('matchRegNumber never matches across a different letter suffix', () => {
+  const list = [
+    { id: 'pg', name: 'PG STUDENT', regNumber: '2025366001FN' },
+    { id: 'ug', name: 'UG STUDENT', regNumber: '2025366001' },
+  ]
+  assert.equal(matchRegNumber('2025366001FN', list)?.entry.id, 'pg')
+  assert.equal(matchRegNumber('2025366001', [list[0]]), null)
+  assert.equal(matchRegNumber('2025366002', [list[0]]), null)
 })
 
 test('pickRegNumber prefers a page candidate on the class list over a wrong AI pick', () => {
@@ -96,6 +123,12 @@ test('extractStudentInfo still reads the page when the AI request fails', async 
   globalThis.fetch = async () => ({ ok: false, status: 500 })
   const info = await extractStudentInfo(bookletText, classList)
   assert.deepEqual(info, { name: null, regNumber: '2021/245670' })
+})
+
+test('extractStudentInfo reads a postgraduate number off the booklet', async () => {
+  fakeModel({ name: null, regNumber: '2025366001 FN' })
+  const pgText = bookletText.replace('2021/ 24567O', '2025366001 FN')
+  assert.equal((await extractStudentInfo(pgText)).regNumber, '2025366001FN')
 })
 
 test('extractStudentInfo returns nulls for an empty page without calling the AI', async () => {

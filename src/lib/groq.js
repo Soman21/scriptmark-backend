@@ -344,8 +344,9 @@ sideways, so the order can be jumbled.
 REGISTRATION NUMBER: the student handwrites it in a box. The printed label (such as
 "STUDENT'S REG. NO", "Reg No", "Matric No") is usually printed UNDER or above the box, not
 after it, so the handwritten value can appear on the line before the label as well as after
-it. It looks like YYYY/NNNNNN, for example 2021/245678, but OCR may add spaces or read a 0
-as O. Copy it exactly as it appears.
+it. It starts with a 4 digit year and may or may not have a slash, for example 2021/245678
+or 2017364085. Postgraduate numbers end in letters, for example 2025366001FN, so keep any
+letters at the end. OCR may add spaces or read a 0 as O. Copy it exactly as it appears.
 These are NOT the registration number, ignore them:
 - the booklet serial number printed near "S/N", for example "S/N: 25/B1/89487"
 - the academic session, for example "2023/2024" or "20__/20__"
