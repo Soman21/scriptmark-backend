@@ -399,3 +399,21 @@ test('a second script with the same reg number is flagged as scanned twice', { s
   const list = (await call('GET', `/sessions/${b.session.id}/scripts`, t)).body
   assert.equal(list.filter((s) => s.duplicateOf.length).length, 2)
 })
+
+test('the page assistant only works on sessions you can see and returns checked actions', { skip }, async () => {
+  const bola = await prisma.user.findFirst({ where: { email: 'bola@unizik.edu.ng' } })
+  const t = tokenFor(bola)
+  const b = await setupCourse(t, 'Page assistant')
+  const messages = [{ role: 'user', content: 'my questions are question 1' }]
+  assert.equal((await call('POST', '/assistant/page', users.mallory, { sessionId: b.session.id, page: 'claim', messages })).status, 403)
+  assert.equal((await call('POST', '/assistant/page', t, { sessionId: b.session.id, page: 'nope', messages })).status, 400)
+  const q = b.guide.questions[0]
+  groqReplies.push({ content: JSON.stringify({ reply: 'Claimed question 1 for you.', actions: [{ type: 'claim', questions: [`Q${q.number}${q.subLabel || ''}`, 'Q99'] }] }) })
+  const r = await call('POST', '/assistant/page', t, { sessionId: b.session.id, page: 'claim', messages })
+  assert.equal(r.status, 200)
+  assert.equal(r.body.reply, 'Claimed question 1 for you.')
+  assert.deepEqual(r.body.actions.map((a) => [a.type, a.questionIds]), [['claim', [q.id]]])
+  assert.match(groqCalls.at(-1).messages[1].content, /unclaimed|claimed by you/)
+  // nothing was saved by the chat itself
+  assert.equal((await prisma.question.findUnique({ where: { id: q.id } })).assignedMarkerId, q.assignedMarkerId ?? null)
+})

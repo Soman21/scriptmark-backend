@@ -1,11 +1,14 @@
 import express from 'express'
 import prisma from '../lib/prisma.js'
 import { requireAuth } from '../middleware/auth.js'
-import { chatWithAssistantTools, reviewScriptChat } from '../lib/groq.js'
+import { chatWithAssistantTools, reviewScriptChat, pageAssistantChat } from '../lib/groq.js'
 import { buildReviewContext, cleanReviewReply } from '../lib/review.js'
 import { accessibleSessionsWhere, canAccessSession, canAccessScript } from '../lib/access.js'
 import { findUnresolvedScripts } from '../lib/roster.js'
 import { computeSessionAnalytics } from '../lib/analytics.js'
+import { PAGES, PAGE_PROMPTS, buildPageContext, cleanPageReply } from '../lib/pageAssistant.js'
+import { withDuplicateFlags } from '../lib/duplicates.js'
+import { resultRow } from '../lib/resultRows.js'
 
 const router = express.Router()
 router.use(requireAuth)
@@ -246,6 +249,75 @@ router.post('/review', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(502).json({ error: 'The marking assistant could not answer just now. Please try again in a moment.' })
+  }
+})
+
+// Loads what one page shows, for the chat helper on that page.
+async function loadPageData(page, session, user) {
+  if (page === 'claim') {
+    const questions = session.guideId
+      ? await prisma.question.findMany({
+          where: { guideId: session.guideId },
+          orderBy: { order: 'asc' },
+          include: { assignedMarker: { select: { id: true, name: true } } },
+        })
+      : []
+    const markers = await prisma.sessionMarker.findMany({
+      where: { sessionId: session.id, status: 'APPROVED' },
+      include: { user: { select: { id: true, name: true } } },
+    })
+    const mine = markers.find((m) => m.userId === user.id)
+    const canManage = user.role === 'ADMIN' || session.createdById === user.id || mine?.accessLevel === 'FULL'
+    return { questions, markers: markers.map((m) => m.user), canManage }
+  }
+  if (page === 'queue') {
+    const answers = await prisma.scriptAnswer.findMany({
+      where: { question: { assignedMarkerId: user.id }, script: { sessionId: session.id } },
+      include: { question: true, script: { select: { id: true, studentName: true, regNumber: true } } },
+      orderBy: [{ question: { order: 'asc' } }, { script: { regNumber: 'asc' } }],
+    })
+    return { answers }
+  }
+  const scripts = await prisma.script.findMany({
+    where: { sessionId: session.id },
+    include: { answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } } },
+    orderBy: { uploadedAt: 'asc' },
+  })
+  if (page === 'results') return { scripts: withDuplicateFlags(scripts) }
+  const analytics = await computeSessionAnalytics(session.id)
+  const students = scripts.map((s) => {
+    const row = resultRow(s, 'total')
+    return { ...row, exam: row.exam ?? s.totalScore, studentName: s.studentName, examMax: s.answers.reduce((sum, a) => sum + (a.question?.maxMarks || 0), 0) }
+  })
+  return { analytics, students }
+}
+
+// POST /api/assistant/page - body: { sessionId, page, messages }
+// The chat helper on Claim Questions, My Queue, Results and Analytics. It
+// returns a reply and checked actions; the browser carries the actions out
+// through the page's normal routes, so their permission checks still apply.
+router.post('/page', async (req, res) => {
+  try {
+    const { sessionId, page } = req.body
+    if (!PAGES.includes(page)) return res.status(400).json({ error: 'Unknown page.' })
+    const session = sessionId ? await canAccessSession(prisma, req.user, sessionId) : null
+    if (!session) return res.status(403).json({ error: 'You do not have access to this session.' })
+    const messages = (Array.isArray(req.body.messages) ? req.body.messages : [])
+      .filter((m) => (m?.role === 'user' || m?.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }))
+      .slice(-12)
+    if (messages.length === 0 || messages.at(-1).role !== 'user') {
+      return res.status(400).json({ error: 'At least one message is required.' })
+    }
+
+    const data = await loadPageData(page, session, req.user)
+    const { context, refs } = buildPageContext(page, data, req.user.id)
+    const raw = await pageAssistantChat(PAGE_PROMPTS[page], context, messages)
+    const { reply, actions } = cleanPageReply(page, raw, refs, { userId: req.user.id, canManage: data.canManage })
+    res.json({ reply: reply || "Sorry, I couldn't put an answer together. Could you ask that another way?", actions })
+  } catch (err) {
+    console.error(err)
+    res.status(502).json({ error: 'The assistant could not answer just now. Please try again in a moment.' })
   }
 })
 

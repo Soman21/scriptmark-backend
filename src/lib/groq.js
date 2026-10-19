@@ -771,3 +771,29 @@ export async function reviewScriptChat(context, messages) {
   if (!content) throw new Error('Groq returned an empty response.')
   return JSON.parse(content)
 }
+
+// The chat helper on a ScriptMark page; see pageAssistant.js.
+export async function pageAssistantChat(systemPrompt, context, messages) {
+  const res = await fetch(GROQ_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'system', content: `Page summary:\n${context}` },
+        ...messages,
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.2,
+    }),
+  })
+  if (!res.ok) throw new Error(`Groq API error (${res.status}): ${await res.text()}`)
+  const data = await res.json()
+  const content = data.choices?.[0]?.message?.content
+  if (!content) throw new Error('Groq returned an empty response.')
+  return JSON.parse(content)
+}
