@@ -647,11 +647,16 @@ router.post('/:id/inviteByEmail', async (req, res) => {
     }
 
     const inviter = await prisma.user.findUnique({ where: { id: req.user.id } })
+    // The link signs them in (or up) and joins in one step; the code is the fallback.
+    const appUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '')
+    const joinLink = appUrl
+      ? `<p><a href="${appUrl}/join/${session.joinCode}" style="display:inline-block;background:#0ea5e9;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600;">Join the session</a></p><p>Or sign in and enter this join code:</p>`
+      : `<p>If you don't have an account yet, sign up first, then log in and use this join code:</p>`
 
     await sendEmail({
       to: email.trim(),
       subject: `You've been invited to mark ${session.title} on ScriptMark`,
-      html: `<p>Hi,</p><p>${inviter.name} has invited you to help mark <strong>${session.title}</strong>${session.courseCode ? ` (${session.courseCode})` : ''} on ScriptMark.</p><p>If you don't have an account yet, sign up first, then log in and use this join code:</p><p style="font-size:28px;font-weight:bold;letter-spacing:4px;">${session.joinCode}</p><p>Once you're in, you can claim which questions you'll be marking.</p>`,
+      html: `<p>Hi,</p><p>${inviter.name} has invited you to help mark <strong>${session.title}</strong>${session.courseCode ? ` (${session.courseCode})` : ''} on ScriptMark.</p>${joinLink}<p style="font-size:28px;font-weight:bold;letter-spacing:4px;">${session.joinCode}</p><p>Once you're in, you can claim which questions you'll be marking.</p>`,
     })
 
     res.json({ message: 'Invite sent.' })

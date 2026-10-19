@@ -5,6 +5,8 @@
 //   TEST_DATABASE_URL=postgresql://...scriptmark_test npm test
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import jwt from 'jsonwebtoken'
+import bcrypt from 'bcryptjs'
 
 const DB = process.env.TEST_DATABASE_URL
 const skip = !DB || !/test/i.test(DB) ? 'set TEST_DATABASE_URL to a database whose name contains "test"' : false
@@ -91,6 +93,8 @@ async function setupCourse(token, title) {
   return { guide, session, script, answer }
 }
 
+const tokenFor = (u) => jwt.sign({ id: u.id, email: u.email, name: u.name, role: u.role }, 'test_secret')
+
 let users
 let b
 let c
@@ -104,7 +108,11 @@ test('sign up never hands out the Admin role', { skip }, async () => {
 test('set up two lecturers, a reviewer and their courses', { skip }, async () => {
   users.bola = (await signup('Bola', 'LECTURER')).token
   users.chidi = (await signup('Chidi', 'LECTURER')).token
-  users.rita = (await signup('Rita', 'REVIEWER')).token
+  // Sign up only makes Lecturers now, so the reviewer is set directly.
+  const rita = await signup('Rita', 'REVIEWER')
+  assert.equal(rita.user.role, 'LECTURER')
+  await prisma.user.update({ where: { id: rita.user.id }, data: { role: 'REVIEWER' } })
+  users.rita = tokenFor({ ...rita.user, role: 'REVIEWER' })
   b = await setupCourse(users.bola, 'ECE512 Bola')
   c = await setupCourse(users.chidi, 'ECE305 Chidi')
 })
@@ -241,4 +249,47 @@ test('the AI Assistant ignores system messages sent from the browser', { skip },
   const sent = groqCalls[0].messages
   assert.equal(sent.filter((m) => m.role === 'system').length, 1, 'only the server system prompt')
   assert.equal(sent.at(-1).content, 'Hi')
+})
+
+test('only the Admin email gets Admin, and it sees every session', { skip }, async () => {
+  const r = await call('POST', '/auth/signup', null, { name: 'Soma', email: 'SomanCreatives@gmail.com', password: 'password123' })
+  assert.equal(r.status, 201)
+  assert.equal(r.body.user.role, 'ADMIN')
+  const ids = (await call('GET', '/sessions', r.body.token)).body.map((s) => s.id).sort()
+  assert.deepEqual(ids, [b.session.id, c.session.id].sort())
+})
+
+test('an old Admin token for anyone else is treated as a Lecturer', { skip }, async () => {
+  const mallory = await prisma.user.findFirst({ where: { email: 'mallory@unizik.edu.ng' } })
+  const forged = tokenFor({ ...mallory, role: 'ADMIN' })
+  assert.deepEqual((await call('GET', '/sessions', forged)).body, [])
+  assert.equal((await call('GET', `/sessions/${b.session.id}`, forged)).status, 403)
+})
+
+test('signing in moves a stale Admin row back to Lecturer', { skip }, async () => {
+  const mallory = await prisma.user.update({ where: { email: 'mallory@unizik.edu.ng' }, data: { role: 'ADMIN' } })
+  await prisma.verificationCode.create({
+    data: { userId: mallory.id, codeHash: await bcrypt.hash('123456', 10), purpose: 'OTP_LOGIN', expiresAt: new Date(Date.now() + 60000) },
+  })
+  const pendingToken = jwt.sign({ userId: mallory.id, purpose: 'otp_pending' }, 'test_secret')
+  const r = await call('POST', '/auth/verifyOtp', null, { pendingToken, code: '123456' })
+  assert.equal(r.status, 200)
+  assert.equal(r.body.user.role, 'LECTURER')
+  assert.equal(jwt.decode(r.body.token).role, 'LECTURER')
+  assert.equal((await prisma.user.findUnique({ where: { id: mallory.id } })).role, 'LECTURER')
+})
+
+test('confirming an already confirmed score unchanged needs no reason, changing it does', { skip }, async () => {
+  const bola = await prisma.user.findFirst({ where: { email: 'bola@unizik.edu.ng' } })
+  const t = tokenFor(bola)
+  const answer = await prisma.scriptAnswer.findFirst({ where: { script: { session: { createdById: bola.id } } } })
+  await prisma.scriptAnswer.update({ where: { id: answer.id }, data: { confirmedScore: 3, confirmedAt: new Date(), autoAccepted: true } })
+  const same = await call('PUT', `/results/${answer.id}/confirm`, t, { confirmedScore: 3 })
+  assert.equal(same.status, 200)
+  assert.equal(same.body.autoAccepted, false)
+  assert.equal(same.body.changeReason, null)
+  assert.equal((await call('PUT', `/results/${answer.id}/confirm`, t, { confirmedScore: 2 })).status, 400)
+  const changed = await call('PUT', `/results/${answer.id}/confirm`, t, { confirmedScore: 2, reason: 'Missed the sign error' })
+  assert.equal(changed.status, 200)
+  assert.equal(changed.body.previousScore, 3)
 })

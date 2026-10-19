@@ -12,8 +12,10 @@ let transporter = null
 function getTransporter() {
   if (!transporter) {
     transporter = nodemailer.createTransport({
-      host: 'smtp-relay.brevo.com',
-      port: 2525,
+      // SMTP_HOST and SMTP_PORT exist only so a local mail catcher can stand
+      // in during testing; production uses Brevo.
+      host: process.env.SMTP_HOST || 'smtp-relay.brevo.com',
+      port: Number(process.env.SMTP_PORT) || 2525,
       secure: false, // 2525 and 587 are unencrypted at connect, then upgrade via STARTTLS
       auth: {
         user: process.env.BREVO_SMTP_USER, // your Brevo login email

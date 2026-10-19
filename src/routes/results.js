@@ -85,7 +85,9 @@ router.put('/:answerId/confirm', async (req, res) => {
       return res.status(403).json({ error: 'You do not have permission to confirm this score.' })
     }
 
-    const isOverride = existing.confirmedAt != null
+    // Signing off an already confirmed (often auto accepted) score without
+    // changing it is not an override, so it needs no reason.
+    const isOverride = existing.confirmedAt != null && Number(confirmedScore) !== existing.confirmedScore
     if (isOverride && !reason) {
       return res.status(400).json({ error: 'A reason is required when changing a score that was already confirmed.' })
     }

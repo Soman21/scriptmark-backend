@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken'
 import prisma from '../lib/prisma.js'
 import { sendEmail, sixDigitCode } from '../lib/email.js'
 import { requireAuth } from '../middleware/auth.js'
+import { effectiveRole } from '../lib/roles.js'
 
 const router = express.Router()
 
@@ -13,9 +14,17 @@ const normalizeEmail = (email) => String(email || '').trim().toLowerCase()
 const findUserByEmail = (email) =>
   prisma.user.findFirst({ where: { email: { equals: normalizeEmail(email), mode: 'insensitive' } } })
 
+// Brings a stored role in line with the Admin email rule before a token is
+// issued, so the database and the token agree.
+async function withSyncedRole(user) {
+  const role = effectiveRole(user.email, user.role)
+  if (role === user.role) return user
+  return prisma.user.update({ where: { id: user.id }, data: { role } })
+}
+
 function signToken(user) {
   return jwt.sign(
-    { id: user.id, email: user.email, name: user.name, role: user.role },
+    { id: user.id, email: user.email, name: user.name, role: effectiveRole(user.email, user.role) },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   )
@@ -23,7 +32,7 @@ function signToken(user) {
 
 router.post('/signup', async (req, res) => {
   try {
-    const { name, password, role } = req.body
+    const { name, password } = req.body
     const email = normalizeEmail(req.body.email)
 
     if (!name || !email || !password) {
@@ -42,9 +51,9 @@ router.post('/signup', async (req, res) => {
         name: String(name).trim(),
         email,
         passwordHash,
-        // Admin sees every session and guide, so it is never self chosen at
-        // sign up; it can only be granted directly in the database.
-        role: role === 'REVIEWER' ? 'REVIEWER' : 'LECTURER',
+        // Everyone signs up as a Lecturer. Admin is never self chosen; it
+        // follows the Admin email list in lib/roles.js.
+        role: effectiveRole(email, 'LECTURER'),
       },
     })
 
@@ -136,7 +145,7 @@ router.post('/verifyOtp', async (req, res) => {
       return res.status(401).json({ error: 'This login attempt has expired. Please log in again.' })
     }
 
-    const user = await prisma.user.findUnique({ where: { id: payload.userId } })
+    let user = await prisma.user.findUnique({ where: { id: payload.userId } })
     if (!user) {
       return res.status(401).json({ error: 'This login attempt has expired. Please log in again.' })
     }
@@ -161,6 +170,7 @@ router.post('/verifyOtp', async (req, res) => {
 
     await prisma.verificationCode.update({ where: { id: matchedCode.id }, data: { used: true } })
 
+    user = await withSyncedRole(user)
     const token = signToken(user)
     res.json({
       token,
