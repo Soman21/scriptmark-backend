@@ -12,6 +12,7 @@ import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromI
 import { matchRegNumber, mergeClassListEntries, normalizeRegNumber, findUnresolvedScripts } from '../lib/roster.js'
 import { computeSessionAnalytics } from '../lib/analytics.js'
 import { courseDetailsToFill } from '../lib/frontPage.js'
+import { loadEvaluationRows, buildEvaluationReport, evaluationCsv } from '../lib/evaluation.js'
 import { pdfToPageImages } from '../lib/pdfSplit.js'
 import { sendEmail } from '../lib/email.js'
 import jwt from 'jsonwebtoken'
@@ -1460,6 +1461,25 @@ router.get('/:id/analytics', requireMembership, async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not compute analytics.' })
+  }
+})
+
+// GET /api/sessions/:id/evaluation - how closely the AI's suggested scores
+// match the lecturer's confirmed ones (see evaluation.js). ?format=csv
+// returns the raw answer pairs instead, for pooling sessions in Excel/SPSS.
+router.get('/:id/evaluation', requireMembership, async (req, res) => {
+  try {
+    const rows = await loadEvaluationRows(req.params.id)
+    if (req.query.format === 'csv') {
+      const safeName = req.markingSession.title.replace(/[^a-z0-9]/gi, '_')
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}_evaluation.csv"`)
+      return res.send(evaluationCsv(rows))
+    }
+    res.json(buildEvaluationReport(rows))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not compute the evaluation.' })
   }
 })
 
