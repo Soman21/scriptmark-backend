@@ -147,7 +147,7 @@ router.get('/myQueue', async (req, res) => {
         question: true,
         script: { select: { id: true, studentName: true, regNumber: true, studentIdentifier: true } },
       },
-      orderBy: [{ question: { order: 'asc' } }],
+      orderBy: [{ question: { order: 'asc' } }, { script: { regNumber: 'asc' } }],
     })
 
     res.json({ answers })
