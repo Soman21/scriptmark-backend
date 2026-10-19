@@ -50,7 +50,16 @@ same order given, ONLY for a question that has one:
 // ocrText: the full text extracted from the student's script via OCR (already substituted
 // with the vision model's re transcription for any calculation heavy question, see
 // transcribeCalculationFromImage — this function itself does not know or care which).
-export async function scoreScriptAgainstGuide(ocrText, questions) {
+// Every call is retried up to SCORE_MAX_ATTEMPTS times in total when Groq is
+// rate limiting or erroring, when its reply is not valid JSON, or when the
+// results fail validation (missing questions, unknown ids, scores that are
+// not numbers or are outside 0..maxMarks). Kept small to protect the free
+// tier's daily request limit. If the last attempt still has problems, the
+// best attempt is cleaned up and every affected question is forced to "low"
+// confidence, so it can never be auto accepted and a human always looks at it.
+// options.sleep is only overridden by tests, to skip the real waits.
+export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) {
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
   const questionsBlock = questions
     .map((q) => {
       const label = q.subLabel ? `Question ${q.number}${q.subLabel}` : `Question ${q.number}`
@@ -64,34 +73,183 @@ export async function scoreScriptAgainstGuide(ocrText, questions) {
 
   const userPrompt = `MARKING GUIDE:\n${questionsBlock}\n\nSTUDENT'S EXTRACTED SCRIPT TEXT (from OCR):\n${ocrText}`
 
-  const res = await fetch(GROQ_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userPrompt },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.2,
-    }),
-  })
+  let best = null // { results, problems } with the fewest problems so far
+  let lastError = null
 
-  if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(`Groq API error (${res.status}): ${errText}`)
+  for (let attempt = 1; attempt <= SCORE_MAX_ATTEMPTS; attempt++) {
+    const isLast = attempt === SCORE_MAX_ATTEMPTS
+    const res = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.2,
+      }),
+    })
+
+    if (!res.ok) {
+      const errText = await res.text()
+      lastError = new Error(`Groq API error (${res.status}): ${errText}`)
+      // Bad key, bad request etc. will not fix themselves, so fail straight away.
+      if (!RETRYABLE_STATUSES.has(res.status)) throw lastError
+      if (!isLast) await sleep(retryDelayMs(res, attempt))
+      continue
+    }
+
+    let rawResults
+    try {
+      const data = await res.json()
+      const content = data.choices?.[0]?.message?.content
+      if (!content) throw new Error('Groq returned an empty response.')
+      const parsed = JSON.parse(content)
+      if (!Array.isArray(parsed.results)) throw new Error('Groq response has no "results" array.')
+      rawResults = parsed.results
+    } catch (err) {
+      lastError = err
+      console.warn(`Scoring attempt ${attempt} returned an unusable reply: ${err.message}`)
+      if (!isLast) await sleep(retryDelayMs(null, attempt))
+      continue
+    }
+
+    const checked = validateScoreResults(rawResults, questions)
+    if (checked.problems.length === 0) return checked.results
+    console.warn(`Scoring attempt ${attempt} failed validation: ${checked.problems.join('; ')}`)
+    if (!best || checked.problems.length < best.problems.length) best = checked
+    if (!isLast) await sleep(retryDelayMs(null, attempt))
   }
 
-  const data = await res.json()
-  const content = data.choices?.[0]?.message?.content
-  if (!content) throw new Error('Groq returned an empty response.')
+  if (!best) throw lastError || new Error('Groq scoring failed.')
+  return best.results
+}
 
-  const parsed = JSON.parse(content)
-  return parsed.results || []
+const SCORE_MAX_ATTEMPTS = 3
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504])
+
+// Honours Groq's Retry-After header on a 429 when present, otherwise backs
+// off 1s, 2s, 4s... Capped so one script can't stall the marking queue.
+function retryDelayMs(res, attempt) {
+  const retryAfter = Number(res?.headers?.get?.('retry-after'))
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(retryAfter * 1000, 30000)
+  return Math.min(1000 * 2 ** (attempt - 1), 30000)
+}
+
+const CONFIDENCE_LEVELS = new Set(['high', 'medium', 'low'])
+
+function toNumber(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'string' && value.trim() !== '') {
+    const n = Number(value.trim())
+    return Number.isFinite(n) ? n : null
+  }
+  return null
+}
+
+function clamp(n, min, max) {
+  return Math.min(Math.max(n, min), max)
+}
+
+// Checks the model's raw results against the questions actually asked and
+// returns { results, problems }. results is always safe to save: one entry
+// per asked question, in the asked order, ids only from the guide, scores
+// numeric and within 0..maxMarks (or null when the model gave no usable
+// score, so a human enters it). Any question with a problem is forced to
+// "low" confidence and gets a note at the front of its reasoning. problems
+// is a list of short descriptions; empty means the reply was clean.
+export function validateScoreResults(rawResults, questions) {
+  const problems = []
+  const byId = new Map()
+
+  for (const r of Array.isArray(rawResults) ? rawResults : []) {
+    const id = r && typeof r === 'object' ? String(r.questionId ?? '') : ''
+    if (!questions.some((q) => q.id === id)) {
+      problems.push(`unknown questionId "${id}"`)
+      continue
+    }
+    if (byId.has(id)) {
+      problems.push(`duplicate result for question ${id}`)
+      continue
+    }
+    byId.set(id, r)
+  }
+
+  const results = questions.map((q) => {
+    const r = byId.get(q.id)
+    const notes = []
+
+    if (!r) {
+      problems.push(`no result for question ${q.id}`)
+      return {
+        questionId: q.id,
+        suggestedScore: null,
+        answerText: '',
+        confidence: 'low',
+        reasoning: 'The AI did not return a score for this question. Please mark it manually.',
+      }
+    }
+
+    const maxMarks = toNumber(q.maxMarks) ?? 0
+    let score = toNumber(r.suggestedScore)
+    if (score === null) {
+      notes.push('the AI gave no usable score')
+    } else if (score < 0 || score > maxMarks) {
+      notes.push(`the AI suggested ${score} which is outside 0 to ${maxMarks}, so it was capped`)
+      score = clamp(score, 0, maxMarks)
+    }
+
+    let stepBreakdown = null
+    const steps = Array.isArray(q.steps) ? q.steps : []
+    if (steps.length > 0 && Array.isArray(r.stepBreakdown) && r.stepBreakdown.length > 0) {
+      stepBreakdown = r.stepBreakdown.map((s, i) => {
+        const stepMarks = toNumber(steps[i]?.marks) ?? toNumber(s?.marks) ?? 0
+        let awarded = toNumber(s?.awarded)
+        if (awarded === null) {
+          notes.push(`step ${i + 1} has no usable award`)
+          awarded = 0
+        } else if (awarded < 0 || awarded > stepMarks) {
+          notes.push(`step ${i + 1} award ${awarded} is outside 0 to ${stepMarks}, so it was capped`)
+          awarded = clamp(awarded, 0, stepMarks)
+        }
+        return { ...s, marks: stepMarks, awarded }
+      })
+      const stepTotal = clamp(stepBreakdown.reduce((sum, s) => sum + s.awarded, 0), 0, maxMarks)
+      if (score !== null && Math.abs(stepTotal - score) > 1e-9) {
+        notes.push(`the score ${score} did not match the step awards, so the step total ${stepTotal} was used`)
+        score = stepTotal
+      } else if (score === null) {
+        score = stepTotal
+      }
+    }
+
+    let confidence = typeof r.confidence === 'string' ? r.confidence.toLowerCase().trim() : ''
+    if (!CONFIDENCE_LEVELS.has(confidence)) confidence = 'low'
+
+    let reasoning = typeof r.reasoning === 'string' ? r.reasoning : ''
+    if (notes.length > 0) {
+      problems.push(`question ${q.id}: ${notes.join(', ')}`)
+      confidence = 'low'
+      reasoning = `[Check needed: ${notes.join('; ')}.] ${reasoning}`.trim()
+    }
+
+    const cleaned = {
+      questionId: q.id,
+      suggestedScore: score,
+      answerText: typeof r.answerText === 'string' ? r.answerText : '',
+      confidence,
+      reasoning,
+    }
+    if (stepBreakdown) cleaned.stepBreakdown = stepBreakdown
+    return cleaned
+  })
+
+  return { results, problems }
 }
 
 // Re transcribes a calculation heavy question's answer directly from the page
