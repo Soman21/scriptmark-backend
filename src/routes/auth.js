@@ -124,6 +124,13 @@ router.post('/login', async (req, res) => {
   }
 })
 
+// Wrong code attempts per user. After OTP_MAX_ATTEMPTS the outstanding codes
+// are cancelled and a fresh sign in is needed, so the 6 digit code cannot be
+// guessed. Kept in memory: a restart only resets the count, never lets
+// anyone in.
+const OTP_MAX_ATTEMPTS = 5
+const otpFailures = new Map()
+
 // POST /api/auth/verifyOtp - body: { pendingToken, code }
 // Completes login: checks the pending token is genuine and not expired,
 // checks the code matches a recent unused OTP_LOGIN code for that user, then
@@ -165,9 +172,17 @@ router.post('/verifyOtp', async (req, res) => {
     }
 
     if (!matchedCode) {
+      const failures = (otpFailures.get(user.id) || 0) + 1
+      if (failures >= OTP_MAX_ATTEMPTS) {
+        otpFailures.delete(user.id)
+        await prisma.verificationCode.updateMany({ where: { userId: user.id, purpose: 'OTP_LOGIN', used: false }, data: { used: true } })
+        return res.status(429).json({ error: 'Too many wrong codes. Sign in again to get a new code.' })
+      }
+      otpFailures.set(user.id, failures)
       return res.status(400).json({ error: 'That code is incorrect or has expired.' })
     }
 
+    otpFailures.delete(user.id)
     await prisma.verificationCode.update({ where: { id: matchedCode.id }, data: { used: true } })
 
     user = await withSyncedRole(user)

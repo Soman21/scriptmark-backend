@@ -293,3 +293,66 @@ test('confirming an already confirmed score unchanged needs no reason, changing 
   assert.equal(changed.status, 200)
   assert.equal(changed.body.previousScore, 3)
 })
+
+test('editing a marked question reports it, and re marking redoes only unconfirmed answers', { skip }, async () => {
+  const bola = await prisma.user.findFirst({ where: { email: 'bola@unizik.edu.ng' } })
+  const t = tokenFor(bola)
+  const guide = (await call('GET', `/guides/${b.guide.id}`, t)).body
+  await prisma.script.update({ where: { id: b.script.id }, data: { ocrText: 'X(z) is the sum of x[n] z^-n' } })
+  await prisma.scriptAnswer.update({ where: { id: b.answer.id }, data: { confirmedScore: null, confirmedAt: null, suggestedScore: 1 } })
+  const questions = guide.questions.map((q) => ({ ...q, modelAnswer: q.modelAnswer + ' for all integers n' }))
+  const saved = await call('PUT', `/guides/${guide.id}`, t, { title: guide.title, questions })
+  assert.equal(saved.status, 200)
+  assert.deepEqual(saved.body.changedMarkedQuestions.map((q) => q.label), ['Q1'])
+  const unchanged = await call('PUT', `/guides/${guide.id}`, t, { title: guide.title, questions })
+  assert.deepEqual(unchanged.body.changedMarkedQuestions, [])
+
+  const qid = guide.questions[0].id
+  groqReplies.push({ content: JSON.stringify({ results: [{ questionId: qid, suggestedScore: 4, answerText: 'X(z)', confidence: 'medium', reasoning: 'Matches the new guide.' }] }) })
+  assert.equal((await call('POST', `/sessions/${b.session.id}/remark`, users.chidi, { questionIds: [qid] })).status, 403)
+  const r = await call('POST', `/sessions/${b.session.id}/remark`, t, { questionIds: [qid] })
+  assert.equal(r.status, 200)
+  assert.equal(r.body.answers, 1)
+  for (let i = 0; i < 50; i++) {
+    if ((await prisma.scriptAnswer.findUnique({ where: { id: b.answer.id } })).suggestedScore === 4) break
+    await new Promise((res) => setTimeout(res, 20))
+  }
+  assert.equal((await prisma.scriptAnswer.findUnique({ where: { id: b.answer.id } })).suggestedScore, 4)
+  const all = await prisma.scriptAnswer.findMany({ where: { scriptId: b.script.id } })
+  const expected = all.reduce((sum, x) => sum + (x.confirmedScore ?? x.suggestedScore ?? 0), 0)
+  assert.equal((await prisma.script.findUnique({ where: { id: b.script.id } })).totalScore, expected)
+
+  // a score the lecturer confirmed by hand is left alone
+  await prisma.scriptAnswer.update({ where: { id: b.answer.id }, data: { confirmedScore: 5, confirmedAt: new Date(), autoAccepted: false } })
+  const kept = await call('POST', `/sessions/${b.session.id}/remark`, t, { questionIds: [qid] })
+  assert.equal(kept.body.answers, 0)
+  assert.ok(kept.body.keptConfirmed >= 1)
+})
+
+test('revoking a marker frees the questions they claimed, and the code alone cannot bring them back', { skip }, async () => {
+  const bola = await prisma.user.findFirst({ where: { email: 'bola@unizik.edu.ng' } })
+  const chidi = await prisma.user.findFirst({ where: { email: 'chidi@unizik.edu.ng' } })
+  const t = tokenFor(bola)
+  const session = await prisma.markingSession.findUnique({ where: { id: b.session.id } })
+  assert.equal((await call('POST', '/sessions/join', users.chidi, { code: session.joinCode })).status, 200)
+  const qid = b.guide.questions[0].id
+  assert.equal((await call('PUT', `/guides/${b.guide.id}/questions/${qid}/claim`, users.chidi, {})).status, 200)
+  assert.equal((await call('DELETE', `/sessions/${session.id}/markers/${chidi.id}`, t)).body.releasedQuestions, 1)
+  assert.equal((await prisma.question.findUnique({ where: { id: qid } })).assignedMarkerId, null)
+  assert.equal((await call('GET', `/sessions/${session.id}`, users.chidi)).status, 403)
+  assert.equal((await call('POST', '/sessions/join', users.chidi, { code: session.joinCode })).status, 403)
+  assert.equal((await call('PUT', `/guides/${b.guide.id}/questions/${qid}/claim`, t, { targetUserId: chidi.id })).status, 400)
+  assert.equal((await call('PUT', `/sessions/${session.id}/markers/${chidi.id}/approve`, t)).status, 200)
+  assert.equal((await call('GET', `/sessions/${session.id}`, users.chidi)).status, 200)
+})
+
+test('five wrong sign in codes cancel the code', { skip }, async () => {
+  const rita = await prisma.user.findFirst({ where: { email: 'rita@unizik.edu.ng' } })
+  await prisma.verificationCode.create({
+    data: { userId: rita.id, codeHash: await bcrypt.hash('654321', 10), purpose: 'OTP_LOGIN', expiresAt: new Date(Date.now() + 60000) },
+  })
+  const pendingToken = jwt.sign({ userId: rita.id, purpose: 'otp_pending' }, 'test_secret')
+  for (let i = 0; i < 4; i++) assert.equal((await call('POST', '/auth/verifyOtp', null, { pendingToken, code: '000000' })).status, 400)
+  assert.equal((await call('POST', '/auth/verifyOtp', null, { pendingToken, code: '000000' })).status, 429)
+  assert.equal((await call('POST', '/auth/verifyOtp', null, { pendingToken, code: '654321' })).status, 400, 'the real code no longer works')
+})

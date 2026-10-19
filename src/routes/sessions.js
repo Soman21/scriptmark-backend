@@ -622,7 +622,15 @@ router.delete('/:id/markers/:userId', requireRole('LECTURER', 'ADMIN'), async (r
       where: { sessionId_userId: { sessionId: session.id, userId: req.params.userId } },
       data: { status: 'REVOKED' },
     })
-    res.json({ message: 'Access revoked.' })
+    // Their claimed questions go back to unclaimed, so someone else can
+    // pick them up instead of them staying locked to a person with no access.
+    const released = session.guideId
+      ? await prisma.question.updateMany({
+          where: { guideId: session.guideId, assignedMarkerId: req.params.userId },
+          data: { assignedMarkerId: null },
+        })
+      : { count: 0 }
+    res.json({ message: 'Access revoked.', releasedQuestions: released.count })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not revoke access: ' + err.message })
@@ -1031,6 +1039,79 @@ router.post('/:id/mark', requireRole('LECTURER', 'ADMIN'), requireMembership, as
     res.status(500).json({ error: 'Could not start marking: ' + err.message })
   }
 })
+
+// POST /api/sessions/:id/remark - body: { questionIds }. After the guide is
+// edited, re scores those questions on scripts already marked, using the
+// saved script text (or the vision transcript for calculation heavy ones).
+// A score a lecturer already confirmed by hand is their call and is kept;
+// only unconfirmed and auto accepted answers are redone. Runs in the
+// background like /mark; the reply says how many answers will be redone.
+router.post('/:id/remark', requireRole('LECTURER', 'ADMIN'), requireMembership, async (req, res) => {
+  try {
+    const session = req.markingSession
+    if (req.user.role !== 'ADMIN' && session.createdById !== req.user.id) {
+      return res.status(403).json({ error: 'Only this session\'s Coordinator can re mark it.' })
+    }
+    const ids = Array.isArray(req.body.questionIds) ? req.body.questionIds : []
+    const questions = await prisma.question.findMany({ where: { id: { in: ids }, guideId: session.guideId || '' } })
+    if (questions.length === 0) return res.status(400).json({ error: 'No changed questions to re mark.' })
+
+    const answers = await prisma.scriptAnswer.findMany({
+      where: { questionId: { in: questions.map((q) => q.id) }, script: { sessionId: session.id } },
+      include: { script: { select: { id: true, ocrText: true } } },
+    })
+    const redo = answers.filter((a) => a.confirmedAt == null || a.autoAccepted)
+    res.json({ started: true, answers: redo.length, keptConfirmed: answers.length - redo.length })
+
+    remarkAnswers(redo, questions, session).catch((err) => console.error('Re marking failed:', err))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not start re marking: ' + err.message })
+  }
+})
+
+async function remarkAnswers(answers, questions, session) {
+  const byId = new Map(questions.map((q) => [q.id, q]))
+  const touchedScripts = new Set()
+  for (const a of answers) {
+    const q = byId.get(a.questionId)
+    const text = (q.isCalculationHeavy && a.visionTranscript) || a.script.ocrText
+    if (!text) continue
+    try {
+      const [r] = await scoreScriptAgainstGuide(text, [q])
+      if (!r) continue
+      const autoAccept = session.autoAcceptHighConfidence && r.confidence === 'high'
+      await prisma.scriptAnswer.update({
+        where: { id: a.id },
+        data: {
+          suggestedScore: r.suggestedScore,
+          reasoning: r.reasoning,
+          confidence: r.confidence || null,
+          extractedText: r.answerText || a.extractedText,
+          stepBreakdown: r.stepBreakdown || null,
+          ...(autoAccept
+            ? { confirmedScore: r.suggestedScore, confirmedAt: new Date(), autoAccepted: true }
+            : { confirmedScore: null, confirmedAt: null, autoAccepted: false }),
+        },
+      })
+      touchedScripts.add(a.scriptId)
+    } catch (err) {
+      console.error(`Re marking answer ${a.id} failed:`, err)
+    }
+  }
+  for (const scriptId of touchedScripts) {
+    const all = await prisma.scriptAnswer.findMany({ where: { scriptId } })
+    await prisma.script.update({
+      where: { id: scriptId },
+      data: {
+        totalScore: all.reduce((sum, x) => sum + (x.confirmedScore ?? x.suggestedScore ?? 0), 0),
+        hasLowConfidenceScore: all.some((x) => x.confidence === 'low'),
+        // Anything now waiting on a lecturer puts the script back in review.
+        ...(all.some((x) => x.confirmedAt == null) ? { status: 'SCORED' } : {}),
+      },
+    })
+  }
+}
 
 // Fills any course code, semester or academic session the lecturer left
 // blank on the session, from what a script's front page says. Each field

@@ -185,7 +185,7 @@ router.put('/:id/questions/:questionId/claim', requireRole('LECTURER', 'ADMIN'),
       const isMarker = await prisma.sessionMarker.findUnique({
         where: { sessionId_userId: { sessionId: session.id, userId: finalTargetId } },
       })
-      if (!isMarker) {
+      if (!isMarker || isMarker.status !== 'APPROVED') {
         return res.status(400).json({ error: 'That person needs to join this session with its code first.' })
       }
     }
@@ -287,6 +287,19 @@ router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
     }
 
     const byKey = new Map(existing.questions.map((q) => [questionKey(q), q]))
+    // Questions scripts were already marked against whose marking content
+    // changed: the frontend offers to re mark them with the new version.
+    const markingFields = ['text', 'modelAnswer', 'keywords', 'maxMarks', 'isCalculationHeavy']
+    const changedMarked = incoming
+      .map((data) => ({ data, match: byKey.get(questionKey(data)) }))
+      .filter(
+        ({ data, match }) =>
+          match &&
+          match._count.scriptAnswers > 0 &&
+          (markingFields.some((f) => data[f] !== match[f]) ||
+            JSON.stringify(data.steps === Prisma.DbNull ? null : data.steps) !== JSON.stringify(match.steps ?? null))
+      )
+      .map(({ match }) => ({ id: match.id, label: `Q${match.number}${match.subLabel || ''}`, markedAnswers: match._count.scriptAnswers }))
     const guide = await prisma.$transaction(async (tx) => {
       await tx.question.deleteMany({ where: { guideId: existing.id, id: { in: existing.questions.filter((q) => !keep.has(questionKey(q))).map((q) => q.id) } } })
       for (const data of incoming) {
@@ -306,7 +319,7 @@ router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         include: { questions: { orderBy: { order: 'asc' } } },
       })
     })
-    res.json(guide)
+    res.json({ ...guide, changedMarkedQuestions: changedMarked })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not save the marking guide.' })
