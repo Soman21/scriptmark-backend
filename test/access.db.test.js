@@ -417,3 +417,24 @@ test('the page assistant only works on sessions you can see and returns checked 
   // nothing was saved by the chat itself
   assert.equal((await prisma.question.findUnique({ where: { id: q.id } })).assignedMarkerId, q.assignedMarkerId ?? null)
 })
+
+test('a Limited marker can release a question they claimed, but not someone else\'s', { skip }, async () => {
+  const bola = await prisma.user.findFirst({ where: { email: 'bola@unizik.edu.ng' } })
+  const rita = await prisma.user.findFirst({ where: { email: 'rita@unizik.edu.ng' } })
+  const b = await setupCourse(tokenFor(bola), 'Release own')
+  await prisma.sessionMarker.upsert({
+    where: { sessionId_userId: { sessionId: b.session.id, userId: rita.id } },
+    create: { sessionId: b.session.id, userId: rita.id, status: 'APPROVED', accessLevel: 'LIMITED' },
+    update: {},
+  })
+  const t = tokenFor({ ...rita, role: 'LECTURER' })
+  const [q1, q2] = b.guide.questions.length > 1 ? b.guide.questions : [b.guide.questions[0], b.guide.questions[0]]
+  await prisma.question.update({ where: { id: q1.id }, data: { assignedMarkerId: rita.id } })
+  const mine = await call('PUT', `/guides/${b.guide.id}/questions/${q1.id}/claim`, t, { targetUserId: null })
+  assert.equal(mine.status, 200)
+  assert.equal(mine.body.assignedMarkerId, null)
+  if (q2.id !== q1.id) {
+    await prisma.question.update({ where: { id: q2.id }, data: { assignedMarkerId: bola.id } })
+    assert.equal((await call('PUT', `/guides/${b.guide.id}/questions/${q2.id}/claim`, t, { targetUserId: null })).status, 403)
+  }
+})

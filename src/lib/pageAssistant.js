@@ -81,7 +81,7 @@ export function buildPageContext(page, data, userId) {
     const a = data.analytics
     lines.push(`Scripts: ${a.totalScripts}, marked: ${a.scoredCount}, average exam score ${a.average ?? 'none'}, highest ${a.highest ?? 'none'}, flagged ${a.flaggedCount}, with low confidence answers ${a.lowConfidenceCount}.`)
     lines.push(`Score bands in percent: ${a.distribution.map((d) => `${d.range}: ${d.value}`).join(', ')}.`)
-    lines.push('Per question average percent: ' + a.questionPerformance.map((q) => `${label(q)} ${q.averagePercent ?? 'none'} (${q.responseCount} answers)`).join(', ') + '.')
+    lines.push('Per question average percent: ' + a.perQuestion.map((q) => `${label(q)} ${q.averagePercent ?? 'none'} (${q.responseCount} answers)`).join(', ') + '.')
     lines.push('Students:')
     for (const s of data.students) {
       lines.push(`${studentOf(s)}: exam ${s.exam ?? 'not marked'} of ${s.examMax}, CA ${s.ca ?? 'not entered'}${s.total != null ? `, total ${s.total}, grade ${s.grade}` : ''}.`)

@@ -173,7 +173,9 @@ router.put('/:id/questions/:questionId/claim', requireRole('LECTURER', 'ADMIN'),
     const finalTargetId = wantsSelf ? req.user.id : targetUserId // null here means "unclaim"
 
     const alreadyTaken = question.assignedMarkerId && question.assignedMarkerId !== req.user.id
-    if (!isCoordinator && (alreadyTaken || !wantsSelf)) {
+    // A marker may release a question they hold themselves.
+    const releasingOwn = targetUserId === null && question.assignedMarkerId === req.user.id
+    if (!isCoordinator && (alreadyTaken || (!wantsSelf && !releasingOwn))) {
       return res.status(403).json({
         error: alreadyTaken
           ? 'This question is already claimed by someone else. Ask your Coordinator to reassign it if needed.'

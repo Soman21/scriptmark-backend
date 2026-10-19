@@ -45,3 +45,15 @@ test('results opens one script that is on the page, and analytics never acts', (
   assert.deepEqual(cleanPageReply('results', { actions: [{ type: 'open', script: 'S9' }, { type: 'open', script: 'S1' }] }, refs).actions, [{ type: 'open', scriptId: 's1', student: 'Ada' }])
   assert.deepEqual(cleanPageReply('analytics', { reply: 'Hi', actions: [{ type: 'open', script: 'S1' }] }, refs).actions, [])
 })
+
+test('the analytics summary reads the same numbers the Analytics page shows', () => {
+  const analytics = {
+    totalScripts: 2, scoredCount: 2, average: 15, highest: 20, flaggedCount: 0, lowConfidenceCount: 1,
+    distribution: [{ range: '0-20', value: 0 }, { range: '81-100', value: 2 }],
+    perQuestion: [{ number: '1', subLabel: 'a', averagePercent: 80, responseCount: 2 }, { number: '2', subLabel: null, averagePercent: 35, responseCount: 2 }],
+  }
+  const students = [{ studentName: 'Ada', regNumber: '2019364001', exam: 20, examMax: 20, ca: null, total: null }]
+  const { context } = buildPageContext('analytics', { analytics, students }, 'me')
+  assert.match(context, /1a 80 \(2 answers\), 2 35 \(2 answers\)/)
+  assert.match(context, /Ada, 2019364001: exam 20 of 20, CA not entered\./)
+})
