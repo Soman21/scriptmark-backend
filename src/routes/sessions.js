@@ -11,6 +11,7 @@ import { writeResultsPdf } from '../lib/pdfExport.js'
 import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, parseClassList } from '../lib/groq.js'
 import { matchRegNumber, mergeClassListEntries, normalizeRegNumber, findUnresolvedScripts } from '../lib/roster.js'
 import { computeSessionAnalytics } from '../lib/analytics.js'
+import { courseDetailsToFill } from '../lib/frontPage.js'
 import { pdfToPageImages } from '../lib/pdfSplit.js'
 import { sendEmail } from '../lib/email.js'
 import jwt from 'jsonwebtoken'
@@ -746,6 +747,7 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
     let detected = null
     if (isFirstPageOfNewScript && !studentName && !regNumber) {
       detected = await extractStudentInfo(pageText, req.markingSession.classList)
+      await fillBlankCourseDetails(req.markingSession, detected)
       if (detected.name || detected.regNumber) {
         const identifier = [detected.name, detected.regNumber].filter(Boolean).join(' — ') || null
         await prisma.script.update({
@@ -1000,6 +1002,27 @@ router.post('/:id/mark', requireRole('LECTURER', 'ADMIN'), requireMembership, as
   }
 })
 
+// Fills any course code, semester or academic session the lecturer left
+// blank on the session, from what a script's front page says. Each field
+// is only written while it is still blank in the database, so a value the
+// lecturer typed (or one an earlier script already filled) is never
+// overwritten, even with several uploads running at once.
+async function fillBlankCourseDetails(session, detected) {
+  const fill = courseDetailsToFill(session, detected)
+  for (const [field, value] of Object.entries(fill)) {
+    try {
+      await prisma.markingSession.updateMany({
+        where: { id: session.id, OR: [{ [field]: null }, { [field]: '' }] },
+        data: { [field]: value },
+      })
+      session[field] = value
+    } catch (err) {
+      // Nice to have only, so a failure here never fails the upload or marking.
+      console.error(`Could not fill session ${field} from front page:`, err)
+    }
+  }
+}
+
 async function runMarkingQueue(scripts, guide, session) {
   for (const script of scripts) {
     try {
@@ -1026,6 +1049,7 @@ async function runMarkingQueue(scripts, guide, session) {
         let regNumber = script.regNumber
         if ((!studentName || !regNumber) && pageTexts[0]) {
           const detected = await extractStudentInfo(pageTexts[0], session.classList)
+          await fillBlankCourseDetails(session, detected)
           studentName = studentName || detected.name
           regNumber = regNumber || detected.regNumber
         }

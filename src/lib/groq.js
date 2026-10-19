@@ -3,6 +3,7 @@
 // must confirm the score before it counts (see results.js "/confirm" route).
 
 import { pickRegNumber } from './roster.js'
+import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
@@ -332,10 +333,15 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
 // UNDER it, and the page has no name field at all, so the name normally
 // comes from the class list once the reg number matches. classList is
 // optional; when given, a reg number on the page that matches a student is
-// preferred over one that does not. Returns null for either field if it
-// cannot find them confidently, and the lecturer then types them in.
+// preferred over one that does not. The same call also reads the course
+// code, semester and academic session, so a session the lecturer left
+// those blank on can be filled in (see courseDetailsToFill). Returns null
+// for any field it cannot find confidently, and the lecturer then types
+// them in.
+const EMPTY_FRONT_PAGE = { name: null, regNumber: null, courseCode: null, semester: null, academicSession: null }
+
 export async function extractStudentInfo(pageText, classList) {
-  if (!pageText || !pageText.trim()) return { name: null, regNumber: null }
+  if (!pageText || !pageText.trim()) return { ...EMPTY_FRONT_PAGE }
 
   const systemPrompt = `You are given OCR text from the front page of a handwritten exam answer booklet,
 with line breaks in rough top to bottom reading order. The page may have been photographed
@@ -357,13 +363,19 @@ or "Student's Name". Many booklets have no name field. Never take the university
 department, course title, or any printed heading as the name. If there is no labelled
 name, use null.
 
+COURSE DETAILS: also read these handwritten values, each from the box above or beside its
+printed label. Use null for any that is blank or unclear.
+- courseCode: from "COURSE CODE", for example "ECE 512"
+- semester: from "SEMESTER", for example "First" or "Second"
+- academicSession: the two years written into "20__/20__ SESSION", for example "2025/2026"
+
 Respond with ONLY a JSON object of this exact shape, nothing else:
-{"name": "the student's name or null", "regNumber": "the registration number or null"}`
+{"name": "the student's name or null", "regNumber": "the registration number or null", "courseCode": "or null", "semester": "or null", "academicSession": "or null"}`
 
   // Even if the AI call fails, a reg number shaped string on the page is
   // still worth returning, so failures fall through to the page scan.
   let aiPick = null
-  let name = null
+  let parsed = {}
   try {
     const res = await fetch(GROQ_API_URL, {
       method: 'POST',
@@ -385,16 +397,21 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
       const data = await res.json()
       const content = data.choices?.[0]?.message?.content
       if (content) {
-        const parsed = JSON.parse(content)
+        parsed = JSON.parse(content) || {}
         aiPick = parsed.regNumber || null
-        name = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : null
       }
     }
   } catch (err) {
     console.error('Student info extraction failed:', err)
   }
 
-  return { name, regNumber: pickRegNumber(aiPick, pageText, classList) }
+  return {
+    name: typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : null,
+    regNumber: pickRegNumber(aiPick, pageText, classList),
+    courseCode: cleanCourseCode(parsed.courseCode),
+    semester: cleanSemester(parsed.semester),
+    academicSession: cleanAcademicSession(parsed.academicSession),
+  }
 }
 
 const PARSE_GUIDE_SYSTEM_PROMPT = `You are given the raw text of an existing exam marking scheme document,

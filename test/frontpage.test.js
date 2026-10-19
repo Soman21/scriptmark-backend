@@ -6,6 +6,7 @@ import { test, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { cleanRegNumber, findRegNumberCandidates, pickRegNumber, matchRegNumber } from '../src/lib/roster.js'
 import { extractStudentInfo } from '../src/lib/groq.js'
+import { cleanCourseCode, cleanAcademicSession, cleanSemester, courseDetailsToFill } from '../src/lib/frontPage.js'
 
 // Value lines come BEFORE their labels, as on the booklet.
 const bookletText = `NNAMDI AZIKIWE UNIVERSITY, AWKA
@@ -110,7 +111,9 @@ test('pickRegNumber returns null when nothing on the page is reg number shaped',
 
 test('extractStudentInfo cleans the AI reg number pick', async () => {
   fakeModel({ name: null, regNumber: '2021/ 24567O' })
-  assert.deepEqual(await extractStudentInfo(bookletText, classList), { name: null, regNumber: '2021/245670' })
+  const info = await extractStudentInfo(bookletText, classList)
+  assert.equal(info.name, null)
+  assert.equal(info.regNumber, '2021/245670')
 })
 
 test('extractStudentInfo falls back to the page when the AI picks the booklet serial', async () => {
@@ -122,7 +125,7 @@ test('extractStudentInfo falls back to the page when the AI picks the booklet se
 test('extractStudentInfo still reads the page when the AI request fails', async () => {
   globalThis.fetch = async () => ({ ok: false, status: 500 })
   const info = await extractStudentInfo(bookletText, classList)
-  assert.deepEqual(info, { name: null, regNumber: '2021/245670' })
+  assert.deepEqual(info, { name: null, regNumber: '2021/245670', courseCode: null, semester: null, academicSession: null })
 })
 
 test('extractStudentInfo reads a postgraduate number off the booklet', async () => {
@@ -135,5 +138,36 @@ test('extractStudentInfo returns nulls for an empty page without calling the AI'
   globalThis.fetch = async () => {
     throw new Error('should not be called')
   }
-  assert.deepEqual(await extractStudentInfo('   '), { name: null, regNumber: null })
+  assert.deepEqual(await extractStudentInfo('   '), { name: null, regNumber: null, courseCode: null, semester: null, academicSession: null })
+})
+
+test('extractStudentInfo returns cleaned course details from the same AI call', async () => {
+  fakeModel({ name: null, regNumber: '2021/245670', courseCode: 'ece 512', semester: 'FIRST', academicSession: '2025 / 26' })
+  const info = await extractStudentInfo(bookletText)
+  assert.equal(info.courseCode, 'ECE512')
+  assert.equal(info.semester, 'First')
+  assert.equal(info.academicSession, '2025/2026')
+})
+
+test('extractStudentInfo drops course details it cannot read cleanly', async () => {
+  fakeModel({ name: null, regNumber: '2021/245670', courseCode: 'DIGITAL SIGNAL', semester: 'third', academicSession: '20__/20__' })
+  const info = await extractStudentInfo(bookletText)
+  assert.deepEqual([info.courseCode, info.semester, info.academicSession], [null, null, null])
+})
+
+test('cleanCourseCode, cleanSemester and cleanAcademicSession', () => {
+  assert.equal(cleanCourseCode('ECE-512'), 'ECE512')
+  assert.equal(cleanCourseCode('CSC 4O1'), null)
+  assert.equal(cleanSemester('2nd semester'), 'Second')
+  assert.equal(cleanSemester('Harmattan'), 'First')
+  assert.equal(cleanAcademicSession('2025/2026'), '2025/2026')
+  assert.equal(cleanAcademicSession('2025/2027'), null)
+  assert.equal(cleanAcademicSession('2021/245670'), null)
+})
+
+test('courseDetailsToFill only fills fields the lecturer left blank', () => {
+  const session = { courseCode: 'ECE 512', semester: '', academicSession: null }
+  const detected = { courseCode: 'ECE513', semester: 'First', academicSession: '2025/2026' }
+  assert.deepEqual(courseDetailsToFill(session, detected), { semester: 'First', academicSession: '2025/2026' })
+  assert.deepEqual(courseDetailsToFill(session, { courseCode: null, semester: null, academicSession: null }), {})
 })
