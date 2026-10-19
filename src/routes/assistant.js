@@ -69,7 +69,7 @@ async function toolFindStudent(user, { query, sessionId }) {
         { regNumber: { contains: query, mode: 'insensitive' } },
       ],
     },
-    include: { answers: { include: { question: true } } },
+    include: { answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } } },
     take: 10,
   })
 

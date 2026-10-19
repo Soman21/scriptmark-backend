@@ -6,7 +6,7 @@ import { requireAuth, requireRole } from '../middleware/auth.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { extractTextFromImage } from '../lib/vision.js'
 import { extractTextFromDocument } from '../lib/docParse.js'
-import { computeGrade } from '../lib/grading.js'
+import { resultRow, RESULT_COLUMNS } from '../lib/resultRows.js'
 import { writeResultsPdf } from '../lib/pdfExport.js'
 import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, parseClassList } from '../lib/groq.js'
 import { matchRegNumber, mergeClassListEntries, normalizeRegNumber, findUnresolvedScripts } from '../lib/roster.js'
@@ -677,7 +677,7 @@ router.post('/:id/inviteByEmail', async (req, res) => {
 router.get('/scripts/:scriptId', requireScriptMembership, async (req, res) => {
   const script = await prisma.script.findUnique({
     where: { id: req.params.scriptId },
-    include: { pages: { orderBy: { pageNumber: 'asc' } }, answers: { include: { question: true } } },
+    include: { pages: { orderBy: { pageNumber: 'asc' } }, answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } } },
   })
   if (!script) return res.status(404).json({ error: 'Script not found.' })
   res.json(script)
@@ -705,7 +705,7 @@ router.get('/:id/scripts', requireMembership, async (req, res) => {
   const scripts = await prisma.script.findMany({
     where: { sessionId: req.params.id },
     include: {
-      answers: { include: { question: true } },
+      answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } },
       pages: { orderBy: { pageNumber: 'asc' } },
     },
     orderBy: { uploadedAt: 'asc' },
@@ -1478,6 +1478,7 @@ router.get('/:id/export', requireMembership, async (req, res) => {
     const scripts = await prisma.script.findMany({
       where: { sessionId: req.params.id },
       orderBy: { studentName: 'asc' },
+      include: { answers: { select: { confirmedAt: true, confirmedScore: true } } },
     })
 
     // A script matched to a roster entry that's still flagged (conflicting
@@ -1493,12 +1494,16 @@ router.get('/:id/export', requireMembership, async (req, res) => {
     }
 
     const format = req.query.format === 'pdf' ? 'pdf' : 'xlsx'
+    // scores=exam gives exam scores only; anything else adds CA and grades.
+    const scores = req.query.scores === 'exam' ? 'exam' : 'total'
+    const columns = RESULT_COLUMNS[scores]
+    const rows = scripts.map((s) => resultRow(s, scores))
     const safeName = session.title.replace(/[^a-z0-9]/gi, '_')
 
     if (format === 'pdf') {
       res.setHeader('Content-Type', 'application/pdf')
       res.setHeader('Content-Disposition', `attachment; filename="${safeName}_results.pdf"`)
-      writeResultsPdf(res, session, scripts)
+      writeResultsPdf(res, session, columns, rows)
       return
     }
 
@@ -1510,32 +1515,19 @@ router.get('/:id/export', requireMembership, async (req, res) => {
     sheet.getCell('A1').font = { size: 16, bold: true }
 
     sheet.mergeCells('A2:F2')
-    sheet.getCell('A2').value = `Department: ${session.department || '—'}`
+    sheet.getCell('A2').value = `Department: ${session.department || 'Not set'}`
     sheet.mergeCells('A3:F3')
-    sheet.getCell('A3').value = `Faculty: ${session.faculty || '—'}`
+    sheet.getCell('A3').value = `Faculty: ${session.faculty || 'Not set'}`
 
     sheet.addRow([])
-    sheet.addRow(['Student Name', 'Reg Number', 'CA Score', 'Exam Score', 'Total', 'Grade'])
+    sheet.addRow(columns.map(([, label]) => label))
     const tableHeaderRow = sheet.lastRow
     tableHeaderRow.font = { bold: true }
     tableHeaderRow.eachCell((cell) => {
       cell.border = { bottom: { style: 'thin' } }
     })
 
-    scripts.forEach((s) => {
-      const examScore = s.totalScore ?? null
-      const ca = s.caScore ?? null
-      const total = (examScore ?? 0) + (ca ?? 0)
-      const grade = examScore != null ? computeGrade(total) : ''
-      sheet.addRow([
-        s.studentName || s.studentIdentifier || 'Unnamed',
-        s.regNumber || '',
-        ca ?? '',
-        examScore ?? '',
-        examScore != null ? total : '',
-        grade,
-      ])
-    })
+    rows.forEach((row) => sheet.addRow(columns.map(([key]) => row[key] ?? '')))
 
     sheet.columns.forEach((col) => {
       col.width = 22
