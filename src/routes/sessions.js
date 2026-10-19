@@ -745,7 +745,7 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
     // automatically from the OCR text. Never overrides a value already typed in.
     let detected = null
     if (isFirstPageOfNewScript && !studentName && !regNumber) {
-      detected = await extractStudentInfo(pageText)
+      detected = await extractStudentInfo(pageText, req.markingSession.classList)
       if (detected.name || detected.regNumber) {
         const identifier = [detected.name, detected.regNumber].filter(Boolean).join(' — ') || null
         await prisma.script.update({
@@ -1025,7 +1025,7 @@ async function runMarkingQueue(scripts, guide, session) {
         let studentName = script.studentName
         let regNumber = script.regNumber
         if ((!studentName || !regNumber) && pageTexts[0]) {
-          const detected = await extractStudentInfo(pageTexts[0])
+          const detected = await extractStudentInfo(pageTexts[0], session.classList)
           studentName = studentName || detected.name
           regNumber = regNumber || detected.regNumber
         }

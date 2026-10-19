@@ -2,6 +2,8 @@
 // for suggesting scores. This is ALWAYS a suggestion — a human lecturer/reviewer
 // must confirm the score before it counts (see results.js "/confirm" route).
 
+import { pickRegNumber } from './roster.js'
+
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
 
@@ -324,30 +326,43 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
   }
 }
 
-// Reads the front page of a script and tries to pick out the student's name
-// and registration number, since students write these by hand at the top of
-// the page. Returns null for either field if it cannot find them confidently —
-// the lecturer then just types them in manually.
-export async function extractStudentInfo(pageText) {
+// Reads the front page of a script and tries to pick out the student's reg
+// number (and a name, only where the page has a printed name label). Built
+// for the UNIZIK answer booklet: each handwritten box has its printed label
+// UNDER it, and the page has no name field at all, so the name normally
+// comes from the class list once the reg number matches. classList is
+// optional; when given, a reg number on the page that matches a student is
+// preferred over one that does not. Returns null for either field if it
+// cannot find them confidently, and the lecturer then types them in.
+export async function extractStudentInfo(pageText, classList) {
   if (!pageText || !pageText.trim()) return { name: null, regNumber: null }
 
-  const systemPrompt = `You are given OCR text from the front page of a handwritten exam script,
-with line breaks preserved roughly in top to bottom reading order.
+  const systemPrompt = `You are given OCR text from the front page of a handwritten exam answer booklet,
+with line breaks in rough top to bottom reading order. The page may have been photographed
+sideways, so the order can be jumbled.
 
-REGISTRATION NUMBER: usually has a printed label right next to it, such as "Reg No",
-"Registration Number", "Matric No", or similar, and often follows a pattern like
-YYYY/NNNNNN. This is usually reliable to find — look for text right after such a label.
+REGISTRATION NUMBER: the student handwrites it in a box. The printed label (such as
+"STUDENT'S REG. NO", "Reg No", "Matric No") is usually printed UNDER or above the box, not
+after it, so the handwritten value can appear on the line before the label as well as after
+it. It looks like YYYY/NNNNNN, for example 2021/245678, but OCR may add spaces or read a 0
+as O. Copy it exactly as it appears.
+These are NOT the registration number, ignore them:
+- the booklet serial number printed near "S/N", for example "S/N: 25/B1/89487"
+- the academic session, for example "2023/2024" or "20__/20__"
+- the examination date, course code, semester, or any question number or mark
 
-STUDENT NAME: has NO printed label. Students simply handwrite their name somewhere near
-the very top of the page, before any numbered exam questions begin. Look for a short
-line of two to four capitalized words, with no digits, that is not the course title,
-department, faculty, date, or the start of an answer. This is inherently a guess, not a
-labeled field, so only return a name if the line is clearly name shaped and positioned
-near the top. If nothing fits confidently, use null rather than guessing.
+STUDENT NAME: only return a name if it is written next to a printed label such as "Name"
+or "Student's Name". Many booklets have no name field. Never take the university, faculty,
+department, course title, or any printed heading as the name. If there is no labelled
+name, use null.
 
 Respond with ONLY a JSON object of this exact shape, nothing else:
 {"name": "the student's name or null", "regNumber": "the registration number or null"}`
 
+  // Even if the AI call fails, a reg number shaped string on the page is
+  // still worth returning, so failures fall through to the page scan.
+  let aiPick = null
+  let name = null
   try {
     const res = await fetch(GROQ_API_URL, {
       method: 'POST',
@@ -365,18 +380,20 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
         temperature: 0.1,
       }),
     })
-    if (!res.ok) return { name: null, regNumber: null }
-
-    const data = await res.json()
-    const content = data.choices?.[0]?.message?.content
-    if (!content) return { name: null, regNumber: null }
-
-    const parsed = JSON.parse(content)
-    return { name: parsed.name || null, regNumber: parsed.regNumber || null }
+    if (res.ok) {
+      const data = await res.json()
+      const content = data.choices?.[0]?.message?.content
+      if (content) {
+        const parsed = JSON.parse(content)
+        aiPick = parsed.regNumber || null
+        name = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : null
+      }
+    }
   } catch (err) {
     console.error('Student info extraction failed:', err)
-    return { name: null, regNumber: null }
   }
+
+  return { name, regNumber: pickRegNumber(aiPick, pageText, classList) }
 }
 
 const PARSE_GUIDE_SYSTEM_PROMPT = `You are given the raw text of an existing exam marking scheme document,

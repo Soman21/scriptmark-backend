@@ -61,6 +61,57 @@ export function matchRegNumber(detectedRegNumber, entries) {
   return null
 }
 
+// OCR on handwriting often reads a 0 as O or a 1 as l/I/|. Only these
+// confusions are undone, and only in the digit part, so a real letter in a
+// non UNIZIK style number never gets silently changed into a digit.
+const DIGIT_LOOKALIKES = { O: '0', o: '0', D: '0', I: '1', l: '1', '|': '1', i: '1' }
+
+// Turns a raw OCR or AI reading into a clean YYYY/NNNNNN reg number, or
+// null if it does not have that shape. A short tail (like the "2024" in a
+// "2023/2024" session line) is rejected, since a reg number's serial part
+// is always longer than a year.
+export function cleanRegNumber(raw) {
+  if (!raw) return null
+  const compact = String(raw).replace(/\s+/g, '').replace(/\\/g, '/')
+  const parts = compact.match(/^((?:19|20)\d{2})\/([0-9OoDIil|]{5,7})$/)
+  if (!parts) return null
+  const serial = parts[2].replace(/[OoDIil|]/g, (c) => DIGIT_LOOKALIKES[c])
+  return `${parts[1]}/${serial}`
+}
+
+// Every reg number shaped string on a page, cleaned, in reading order and
+// without repeats. The booklet serial ("S/N: 25/B1/89487") and the session
+// line ("20__/20__") never match the shape, so they drop out here.
+export function findRegNumberCandidates(pageText) {
+  if (!pageText) return []
+  const found = []
+  const pattern = /(?<!\d)((?:19|20)\d{2})\s*[\/\\]\s*([0-9OoDIil|](?:\s?[0-9OoDIil|]){4,6})(?![0-9OoDIil|])/g
+  for (const m of pageText.matchAll(pattern)) {
+    const cleaned = cleanRegNumber(`${m[1]}/${m[2]}`)
+    if (cleaned && !found.includes(cleaned)) found.push(cleaned)
+  }
+  return found
+}
+
+// Picks the reg number to store for a script's front page. The AI's pick
+// goes first, then any other reg number shaped strings on the page. With a
+// class list, the first one that matches a student on it wins, so a wrong
+// AI pick is rescued by the right number elsewhere on the page. Without a
+// class list (or with no match), the AI's pick is kept, else the first
+// candidate on the page.
+export function pickRegNumber(aiPick, pageText, classList) {
+  const options = []
+  for (const r of [cleanRegNumber(aiPick), ...findRegNumberCandidates(pageText)]) {
+    if (r && !options.includes(r)) options.push(r)
+  }
+  if (options.length === 0) return null
+  if (Array.isArray(classList) && classList.length > 0) {
+    const matched = options.find((r) => matchRegNumber(r, classList))
+    if (matched) return matched
+  }
+  return options[0]
+}
+
 // Given a session's scripts and its current classList, returns the scripts
 // whose matched roster entry is still flagged (a name conflict that hasn't
 // been resolved). Shared by the export route and the assistant's
