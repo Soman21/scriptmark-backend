@@ -731,7 +731,7 @@ const ASSISTANT_TOOLS = [
     function: {
       name: 'get_todo_list',
       description:
-        "Lists what needs the lecturer's attention across all their open sessions: answers waiting for them to confirm, questions nobody has claimed, scripts not yet marked, flagged scripts, names to check, lecturers waiting to join, and sessions ready to export. Use for questions like 'what needs me today' or 'what is left to do'.",
+        "Lists what needs the lecturer's attention across all their open sessions: answers waiting for them to confirm, questions nobody has claimed, scripts not yet marked, flagged scripts, names to check, lecturers waiting to join, and sessions ready to export. Use for questions like 'my tasks today', 'what is pending' or 'my to do list'.",
       parameters: { type: 'object', properties: {} },
     },
   },

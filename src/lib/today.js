@@ -1,7 +1,7 @@
 import { findUnresolvedScripts } from './roster.js'
 import { withDuplicateFlags } from './duplicates.js'
 
-// The "What needs me today" list on the AI Assistant page: one pass over
+// The "Today's tasks" list on the AI Assistant page: one pass over
 // every open session the user can see, turned into short items that each
 // link to the page where the work is done. Built from data only, no AI,
 // so the counts always match what the pages themselves show.
