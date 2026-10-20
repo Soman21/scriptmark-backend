@@ -998,6 +998,7 @@ router.post('/:id/scripts/batchUpload', requireRole('LECTURER', 'ADMIN'), requir
 
     for (const file of req.files) {
       const isPdf = file.mimetype === 'application/pdf'
+      if (!isPdf && !file.mimetype.startsWith('image/')) continue // a Word file or similar is not a script
       const pageBuffers = isPdf ? pdfToPageImages(file.buffer) : [file.buffer]
 
       if (pageBuffers.length === 0) continue
