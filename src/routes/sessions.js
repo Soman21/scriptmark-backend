@@ -17,6 +17,7 @@ import { loadEvaluationRows, buildEvaluationReport, evaluationCsv } from '../lib
 import { loadCohortReport, loadSessionComparison } from '../lib/cohort.js'
 import { accessibleSessionsWhere } from '../lib/access.js'
 import { pdfToPageImages } from '../lib/pdfSplit.js'
+import { greyPages, scoreAgainstCover, coverThreshold, groupsFromScores } from '../lib/coverDetect.js'
 import { sendEmail } from '../lib/email.js'
 import jwt from 'jsonwebtoken'
 
@@ -858,18 +859,22 @@ router.delete('/:id/scripts/:scriptId', requireRole('LECTURER', 'ADMIN'), requir
 //
 // IMPORTANT: this step does ZERO OCR, for either mode. OCR and student-info
 // detection are deliberately deferred to the Marking step (see /mark below),
-// so splitting a big PDF stays fast no matter how many pages it has. "Auto"
-// vs "manual" mode is currently just framing for the lecturer — auto-detected
-// reg numbers will appear once Marking digitizes each script, not here.
+// so splitting a big PDF stays fast no matter how many pages it has.
+// "manual" cuts the PDF into fixed chunks of pagesPerSubmission pages.
+// "auto" starts a new script at every page that looks like the answer
+// booklet's front cover (see coverDetect.js), so scripts of different
+// lengths split correctly. Neither mode reads any text.
 //
-// multipart/form-data: pdf (required), pagesPerSubmission (required)
+// multipart/form-data: pdf (required), mode (manual | auto), pagesPerSubmission (manual only)
 router.post('/:id/scripts/bulkSplit', requireRole('LECTURER', 'ADMIN'), requireMembership, uploadPdf.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No PDF file was uploaded (expected field name "pdf").' })
     }
 
-    const pagesPerSubmission = Number(req.body.pagesPerSubmission) || 1
+    const auto = req.body.mode === 'auto'
+    // A whole number of at least 1; anything else once looped forever.
+    const pagesPerSubmission = Math.max(1, Math.floor(Number(req.body.pagesPerSubmission)) || 1)
 
     const pageBuffers = pdfToPageImages(req.file.buffer)
     if (pageBuffers.length === 0) {
@@ -884,12 +889,24 @@ router.post('/:id/scripts/bulkSplit', requireRole('LECTURER', 'ADMIN'), requireM
       pages.push({ pageNumber: i + 1, imageUrl })
     }
 
+    if (auto) {
+      const scores = scoreAgainstCover(greyPages(req.file.buffer))
+      const threshold = coverThreshold(scores)
+      pages.forEach((p, i) => {
+        p.coverScore = Math.round(scores[i] * 100) / 100
+        // Close to the cut off either way: worth a look before confirming.
+        p.unsure = i > 0 && Math.abs(scores[i] - threshold) < 0.15
+      })
+      const groups = groupsFromScores(scores, threshold).map((g) => ({ pages: pages.slice(g.start, g.end + 1) }))
+      return res.json({ mode: 'auto', groups, coversFound: groups.length })
+    }
+
     const groups = []
     for (let i = 0; i < pages.length; i += pagesPerSubmission) {
       groups.push({ pages: pages.slice(i, i + pagesPerSubmission) })
     }
 
-    res.json({ groups })
+    res.json({ mode: 'manual', groups })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not split this PDF: ' + err.message })
