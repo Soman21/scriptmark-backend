@@ -10,6 +10,7 @@ import { PAGES, PAGE_PROMPTS, buildPageContext, cleanPageReply } from '../lib/pa
 import { withDuplicateFlags } from '../lib/duplicates.js'
 import { resultRow } from '../lib/resultRows.js'
 import { loadTodayList } from '../lib/today.js'
+import { loadSessionComparison } from '../lib/cohort.js'
 import { REPORT_PROMPT, buildReportFacts, weakAnswerReasons, reportContext, cleanReport } from '../lib/report.js'
 import { buildEvaluationReport, loadEvaluationRows } from '../lib/evaluation.js'
 
@@ -136,6 +137,19 @@ async function toolPrepareExport(user, { sessionId, format }) {
   return { eligible: true, sessionId, sessionTitle: session.title, format: format || 'both' }
 }
 
+async function toolCompareSessions(user, { sessionIds } = {}) {
+  const where = await accessibleSessionsWhere(prisma, user)
+  const ids = Array.isArray(sessionIds) ? sessionIds.filter((x) => typeof x === 'string').slice(0, 10) : []
+  const sessions = await loadSessionComparison(ids.length ? { AND: [where, { id: { in: ids } }] } : where)
+  // The weakest question only for a handful, since each needs a full read.
+  for (const s of sessions.slice(0, 4)) {
+    const per = (await computeSessionAnalytics(s.id)).perQuestion.filter((q) => q.averagePercent != null)
+    const weakest = per.sort((a, b) => a.averagePercent - b.averagePercent)[0]
+    s.weakestQuestion = weakest ? { question: `Q${weakest.number}${weakest.subLabel || ''}`, averagePercent: weakest.averagePercent } : null
+  }
+  return { sessions, passMark: 40 }
+}
+
 async function executeTool(name, args, user) {
   switch (name) {
     case 'list_sessions':
@@ -150,6 +164,8 @@ async function executeTool(name, args, user) {
       return toolGetAnalytics(user, args)
     case 'prepare_export':
       return toolPrepareExport(user, args)
+    case 'compare_sessions':
+      return toolCompareSessions(user, args)
     case 'get_todo_list':
       return { items: (await loadTodayList(prisma, user, await accessibleSessionsWhere(prisma, user))).map(({ session, text }) => ({ session, text })) }
     default:

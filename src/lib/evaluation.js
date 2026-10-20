@@ -1,5 +1,6 @@
 import prisma from './prisma.js'
 import { computeGrade } from './grading.js'
+import { errorRates, summariseRates } from './wer.js'
 
 // Agreement between the AI's suggested scores and the lecturer's confirmed
 // scores, for the thesis evaluation (Chapter 4). Ground truth is a score a
@@ -167,7 +168,17 @@ export function buildEvaluationReport(rows) {
   const gradeGap = scriptPairs.map((p) => Math.abs(grades.indexOf(computeGrade(p.ai)) - grades.indexOf(computeGrade(p.lecturer))))
   const scriptAbs = scriptPairs.map((p) => Math.abs(p.ai - p.lecturer))
 
+  // Transcription accuracy, on answers a lecturer has typed out. The text
+  // scored is the vision transcript for calculation questions, else OCR.
+  const checked = rows.filter((r) => r.referenceText && r.markedText != null).map((r) => ({ ...r, ...errorRates(r.markedText, r.referenceText) }))
+  const transcription = {
+    ...summariseRates(checked),
+    standardOcr: summariseRates(checked.filter((r) => !r.usedVision)),
+    visionReread: summariseRates(checked.filter((r) => r.usedVision)),
+  }
+
   return {
+    transcription,
     answersScored: scored.length,
     humanConfirmed: human.length,
     autoAcceptedExcluded: scored.length - human.length,
@@ -208,13 +219,16 @@ export async function loadEvaluationRows(sessionId) {
     confirmed: a.confirmedScore,
     autoAccepted: a.autoAccepted,
     overridden: a.previousScore != null,
+    usedVision: !!a.visionTranscript,
+    markedText: a.visionTranscript || a.extractedText,
+    referenceText: a.referenceText,
   }))
 }
 
 // One row per answer, for re running the analysis in Excel or SPSS, or
 // pooling several sessions together.
 export function evaluationCsv(rows) {
-  const header = ['script_id', 'reg_number', 'question', 'max_marks', 'confidence', 'ai_score', 'lecturer_score', 'abs_difference', 'auto_accepted', 'overridden', 'ocr_confidence']
+  const header = ['script_id', 'reg_number', 'question', 'max_marks', 'confidence', 'ai_score', 'lecturer_score', 'abs_difference', 'auto_accepted', 'overridden', 'ocr_confidence', 'wer', 'cer']
   const esc = (v) => {
     if (v == null) return ''
     const s = String(v)
@@ -222,10 +236,11 @@ export function evaluationCsv(rows) {
   }
   const lines = rows
     .filter((r) => r.suggested != null && r.confirmed != null)
-    .map((r) =>
-      [r.scriptId, r.regNumber, r.questionLabel, r.maxMarks, r.confidence, r.suggested, r.confirmed, round(Math.abs(r.suggested - r.confirmed)), r.autoAccepted, r.overridden, round(r.ocrConfidence)]
+    .map((r) => {
+      const e = r.referenceText && r.markedText != null ? errorRates(r.markedText, r.referenceText) : null
+      return [r.scriptId, r.regNumber, r.questionLabel, r.maxMarks, r.confidence, r.suggested, r.confirmed, round(Math.abs(r.suggested - r.confirmed)), r.autoAccepted, r.overridden, round(r.ocrConfidence), e && round(e.wordErrors / (e.words || 1)), e && round(e.charErrors / (e.chars || 1))]
         .map(esc)
         .join(',')
-    )
+    })
   return [header.join(','), ...lines].join('\n') + '\n'
 }

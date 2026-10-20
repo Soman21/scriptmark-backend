@@ -616,6 +616,22 @@ through how to do something in ScriptMark, including drafting a marking guide's 
 answers for them to review and save themselves in the guide builder. Answer plainly and at whatever
 length actually answers the question well, rather than being needlessly brief.
 
+When asked how to do something in ScriptMark, answer from this guide with short numbered steps and
+name the page and button exactly as written here:
+• New session: New Marking Session button in the sidebar, then course code, semester, session and type.
+• Marking guide: Marking Guides in the sidebar, upload the marking scheme or add questions, then attach it to the session.
+• Add lecturers: Add lecturers button in the session header, by email invite, join link or code.
+• Attendance sheet: Scan Scripts page, Upload sheet. Matches scripts to students by reg number.
+• Upload scripts: Scan Scripts page, Upload method. Single Script for page by page scanning, Bulk PDF Upload for one PDF of many students (Auto split at booklet covers, or Fixed pages), Batch Upload for one file per student.
+• Start marking: Done Scanning, Start Marking on Scan Scripts. Progress shows on Marking Progress.
+• Claim questions: Claim Questions page, Claim on each question, or the Claim with chat button.
+• Confirm scores: My Queue for your own questions, or Results for whole scripts, then Confirm All Scores.
+• Coordinator view: Coordinator Overview page, progress per lecturer and unclaimed questions.
+• Analytics: Analytics page, score spread, per question averages, AI Agreement, and Check transcriptions for WER.
+• Export: Results page, Export Results, Excel or PDF, exam only or CA plus exam.
+• Examiner's report: AI Assistant page, Examiner's report button.
+• Settings: Settings in the sidebar, name, voice replies and defaults.
+
 Your reply is shown as plain text, so do not use markdown: no tables, headings, asterisks or bold. Use
 short paragraphs, and when you list things put each item on its own line starting with "• ".`
 
@@ -695,6 +711,18 @@ const ASSISTANT_TOOLS = [
           format: { type: 'string', enum: ['xlsx', 'pdf', 'both'], description: 'Defaults to both if not specified.' },
         },
         required: ['sessionId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'compare_sessions',
+      description:
+        "Compares the lecturer's sessions side by side: scored scripts, mean total, spread and pass rate, plus the weakest question for each named session. Use for questions like 'how did CSC 301 compare with last year' or 'which course had the lowest pass rate'. Leave sessionIds empty to compare every session.",
+      parameters: {
+        type: 'object',
+        properties: { sessionIds: { type: 'array', items: { type: 'string' }, description: 'Optional, from list_sessions.' } },
       },
     },
   },

@@ -89,5 +89,5 @@ test('evaluationCsv writes one row per scored answer and quotes commas', () => {
   const lines = csv.trim().split('\n')
   assert.equal(lines.length, 2)
   assert.ok(lines[0].startsWith('script_id,reg_number,question'))
-  assert.equal(lines[1], 's1,2017364085,"Q1, part a",10,high,8,7,1,false,false,')
+  assert.equal(lines[1], 's1,2017364085,"Q1, part a",10,high,8,7,1,false,false,,,')
 })
