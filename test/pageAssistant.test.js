@@ -11,7 +11,7 @@ const claimData = {
 
 test('question 1 means every part, and taken questions are left out for a marker', () => {
   const { refs, context } = buildPageContext('claim', claimData, 'me')
-  assert.match(context, /Q1b: question 1b .* claimed by another marker/)
+  assert.match(context, /Q1b: question 1b .* claimed by another lecturer/)
   const out = cleanPageReply('claim', { reply: 'Done.', actions: [{ type: 'claim', questions: ['question 1'] }] }, refs, { userId: 'me', canManage: false })
   assert.deepEqual(out.actions, [{ type: 'claim', questionIds: ['a'], labels: ['1a'] }])
 })

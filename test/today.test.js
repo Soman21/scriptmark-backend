@@ -28,8 +28,8 @@ test('the coordinator sees their own queue and unclaimed questions, with links',
   const queue = items.find((i) => i.kind === 'queue')
   assert.equal(queue.text, '1 answer is waiting for you to confirm')
   assert.equal(queue.link, '/sessions/s1/my-queue')
-  assert.match(items.find((i) => i.kind === 'claim').text, /1 question has no marker: Q3/)
-  assert.equal(items.find((i) => i.kind === 'others').text, "4 answers on other markers' questions still to be confirmed")
+  assert.match(items.find((i) => i.kind === 'claim').text, /1 question has no lecturer: Q3/)
+  assert.equal(items.find((i) => i.kind === 'others').text, "4 answers on other lecturers' questions still to be confirmed")
 })
 
 test('a lecturer marking alone is told how many answers still need confirming', () => {

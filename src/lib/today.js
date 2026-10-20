@@ -68,13 +68,13 @@ export function sessionTodoItems(session, userId, isAdmin = false) {
       }
     }
     if (rest) {
-      if (others) add('others', `${plural(rest, 'answer', 'answers')} on other markers' questions still to be confirmed`, 'coordinator', rest, 3)
+      if (others) add('others', `${plural(rest, 'answer', 'answers')} on other lecturers' questions still to be confirmed`, 'coordinator', rest, 3)
       else add('confirm', `${plural(rest, 'answer still needs', 'answers still need')} confirming`, 'results', rest, 2)
     }
   }
   const unclaimed = questions.filter((q) => !q.assignedMarkerId)
   if (canManage && others && unclaimed.length) {
-    add('claim', `${plural(unclaimed.length, 'question has', 'questions have')} no marker: ${unclaimed.map(questionLabel).join(', ')}`, 'claim-questions', unclaimed.length, 2)
+    add('claim', `${plural(unclaimed.length, 'question has', 'questions have')} no lecturer: ${unclaimed.map(questionLabel).join(', ')}`, 'claim-questions', unclaimed.length, 2)
   }
 
   if (canManage) {
