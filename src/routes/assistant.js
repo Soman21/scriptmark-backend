@@ -9,6 +9,9 @@ import { computeSessionAnalytics } from '../lib/analytics.js'
 import { PAGES, PAGE_PROMPTS, buildPageContext, cleanPageReply } from '../lib/pageAssistant.js'
 import { withDuplicateFlags } from '../lib/duplicates.js'
 import { resultRow } from '../lib/resultRows.js'
+import { loadTodayList } from '../lib/today.js'
+import { REPORT_PROMPT, buildReportFacts, weakAnswerReasons, reportContext, cleanReport } from '../lib/report.js'
+import { buildEvaluationReport, loadEvaluationRows } from '../lib/evaluation.js'
 
 const router = express.Router()
 router.use(requireAuth)
@@ -147,6 +150,8 @@ async function executeTool(name, args, user) {
       return toolGetAnalytics(user, args)
     case 'prepare_export':
       return toolPrepareExport(user, args)
+    case 'get_todo_list':
+      return { items: (await loadTodayList(prisma, user, await accessibleSessionsWhere(prisma, user))).map(({ session, text }) => ({ session, text })) }
     default:
       return { error: `Unknown tool: ${name}` }
   }
@@ -218,6 +223,42 @@ router.post('/chat', async (req, res) => {
     console.error(err)
     // The details (often a raw provider error) stay in the server log.
     res.status(502).json({ error: 'The AI Assistant could not answer just now. Please try again in a moment.' })
+  }
+})
+
+// GET /api/assistant/today - what needs the user across every open session.
+router.get('/today', async (req, res) => {
+  try {
+    const items = await loadTodayList(prisma, req.user, await accessibleSessionsWhere(prisma, req.user))
+    res.json({ items })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load your list for today.' })
+  }
+})
+
+// POST /api/assistant/report - body: { sessionId }. Drafts an examiner's
+// report: the numbers come from analytics, the model writes the prose.
+router.post('/report', async (req, res) => {
+  try {
+    const session = await canAccessSession(prisma, req.user, req.body?.sessionId)
+    if (!session) return res.status(403).json({ error: 'That session was not found, or you do not have access to it.' })
+
+    const analytics = await computeSessionAnalytics(session.id)
+    if (!analytics.scoredCount) return res.status(400).json({ error: 'Mark some scripts first, then the report has something to say.' })
+    const evaluation = buildEvaluationReport(await loadEvaluationRows(session.id))
+    const facts = buildReportFacts(session, analytics, evaluation)
+
+    const answers = await prisma.scriptAnswer.findMany({
+      where: { script: { sessionId: session.id } },
+      select: { reasoning: true, suggestedScore: true, confirmedScore: true, question: { select: { number: true, subLabel: true, maxMarks: true } } },
+    })
+    const context = reportContext(facts, weakAnswerReasons(answers, facts.hardest))
+    const raw = await pageAssistantChat(REPORT_PROMPT, context, [{ role: 'user', content: 'Write the report.' }])
+    res.json({ facts, ...cleanReport(raw, facts) })
+  } catch (err) {
+    console.error(err)
+    res.status(502).json({ error: 'The report could not be drafted just now. Please try again in a moment.' })
   }
 })
 

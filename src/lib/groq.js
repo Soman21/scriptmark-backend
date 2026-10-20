@@ -594,7 +594,7 @@ the roster are resolved.
 
 You have tools available to look up REAL data: a lecturer or reviewer's own sessions, a session's
 marking progress, a specific student's scores, a guide's questions, a session's analytics, and you can
-prepare a result sheet export. Use a tool whenever answering the question accurately requires real
+prepare a result sheet export, and list what needs the lecturer today across all sessions. Use a tool whenever answering the question accurately requires real
 data you don't already have in the conversation — never guess or make up scores, counts, or names.
 If a question could refer to more than one session and it isn't clear which, ask which one rather
 than guessing, and prefer the session mentioned in <activeSession> below if one is given and the
@@ -696,6 +696,15 @@ const ASSISTANT_TOOLS = [
         },
         required: ['sessionId'],
       },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_todo_list',
+      description:
+        "Lists what needs the lecturer's attention across all their open sessions: answers waiting for them to confirm, questions nobody has claimed, scripts not yet marked, flagged scripts, names to check, lecturers waiting to join, and sessions ready to export. Use for questions like 'what needs me today' or 'what is left to do'.",
+      parameters: { type: 'object', properties: {} },
     },
   },
 ]
