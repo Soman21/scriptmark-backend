@@ -438,3 +438,13 @@ test('a Limited marker can release a question they claimed, but not someone else
     assert.equal((await call('PUT', `/guides/${b.guide.id}/questions/${q2.id}/claim`, t, { targetUserId: null })).status, 403)
   }
 })
+
+test('two join requests at the same moment both succeed and add the lecturer once', { skip }, async () => {
+  const bola = await prisma.user.findFirst({ where: { email: 'bola@unizik.edu.ng' } })
+  const b = await setupCourse(tokenFor(bola), 'Double join')
+  const session = await prisma.markingSession.findUnique({ where: { id: b.session.id } })
+  const joiner = (await signup('Twice', 'LECTURER')).token
+  const both = await Promise.all([1, 2, 3].map(() => call('POST', '/sessions/join', joiner, { code: session.joinCode })))
+  assert.deepEqual(both.map((r) => r.status), [200, 200, 200])
+  assert.equal(await prisma.sessionMarker.count({ where: { sessionId: session.id, user: { name: 'Twice' } } }), 1)
+})

@@ -201,11 +201,17 @@ router.post('/join', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, r
       return res.status(403).json({ error: 'Your request to join this session is still awaiting approval.' })
     }
 
-    await prisma.sessionMarker.upsert({
-      where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
-      update: {},
-      create: { sessionId: session.id, userId: req.user.id, status: 'APPROVED', accessLevel: 'LIMITED' },
-    })
+    try {
+      await prisma.sessionMarker.upsert({
+        where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+        update: {},
+        create: { sessionId: session.id, userId: req.user.id, status: 'APPROVED', accessLevel: 'LIMITED' },
+      })
+    } catch (err) {
+      // Two join requests at once (a double tap, or the join link opening
+      // twice): the other one already added this lecturer, which is fine.
+      if (err.code !== 'P2002') throw err
+    }
 
     res.json({ id: session.id, title: session.title })
   } catch (err) {
