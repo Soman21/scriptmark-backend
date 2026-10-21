@@ -234,6 +234,11 @@ model ScriptAnswer {
   // they can check what the AI actually read, not just trust the score.
   visionTranscript String?
 
+  // What the answer really says, typed or corrected by a lecturer for a
+  // sample of answers. Ground truth for the transcription error rate
+  // (WER and CER) of the text the AI scored, see wer.js.
+  referenceText String?
+
   // Populated only when the question has a steps rubric: an array of
   // { description, marks, awarded, reasoning } mirroring Question.steps,
   // for transparency during review.

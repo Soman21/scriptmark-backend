@@ -4,10 +4,12 @@
 // produced the conflicting value, since that's the only case a lecturer ever
 // needs to see a source document again.
 
-// UNIZIK reg numbers follow YYYY/NNNNNN. A wrong year means a different
-// student entirely, not an OCR slip, so fuzziness is only ever allowed
-// within the numeric segment after the slash, never in the year.
-const REG_NUMBER_PATTERN = /^(\d{4})\/(\d+)$/
+// UNIZIK reg numbers start with a 4 digit entry year, then a serial, with
+// or without a slash (2021/245678, 2017364085), and postgraduate numbers
+// end in letters (2025366001FN). A wrong year or a different letter suffix
+// means a different student entirely, not an OCR slip, so fuzziness is only
+// ever allowed within the serial digits, never in the year or the suffix.
+const REG_NUMBER_PATTERN = /^(\d{4})\/?(\d+)([A-Z]*)$/
 
 export function normalizeRegNumber(raw) {
   if (!raw) return ''
@@ -49,6 +51,7 @@ export function matchRegNumber(detectedRegNumber, entries) {
     const candidate = normalizeRegNumber(e.regNumber)
     const candidateMatch = candidate.match(REG_NUMBER_PATTERN)
     if (!candidateMatch || candidateMatch[1] !== targetMatch[1]) continue // year must match exactly
+    if (candidateMatch[3] !== targetMatch[3]) continue // so must the letter suffix
 
     const distance = editDistance(targetMatch[2], candidateMatch[2])
     if (distance < bestDistance) {
@@ -59,6 +62,62 @@ export function matchRegNumber(detectedRegNumber, entries) {
 
   if (best && bestDistance <= 2) return { entry: best, matchType: 'fuzzy' }
   return null
+}
+
+// OCR on handwriting often reads a 0 as O or a 1 as l/I/|. Only these
+// confusions are undone, and only in the serial digits, so the letters of a
+// postgraduate suffix like FN are never changed into digits.
+const DIGIT_LOOKALIKES = { O: '0', o: '0', I: '1', l: '1', '|': '1' }
+
+// Year, optional slash, serial (digits or digit lookalikes, ending in a real
+// digit or a lookalike), then an optional suffix of up to 3 letters.
+const REG_SHAPE = /^((?:19|20)\d{2})(\/?)([0-9OoIl|]{5,8})([A-Za-z]{0,3})$/
+
+// Turns a raw OCR or AI reading into a clean reg number, or null if it does
+// not have a reg number's shape. Spaces are removed, the suffix is upper
+// cased, and the slash is kept only if it was written. A short tail (like
+// the "2024" in a "2023/2024" session line) is rejected, since a reg
+// number's serial part is always longer than a year.
+export function cleanRegNumber(raw) {
+  if (!raw) return null
+  const compact = String(raw).replace(/\s+/g, '').replace(/\\/g, '/')
+  const parts = compact.match(REG_SHAPE)
+  if (!parts) return null
+  const serial = parts[3].replace(/[OoIl|]/g, (c) => DIGIT_LOOKALIKES[c])
+  return `${parts[1]}${parts[2]}${serial}${parts[4].toUpperCase()}`
+}
+
+// Every reg number shaped string on a page, cleaned, in reading order and
+// without repeats. The booklet serial ("S/N: 25/B1/89487") and the session
+// line ("20__/20__") never match the shape, so they drop out here.
+export function findRegNumberCandidates(pageText) {
+  if (!pageText) return []
+  const found = []
+  const pattern = /(?<![0-9A-Za-z])((?:19|20)\d{2})[ \t]*([\/\\]?)[ \t]*([0-9OoIl|](?:[ \t]?[0-9OoIl|]){4,7})[ \t]?([A-Za-z]{0,3})(?![0-9A-Za-z|])/g
+  for (const m of pageText.matchAll(pattern)) {
+    const cleaned = cleanRegNumber(`${m[1]}${m[2]}${m[3]}${m[4]}`)
+    if (cleaned && !found.includes(cleaned)) found.push(cleaned)
+  }
+  return found
+}
+
+// Picks the reg number to store for a script's front page. The AI's pick
+// goes first, then any other reg number shaped strings on the page. With a
+// class list, the first one that matches a student on it wins, so a wrong
+// AI pick is rescued by the right number elsewhere on the page. Without a
+// class list (or with no match), the AI's pick is kept, else the first
+// candidate on the page.
+export function pickRegNumber(aiPick, pageText, classList) {
+  const options = []
+  for (const r of [cleanRegNumber(aiPick), ...findRegNumberCandidates(pageText)]) {
+    if (r && !options.includes(r)) options.push(r)
+  }
+  if (options.length === 0) return null
+  if (Array.isArray(classList) && classList.length > 0) {
+    const matched = options.find((r) => matchRegNumber(r, classList))
+    if (matched) return matched
+  }
+  return options[0]
 }
 
 // Given a session's scripts and its current classList, returns the scripts

@@ -6,12 +6,18 @@ import { requireAuth, requireRole } from '../middleware/auth.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { extractTextFromImage } from '../lib/vision.js'
 import { extractTextFromDocument } from '../lib/docParse.js'
-import { computeGrade } from '../lib/grading.js'
+import { withDuplicateFlags, findDuplicates } from '../lib/duplicates.js'
+import { resultRow, RESULT_COLUMNS } from '../lib/resultRows.js'
 import { writeResultsPdf } from '../lib/pdfExport.js'
 import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, parseClassList } from '../lib/groq.js'
 import { matchRegNumber, mergeClassListEntries, normalizeRegNumber, findUnresolvedScripts } from '../lib/roster.js'
 import { computeSessionAnalytics } from '../lib/analytics.js'
+import { courseDetailsToFill } from '../lib/frontPage.js'
+import { loadEvaluationRows, buildEvaluationReport, evaluationCsv } from '../lib/evaluation.js'
+import { loadCohortReport, loadSessionComparison } from '../lib/cohort.js'
+import { accessibleSessionsWhere } from '../lib/access.js'
 import { pdfToPageImages } from '../lib/pdfSplit.js'
+import { greyPages, scoreAgainstCover, coverThreshold, groupsFromScores } from '../lib/coverDetect.js'
 import { sendEmail } from '../lib/email.js'
 import jwt from 'jsonwebtoken'
 
@@ -196,11 +202,17 @@ router.post('/join', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, r
       return res.status(403).json({ error: 'Your request to join this session is still awaiting approval.' })
     }
 
-    await prisma.sessionMarker.upsert({
-      where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
-      update: {},
-      create: { sessionId: session.id, userId: req.user.id, status: 'APPROVED', accessLevel: 'LIMITED' },
-    })
+    try {
+      await prisma.sessionMarker.upsert({
+        where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+        update: {},
+        create: { sessionId: session.id, userId: req.user.id, status: 'APPROVED', accessLevel: 'LIMITED' },
+      })
+    } catch (err) {
+      // Two join requests at once (a double tap, or the join link opening
+      // twice): the other one already added this lecturer, which is fine.
+      if (err.code !== 'P2002') throw err
+    }
 
     res.json({ id: session.id, title: session.title })
   } catch (err) {
@@ -212,6 +224,18 @@ router.post('/join', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, r
 // GET /api/sessions/browsable - ACTIVE sessions the current user is not
 // already a marker on, for the "Request Access" flow when they don't have
 // a join code. Must stay ABOVE any /:id route below.
+// GET /api/sessions/cohort/compare - every session the user can see, side by
+// side (mean, spread, pass rate), for comparing courses and semesters.
+router.get('/cohort/compare', async (req, res) => {
+  try {
+    const where = await accessibleSessionsWhere(prisma, req.user)
+    res.json(await loadSessionComparison(where))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not compare sessions.' })
+  }
+})
+
 router.get('/browsable', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, res) => {
   const myMemberships = await prisma.sessionMarker.findMany({
     where: { userId: req.user.id },
@@ -606,7 +630,15 @@ router.delete('/:id/markers/:userId', requireRole('LECTURER', 'ADMIN'), async (r
       where: { sessionId_userId: { sessionId: session.id, userId: req.params.userId } },
       data: { status: 'REVOKED' },
     })
-    res.json({ message: 'Access revoked.' })
+    // Their claimed questions go back to unclaimed, so someone else can
+    // pick them up instead of them staying locked to a person with no access.
+    const released = session.guideId
+      ? await prisma.question.updateMany({
+          where: { guideId: session.guideId, assignedMarkerId: req.params.userId },
+          data: { assignedMarkerId: null },
+        })
+      : { count: 0 }
+    res.json({ message: 'Access revoked.', releasedQuestions: released.count })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not revoke access: ' + err.message })
@@ -631,11 +663,16 @@ router.post('/:id/inviteByEmail', async (req, res) => {
     }
 
     const inviter = await prisma.user.findUnique({ where: { id: req.user.id } })
+    // The link signs them in (or up) and joins in one step; the code is the fallback.
+    const appUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '')
+    const joinLink = appUrl
+      ? `<p><a href="${appUrl}/join/${session.joinCode}" style="display:inline-block;background:#0ea5e9;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600;">Join the session</a></p><p>Or sign in and enter this join code:</p>`
+      : `<p>If you don't have an account yet, sign up first, then log in and use this join code:</p>`
 
     await sendEmail({
       to: email.trim(),
       subject: `You've been invited to mark ${session.title} on ScriptMark`,
-      html: `<p>Hi,</p><p>${inviter.name} has invited you to help mark <strong>${session.title}</strong>${session.courseCode ? ` (${session.courseCode})` : ''} on ScriptMark.</p><p>If you don't have an account yet, sign up first, then log in and use this join code:</p><p style="font-size:28px;font-weight:bold;letter-spacing:4px;">${session.joinCode}</p><p>Once you're in, you can claim which questions you'll be marking.</p>`,
+      html: `<p>Hi,</p><p>${inviter.name} has invited you to help mark <strong>${session.title}</strong>${session.courseCode ? ` (${session.courseCode})` : ''} on ScriptMark.</p>${joinLink}<p style="font-size:28px;font-weight:bold;letter-spacing:4px;">${session.joinCode}</p><p>Once you're in, you can claim which questions you'll be marking.</p>`,
     })
 
     res.json({ message: 'Invite sent.' })
@@ -648,7 +685,7 @@ router.post('/:id/inviteByEmail', async (req, res) => {
 router.get('/scripts/:scriptId', requireScriptMembership, async (req, res) => {
   const script = await prisma.script.findUnique({
     where: { id: req.params.scriptId },
-    include: { pages: { orderBy: { pageNumber: 'asc' } }, answers: { include: { question: true } } },
+    include: { pages: { orderBy: { pageNumber: 'asc' } }, answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } } },
   })
   if (!script) return res.status(404).json({ error: 'Script not found.' })
   res.json(script)
@@ -666,7 +703,7 @@ router.put('/scripts/:scriptId/studentInfo', requireRole('LECTURER', 'ADMIN'), r
         studentIdentifier: identifier,
       },
     })
-    res.json(script)
+    res.json({ ...script, duplicates: await findDuplicates(prisma, script) })
   } catch (err) {
     res.status(404).json({ error: 'Script not found.' })
   }
@@ -676,12 +713,12 @@ router.get('/:id/scripts', requireMembership, async (req, res) => {
   const scripts = await prisma.script.findMany({
     where: { sessionId: req.params.id },
     include: {
-      answers: { include: { question: true } },
+      answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } },
       pages: { orderBy: { pageNumber: 'asc' } },
     },
     orderBy: { uploadedAt: 'asc' },
   })
-  res.json(scripts)
+  res.json(withDuplicateFlags(scripts))
 })
 
 // POST /api/sessions/:id/scripts - upload a page of a script.
@@ -745,7 +782,17 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
     // automatically from the OCR text. Never overrides a value already typed in.
     let detected = null
     if (isFirstPageOfNewScript && !studentName && !regNumber) {
-      detected = await extractStudentInfo(pageText)
+      detected = await extractStudentInfo(pageText, req.markingSession.classList)
+      await fillBlankCourseDetails(req.markingSession, detected)
+      // With an attendance sheet or class list already uploaded, the name
+      // comes from it straight away, so the lecturer sees the right student
+      // while still scanning rather than only after marking.
+      let classListEntryId = null
+      const match = detected.regNumber ? matchRegNumber(detected.regNumber, req.markingSession.classList) : null
+      if (match) {
+        detected = { ...detected, name: match.entry.name, regNumber: match.entry.regNumber }
+        classListEntryId = match.entry.id
+      }
       if (detected.name || detected.regNumber) {
         const identifier = [detected.name, detected.regNumber].filter(Boolean).join(' — ') || null
         await prisma.script.update({
@@ -754,6 +801,7 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
             studentName: detected.name,
             regNumber: detected.regNumber,
             studentIdentifier: identifier,
+            classListEntryId,
           },
         })
       }
@@ -772,7 +820,8 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
       include: { pages: { orderBy: { pageNumber: 'asc' } } },
     })
 
-    res.status(201).json({ script: updated, detectedStudentInfo: detected })
+    const duplicates = isFirstPageOfNewScript ? await findDuplicates(prisma, updated) : []
+    res.status(201).json({ script: updated, detectedStudentInfo: detected, duplicates })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not process the uploaded page.' })
@@ -810,18 +859,22 @@ router.delete('/:id/scripts/:scriptId', requireRole('LECTURER', 'ADMIN'), requir
 //
 // IMPORTANT: this step does ZERO OCR, for either mode. OCR and student-info
 // detection are deliberately deferred to the Marking step (see /mark below),
-// so splitting a big PDF stays fast no matter how many pages it has. "Auto"
-// vs "manual" mode is currently just framing for the lecturer — auto-detected
-// reg numbers will appear once Marking digitizes each script, not here.
+// so splitting a big PDF stays fast no matter how many pages it has.
+// "manual" cuts the PDF into fixed chunks of pagesPerSubmission pages.
+// "auto" starts a new script at every page that looks like the answer
+// booklet's front cover (see coverDetect.js), so scripts of different
+// lengths split correctly. Neither mode reads any text.
 //
-// multipart/form-data: pdf (required), pagesPerSubmission (required)
+// multipart/form-data: pdf (required), mode (manual | auto), pagesPerSubmission (manual only)
 router.post('/:id/scripts/bulkSplit', requireRole('LECTURER', 'ADMIN'), requireMembership, uploadPdf.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No PDF file was uploaded (expected field name "pdf").' })
     }
 
-    const pagesPerSubmission = Number(req.body.pagesPerSubmission) || 1
+    const auto = req.body.mode === 'auto'
+    // A whole number of at least 1; anything else once looped forever.
+    const pagesPerSubmission = Math.max(1, Math.floor(Number(req.body.pagesPerSubmission)) || 1)
 
     const pageBuffers = pdfToPageImages(req.file.buffer)
     if (pageBuffers.length === 0) {
@@ -836,12 +889,24 @@ router.post('/:id/scripts/bulkSplit', requireRole('LECTURER', 'ADMIN'), requireM
       pages.push({ pageNumber: i + 1, imageUrl })
     }
 
+    if (auto) {
+      const scores = scoreAgainstCover(greyPages(req.file.buffer))
+      const threshold = coverThreshold(scores)
+      pages.forEach((p, i) => {
+        p.coverScore = Math.round(scores[i] * 100) / 100
+        // Close to the cut off either way: worth a look before confirming.
+        p.unsure = i > 0 && Math.abs(scores[i] - threshold) < 0.15
+      })
+      const groups = groupsFromScores(scores, threshold).map((g) => ({ pages: pages.slice(g.start, g.end + 1) }))
+      return res.json({ mode: 'auto', groups, coversFound: groups.length })
+    }
+
     const groups = []
     for (let i = 0; i < pages.length; i += pagesPerSubmission) {
       groups.push({ pages: pages.slice(i, i + pagesPerSubmission) })
     }
 
-    res.json({ groups })
+    res.json({ mode: 'manual', groups })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not split this PDF: ' + err.message })
@@ -933,6 +998,7 @@ router.post('/:id/scripts/batchUpload', requireRole('LECTURER', 'ADMIN'), requir
 
     for (const file of req.files) {
       const isPdf = file.mimetype === 'application/pdf'
+      if (!isPdf && !file.mimetype.startsWith('image/')) continue // a Word file or similar is not a script
       const pageBuffers = isPdf ? pdfToPageImages(file.buffer) : [file.buffer]
 
       if (pageBuffers.length === 0) continue
@@ -1000,6 +1066,100 @@ router.post('/:id/mark', requireRole('LECTURER', 'ADMIN'), requireMembership, as
   }
 })
 
+// POST /api/sessions/:id/remark - body: { questionIds }. After the guide is
+// edited, re scores those questions on scripts already marked, using the
+// saved script text (or the vision transcript for calculation heavy ones).
+// A score a lecturer already confirmed by hand is their call and is kept;
+// only unconfirmed and auto accepted answers are redone. Runs in the
+// background like /mark; the reply says how many answers will be redone.
+router.post('/:id/remark', requireRole('LECTURER', 'ADMIN'), requireMembership, async (req, res) => {
+  try {
+    const session = req.markingSession
+    if (req.user.role !== 'ADMIN' && session.createdById !== req.user.id) {
+      return res.status(403).json({ error: 'Only this session\'s Coordinator can re mark it.' })
+    }
+    const ids = Array.isArray(req.body.questionIds) ? req.body.questionIds : []
+    const questions = await prisma.question.findMany({ where: { id: { in: ids }, guideId: session.guideId || '' } })
+    if (questions.length === 0) return res.status(400).json({ error: 'No changed questions to re mark.' })
+
+    const answers = await prisma.scriptAnswer.findMany({
+      where: { questionId: { in: questions.map((q) => q.id) }, script: { sessionId: session.id } },
+      include: { script: { select: { id: true, ocrText: true } } },
+    })
+    const redo = answers.filter((a) => a.confirmedAt == null || a.autoAccepted)
+    res.json({ started: true, answers: redo.length, keptConfirmed: answers.length - redo.length })
+
+    remarkAnswers(redo, questions, session).catch((err) => console.error('Re marking failed:', err))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not start re marking: ' + err.message })
+  }
+})
+
+async function remarkAnswers(answers, questions, session) {
+  const byId = new Map(questions.map((q) => [q.id, q]))
+  const touchedScripts = new Set()
+  for (const a of answers) {
+    const q = byId.get(a.questionId)
+    const text = (q.isCalculationHeavy && a.visionTranscript) || a.script.ocrText
+    if (!text) continue
+    try {
+      const [r] = await scoreScriptAgainstGuide(text, [q])
+      if (!r) continue
+      const autoAccept = session.autoAcceptHighConfidence && r.confidence === 'high'
+      await prisma.scriptAnswer.update({
+        where: { id: a.id },
+        data: {
+          suggestedScore: r.suggestedScore,
+          reasoning: r.reasoning,
+          confidence: r.confidence || null,
+          extractedText: r.answerText || a.extractedText,
+          stepBreakdown: r.stepBreakdown || null,
+          ...(autoAccept
+            ? { confirmedScore: r.suggestedScore, confirmedAt: new Date(), autoAccepted: true }
+            : { confirmedScore: null, confirmedAt: null, autoAccepted: false }),
+        },
+      })
+      touchedScripts.add(a.scriptId)
+    } catch (err) {
+      console.error(`Re marking answer ${a.id} failed:`, err)
+    }
+  }
+  for (const scriptId of touchedScripts) {
+    const all = await prisma.scriptAnswer.findMany({ where: { scriptId } })
+    await prisma.script.update({
+      where: { id: scriptId },
+      data: {
+        totalScore: all.reduce((sum, x) => sum + (x.confirmedScore ?? x.suggestedScore ?? 0), 0),
+        hasLowConfidenceScore: all.some((x) => x.confidence === 'low'),
+        // Anything now waiting on a lecturer puts the script back in review.
+        ...(all.some((x) => x.confirmedAt == null) ? { status: 'SCORED' } : {}),
+      },
+    })
+  }
+}
+
+// Fills any course code, semester or academic session the lecturer left
+// blank on the session, from what a script's front page says. Each field
+// is only written while it is still blank in the database, so a value the
+// lecturer typed (or one an earlier script already filled) is never
+// overwritten, even with several uploads running at once.
+async function fillBlankCourseDetails(session, detected) {
+  const fill = courseDetailsToFill(session, detected)
+  for (const [field, value] of Object.entries(fill)) {
+    try {
+      await prisma.markingSession.updateMany({
+        where: { id: session.id, OR: [{ [field]: null }, { [field]: '' }] },
+        data: { [field]: value },
+      })
+      session[field] = value
+    } catch (err) {
+      // Nice to have only, so a failure here never fails the upload or marking.
+      console.error(`Could not fill session ${field} from front page:`, err)
+    }
+  }
+}
+
 async function runMarkingQueue(scripts, guide, session) {
   for (const script of scripts) {
     try {
@@ -1025,7 +1185,8 @@ async function runMarkingQueue(scripts, guide, session) {
         let studentName = script.studentName
         let regNumber = script.regNumber
         if ((!studentName || !regNumber) && pageTexts[0]) {
-          const detected = await extractStudentInfo(pageTexts[0])
+          const detected = await extractStudentInfo(pageTexts[0], session.classList)
+          await fillBlankCourseDetails(session, detected)
           studentName = studentName || detected.name
           regNumber = regNumber || detected.regNumber
         }
@@ -1157,7 +1318,7 @@ router.get('/:id/markingStatus', requireMembership, async (req, res) => {
     })
     const total = scripts.length
     const markedCount = scripts.filter((s) => s.status === 'SCORED' || s.status === 'REVIEWED').length
-    res.json({ total, markedCount, scripts })
+    res.json({ total, markedCount, scripts: withDuplicateFlags(scripts) })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not load marking status: ' + err.message })
@@ -1165,16 +1326,21 @@ router.get('/:id/markingStatus', requireMembership, async (req, res) => {
 })
 
 // GET /api/sessions/:id/coordinatorOverview - session-wide progress plus a
-// per-marker breakdown, for the Coordinator's oversight dashboard. Anyone
-// can call this (Results/Marking pages already gate who sees the link to
-// it), it just returns aggregate counts, nothing sensitive per-student.
+// per-marker breakdown, for the Coordinator's oversight dashboard. Only the
+// coordinator, a Full access marker or the Admin can see how others are doing.
 router.get('/:id/coordinatorOverview', requireMembership, async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({
       where: { id: req.params.id },
-      include: { markers: { include: { user: { select: { id: true, name: true, email: true } } } } },
+      include: {
+        markers: { where: { status: 'APPROVED' }, include: { user: { select: { id: true, name: true, email: true } } } },
+        guide: { include: { questions: { select: { id: true, number: true, subLabel: true, assignedMarkerId: true }, orderBy: { order: 'asc' } } } },
+      },
     })
     if (!session) return res.status(404).json({ error: 'Session not found.' })
+    if (!(await canManageMarkers(session, req.user.id, req.user.role))) {
+      return res.status(403).json({ error: 'Only the coordinator of this session can see the overview.' })
+    }
 
     const scriptCount = await prisma.script.count({ where: { sessionId: session.id } })
     const answers = await prisma.scriptAnswer.findMany({
@@ -1196,13 +1362,20 @@ router.get('/:id/coordinatorOverview', requireMembership, async (req, res) => {
     const perMarker = session.markers.map(({ user }) => {
       const assignedAnswers = answers.filter((a) => a.question.assignedMarkerId === user.id)
       const reviewed = assignedAnswers.filter((a) => a.confirmedAt).length
+      const auto = assignedAnswers.filter((a) => a.autoAccepted).length
       return {
         user,
         assigned: assignedAnswers.length,
         reviewed,
+        autoAccepted: auto,
+        confirmedByMarker: reviewed - auto,
         pending: assignedAnswers.length - reviewed,
+        questions: (session.guide?.questions || []).filter((q) => q.assignedMarkerId === user.id).length,
       }
     })
+    const unclaimedQuestions = (session.guide?.questions || [])
+      .filter((q) => !q.assignedMarkerId)
+      .map((q) => `${q.number}${q.subLabel || ''}`)
 
     res.json({
       scriptCount,
@@ -1212,6 +1385,7 @@ router.get('/:id/coordinatorOverview', requireMembership, async (req, res) => {
       humanReviewCompleted,
       pendingReview,
       perMarker,
+      unclaimedQuestions,
     })
   } catch (err) {
     console.error(err)
@@ -1343,6 +1517,7 @@ router.get('/:id/export', requireMembership, async (req, res) => {
     const scripts = await prisma.script.findMany({
       where: { sessionId: req.params.id },
       orderBy: { studentName: 'asc' },
+      include: { answers: { select: { confirmedAt: true, confirmedScore: true } } },
     })
 
     // A script matched to a roster entry that's still flagged (conflicting
@@ -1358,12 +1533,16 @@ router.get('/:id/export', requireMembership, async (req, res) => {
     }
 
     const format = req.query.format === 'pdf' ? 'pdf' : 'xlsx'
+    // scores=exam gives exam scores only; anything else adds CA and grades.
+    const scores = req.query.scores === 'exam' ? 'exam' : 'total'
+    const columns = RESULT_COLUMNS[scores]
+    const rows = scripts.map((s) => resultRow(s, scores))
     const safeName = session.title.replace(/[^a-z0-9]/gi, '_')
 
     if (format === 'pdf') {
       res.setHeader('Content-Type', 'application/pdf')
       res.setHeader('Content-Disposition', `attachment; filename="${safeName}_results.pdf"`)
-      writeResultsPdf(res, session, scripts)
+      writeResultsPdf(res, session, columns, rows)
       return
     }
 
@@ -1375,32 +1554,19 @@ router.get('/:id/export', requireMembership, async (req, res) => {
     sheet.getCell('A1').font = { size: 16, bold: true }
 
     sheet.mergeCells('A2:F2')
-    sheet.getCell('A2').value = `Department: ${session.department || '—'}`
+    sheet.getCell('A2').value = `Department: ${session.department || 'Not set'}`
     sheet.mergeCells('A3:F3')
-    sheet.getCell('A3').value = `Faculty: ${session.faculty || '—'}`
+    sheet.getCell('A3').value = `Faculty: ${session.faculty || 'Not set'}`
 
     sheet.addRow([])
-    sheet.addRow(['Student Name', 'Reg Number', 'CA Score', 'Exam Score', 'Total', 'Grade'])
+    sheet.addRow(columns.map(([, label]) => label))
     const tableHeaderRow = sheet.lastRow
     tableHeaderRow.font = { bold: true }
     tableHeaderRow.eachCell((cell) => {
       cell.border = { bottom: { style: 'thin' } }
     })
 
-    scripts.forEach((s) => {
-      const examScore = s.totalScore ?? null
-      const ca = s.caScore ?? null
-      const total = (examScore ?? 0) + (ca ?? 0)
-      const grade = examScore != null ? computeGrade(total) : ''
-      sheet.addRow([
-        s.studentName || s.studentIdentifier || 'Unnamed',
-        s.regNumber || '',
-        ca ?? '',
-        examScore ?? '',
-        examScore != null ? total : '',
-        grade,
-      ])
-    })
+    rows.forEach((row) => sheet.addRow(columns.map(([key]) => row[key] ?? '')))
 
     sheet.columns.forEach((col) => {
       col.width = 22
@@ -1426,6 +1592,36 @@ router.get('/:id/analytics', requireMembership, async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not compute analytics.' })
+  }
+})
+
+// GET /api/sessions/:id/cohort - grade distribution, entry year and
+// programme breakdowns, and item analysis for one session (see cohort.js).
+router.get('/:id/cohort', requireMembership, async (req, res) => {
+  try {
+    res.json(await loadCohortReport(req.params.id))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not compute the cohort analytics.' })
+  }
+})
+
+// GET /api/sessions/:id/evaluation - how closely the AI's suggested scores
+// match the lecturer's confirmed ones (see evaluation.js). ?format=csv
+// returns the raw answer pairs instead, for pooling sessions in Excel/SPSS.
+router.get('/:id/evaluation', requireMembership, async (req, res) => {
+  try {
+    const rows = await loadEvaluationRows(req.params.id)
+    if (req.query.format === 'csv') {
+      const safeName = req.markingSession.title.replace(/[^a-z0-9]/gi, '_')
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}_evaluation.csv"`)
+      return res.send(evaluationCsv(rows))
+    }
+    res.json(buildEvaluationReport(rows))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not compute the evaluation.' })
   }
 })
 

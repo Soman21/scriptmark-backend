@@ -3,12 +3,28 @@ import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import prisma from '../lib/prisma.js'
 import { sendEmail, sixDigitCode } from '../lib/email.js'
+import { requireAuth } from '../middleware/auth.js'
+import { effectiveRole } from '../lib/roles.js'
 
 const router = express.Router()
 
+// Emails are matched without regard to case or stray spaces, so
+// Ann@Unizik.edu.ng and ann@unizik.edu.ng are the same account.
+const normalizeEmail = (email) => String(email || '').trim().toLowerCase()
+const findUserByEmail = (email) =>
+  prisma.user.findFirst({ where: { email: { equals: normalizeEmail(email), mode: 'insensitive' } } })
+
+// Brings a stored role in line with the Admin email rule before a token is
+// issued, so the database and the token agree.
+async function withSyncedRole(user) {
+  const role = effectiveRole(user.email, user.role)
+  if (role === user.role) return user
+  return prisma.user.update({ where: { id: user.id }, data: { role } })
+}
+
 function signToken(user) {
   return jwt.sign(
-    { id: user.id, email: user.email, name: user.name, role: user.role },
+    { id: user.id, email: user.email, name: user.name, role: effectiveRole(user.email, user.role) },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   )
@@ -16,13 +32,14 @@ function signToken(user) {
 
 router.post('/signup', async (req, res) => {
   try {
-    const { name, email, password, role } = req.body
+    const { name, password } = req.body
+    const email = normalizeEmail(req.body.email)
 
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Name, email, and password are required.' })
     }
 
-    const existing = await prisma.user.findUnique({ where: { email } })
+    const existing = await findUserByEmail(email)
     if (existing) {
       return res.status(409).json({ error: 'An account with that email already exists.' })
     }
@@ -31,10 +48,12 @@ router.post('/signup', async (req, res) => {
 
     const user = await prisma.user.create({
       data: {
-        name,
+        name: String(name).trim(),
         email,
         passwordHash,
-        role: ['LECTURER', 'REVIEWER', 'ADMIN'].includes(role) ? role : 'LECTURER',
+        // Everyone signs up as a Lecturer. Admin is never self chosen; it
+        // follows the Admin email list in lib/roles.js.
+        role: effectiveRole(email, 'LECTURER'),
       },
     })
 
@@ -57,7 +76,7 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required.' })
     }
 
-    const user = await prisma.user.findUnique({ where: { email } })
+    const user = await findUserByEmail(email)
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password.' })
     }
@@ -105,6 +124,13 @@ router.post('/login', async (req, res) => {
   }
 })
 
+// Wrong code attempts per user. After OTP_MAX_ATTEMPTS the outstanding codes
+// are cancelled and a fresh sign in is needed, so the 6 digit code cannot be
+// guessed. Kept in memory: a restart only resets the count, never lets
+// anyone in.
+const OTP_MAX_ATTEMPTS = 5
+const otpFailures = new Map()
+
 // POST /api/auth/verifyOtp - body: { pendingToken, code }
 // Completes login: checks the pending token is genuine and not expired,
 // checks the code matches a recent unused OTP_LOGIN code for that user, then
@@ -126,7 +152,7 @@ router.post('/verifyOtp', async (req, res) => {
       return res.status(401).json({ error: 'This login attempt has expired. Please log in again.' })
     }
 
-    const user = await prisma.user.findUnique({ where: { id: payload.userId } })
+    let user = await prisma.user.findUnique({ where: { id: payload.userId } })
     if (!user) {
       return res.status(401).json({ error: 'This login attempt has expired. Please log in again.' })
     }
@@ -146,11 +172,20 @@ router.post('/verifyOtp', async (req, res) => {
     }
 
     if (!matchedCode) {
+      const failures = (otpFailures.get(user.id) || 0) + 1
+      if (failures >= OTP_MAX_ATTEMPTS) {
+        otpFailures.delete(user.id)
+        await prisma.verificationCode.updateMany({ where: { userId: user.id, purpose: 'OTP_LOGIN', used: false }, data: { used: true } })
+        return res.status(429).json({ error: 'Too many wrong codes. Sign in again to get a new code.' })
+      }
+      otpFailures.set(user.id, failures)
       return res.status(400).json({ error: 'That code is incorrect or has expired.' })
     }
 
+    otpFailures.delete(user.id)
     await prisma.verificationCode.update({ where: { id: matchedCode.id }, data: { used: true } })
 
+    user = await withSyncedRole(user)
     const token = signToken(user)
     res.json({
       token,
@@ -172,7 +207,7 @@ router.post('/forgotPassword', async (req, res) => {
     const { email } = req.body
     if (!email) return res.status(400).json({ error: 'Email is required.' })
 
-    const user = await prisma.user.findUnique({ where: { email } })
+    const user = await findUserByEmail(email)
     if (user) {
       const code = sixDigitCode()
       const codeHash = await bcrypt.hash(code, 10)
@@ -214,7 +249,7 @@ router.post('/resetPassword', async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 8 characters.' })
     }
 
-    const user = await prisma.user.findUnique({ where: { email } })
+    const user = await findUserByEmail(email)
     if (!user) {
       return res.status(400).json({ error: 'Invalid or expired code.' })
     }
@@ -245,6 +280,50 @@ router.post('/resetPassword', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Something went wrong.' })
+  }
+})
+
+// PUT /api/auth/me - body: { name }. Updates the signed in user's display
+// name. The name travels inside the token, so a fresh token comes back too.
+router.put('/me', requireAuth, async (req, res) => {
+  try {
+    const name = typeof req.body.name === 'string' ? req.body.name.trim() : ''
+    if (!name) return res.status(400).json({ error: 'Name cannot be empty.' })
+    if (name.length > 100) return res.status(400).json({ error: 'Name must be 100 characters or fewer.' })
+
+    const user = await prisma.user.update({ where: { id: req.user.id }, data: { name } })
+    res.json({ token: signToken(user), user: { id: user.id, name: user.name, email: user.email, role: user.role } })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not update your profile.' })
+  }
+})
+
+// PUT /api/auth/password - body: { currentPassword, newPassword }. Same 8
+// character minimum as a password reset; the current password must match.
+router.put('/password', requireAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current and new password are both required.' })
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters.' })
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } })
+    if (!user || !(await bcrypt.compare(currentPassword, user.passwordHash))) {
+      return res.status(400).json({ error: 'Your current password is not correct.' })
+    }
+    if (await bcrypt.compare(newPassword, user.passwordHash)) {
+      return res.status(400).json({ error: 'The new password must be different from the current one.' })
+    }
+
+    await prisma.user.update({ where: { id: user.id }, data: { passwordHash: await bcrypt.hash(newPassword, 10) } })
+    res.json({ ok: true })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not change your password.' })
   }
 })
 

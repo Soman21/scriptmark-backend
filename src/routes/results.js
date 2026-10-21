@@ -2,6 +2,7 @@ import express from 'express'
 import prisma from '../lib/prisma.js'
 import { requireAuth } from '../middleware/auth.js'
 import { scoreScriptAgainstGuide } from '../lib/groq.js'
+import { accessibleGuidesWhere, canAccessScript, canAccessSession } from '../lib/access.js'
 
 const router = express.Router()
 router.use(requireAuth)
@@ -16,14 +17,15 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
       return res.status(400).json({ error: 'A marking guide must be selected before scoring.' })
     }
 
-    const script = await prisma.script.findUnique({ where: { id: req.params.scriptId } })
+    const { script, session } = await canAccessScript(prisma, req.user, req.params.scriptId)
     if (!script) return res.status(404).json({ error: 'Script not found.' })
+    if (!session) return res.status(403).json({ error: 'You do not have permission to mark this script.' })
     if (!script.ocrText) {
       return res.status(400).json({ error: 'This script has no extracted text yet — OCR may still be processing.' })
     }
 
-    const guide = await prisma.markingGuide.findUnique({
-      where: { id: guideId },
+    const guide = await prisma.markingGuide.findFirst({
+      where: { id: guideId, ...(await accessibleGuidesWhere(prisma, req.user)) },
       include: { questions: true },
     })
     if (!guide) return res.status(404).json({ error: 'Marking guide not found.' })
@@ -79,8 +81,13 @@ router.put('/:answerId/confirm', async (req, res) => {
 
     const existing = await prisma.scriptAnswer.findUnique({ where: { id: req.params.answerId } })
     if (!existing) return res.status(404).json({ error: 'Answer not found.' })
+    if (!(await canAccessScript(prisma, req.user, existing.scriptId)).session) {
+      return res.status(403).json({ error: 'You do not have permission to confirm this score.' })
+    }
 
-    const isOverride = existing.confirmedAt != null
+    // Signing off an already confirmed (often auto accepted) score without
+    // changing it is not an override, so it needs no reason.
+    const isOverride = existing.confirmedAt != null && Number(confirmedScore) !== existing.confirmedScore
     if (isOverride && !reason) {
       return res.status(400).json({ error: 'A reason is required when changing a score that was already confirmed.' })
     }
@@ -127,6 +134,9 @@ router.get('/myQueue', async (req, res) => {
   try {
     const { sessionId } = req.query
     if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' })
+    if (!(await canAccessSession(prisma, req.user, sessionId))) {
+      return res.status(403).json({ error: 'You do not have permission to view this session.' })
+    }
 
     const answers = await prisma.scriptAnswer.findMany({
       where: {
@@ -137,7 +147,7 @@ router.get('/myQueue', async (req, res) => {
         question: true,
         script: { select: { id: true, studentName: true, regNumber: true, studentIdentifier: true } },
       },
-      orderBy: [{ question: { order: 'asc' } }],
+      orderBy: [{ question: { order: 'asc' } }, { script: { regNumber: 'asc' } }],
     })
 
     res.json({ answers })
@@ -147,14 +157,82 @@ router.get('/myQueue', async (req, res) => {
   }
 })
 
+// GET /api/results/transcriptionSample?sessionId=...&n=10 - answers whose
+// marked text a lecturer has not checked yet, in random order, for the
+// transcription check that gives WER and CER.
+router.get('/transcriptionSample', async (req, res) => {
+  try {
+    const { sessionId } = req.query
+    const n = Math.min(50, Math.max(1, Math.floor(Number(req.query.n)) || 10))
+    if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' })
+    if (!(await canAccessSession(prisma, req.user, sessionId))) {
+      return res.status(403).json({ error: 'You do not have permission to view this session.' })
+    }
+    const withText = { script: { sessionId }, OR: [{ extractedText: { not: null } }, { visionTranscript: { not: null } }] }
+    const [pending, checked] = await Promise.all([
+      prisma.scriptAnswer.findMany({
+        where: { ...withText, referenceText: null },
+        select: {
+          id: true,
+          extractedText: true,
+          visionTranscript: true,
+          question: { select: { number: true, subLabel: true, text: true } },
+          script: { select: { studentName: true, regNumber: true, imageUrl: true, pages: { select: { imageUrl: true, pageNumber: true }, orderBy: { pageNumber: 'asc' } } } },
+        },
+      }),
+      prisma.scriptAnswer.count({ where: { ...withText, referenceText: { not: null } } }),
+    ])
+    for (let i = pending.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      ;[pending[i], pending[j]] = [pending[j], pending[i]]
+    }
+    res.json({
+      checked,
+      remaining: pending.length,
+      answers: pending.slice(0, n).map((a) => ({
+        id: a.id,
+        question: `Q${a.question.number}${a.question.subLabel || ''}`,
+        questionText: a.question.text,
+        markedText: a.visionTranscript || a.extractedText,
+        student: a.script.studentName || a.script.regNumber || null,
+        pages: a.script.pages.length ? a.script.pages.map((p) => p.imageUrl) : [a.script.imageUrl].filter(Boolean),
+      })),
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load answers to check.' })
+  }
+})
+
+// PUT /api/results/:answerId/reference - body: { text }. Saves what the
+// answer really says; an empty text clears it.
+router.put('/:answerId/reference', async (req, res) => {
+  try {
+    const existing = await prisma.scriptAnswer.findUnique({ where: { id: req.params.answerId } })
+    if (!existing) return res.status(404).json({ error: 'Answer not found.' })
+    if (!(await canAccessScript(prisma, req.user, existing.scriptId)).session) {
+      return res.status(403).json({ error: 'You do not have permission to change this answer.' })
+    }
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim().slice(0, 20000) : ''
+    const updated = await prisma.scriptAnswer.update({ where: { id: existing.id }, data: { referenceText: text || null } })
+    res.json({ id: updated.id, referenceText: updated.referenceText })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not save the transcription.' })
+  }
+})
+
 // PUT /api/results/scripts/:scriptId/flag - flag a script for manual review
 router.put('/scripts/:scriptId/flag', async (req, res) => {
   try {
-    const script = await prisma.script.update({
-      where: { id: req.params.scriptId },
+    const { script, session } = await canAccessScript(prisma, req.user, req.params.scriptId)
+    if (!script) return res.status(404).json({ error: 'Script not found.' })
+    if (!session) return res.status(403).json({ error: 'You do not have permission to flag this script.' })
+    const flagged = await prisma.script.update({
+      where: { id: script.id },
       data: { status: 'FLAGGED' },
     })
-    res.json(script)
+    res.json(flagged)
   } catch (err) {
     res.status(404).json({ error: 'Script not found.' })
   }

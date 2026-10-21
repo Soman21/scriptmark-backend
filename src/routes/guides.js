@@ -1,10 +1,12 @@
 import express from 'express'
+import { Prisma } from '@prisma/client'
 import multer from 'multer'
 import prisma from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { extractTextFromDocument } from '../lib/docParse.js'
 import { parseMarkingSchemeDocument, generateModelAnswers } from '../lib/groq.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
+import { accessibleGuidesWhere, canAccessSession, canEditGuide } from '../lib/access.js'
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -15,10 +17,9 @@ const router = express.Router()
 router.use(requireAuth)
 
 router.get('/', async (req, res) => {
-  // Same rule as sessions: Lecturers see their own guides, Reviewers and
-  // Admins see everyone's, since reviewing needs visibility into the guide
-  // a script is being scored against even if a Reviewer didn't create it.
-  const where = req.user.role === 'LECTURER' ? { createdById: req.user.id } : {}
+  // Your own guides, plus the guide of any session you are an approved
+  // marker on. Only Admin sees everyone's.
+  const where = await accessibleGuidesWhere(prisma, req.user)
   const guides = await prisma.markingGuide.findMany({
     where,
     include: { questions: { orderBy: { order: 'asc' } }, createdBy: { select: { name: true } } },
@@ -28,13 +29,16 @@ router.get('/', async (req, res) => {
 })
 
 router.get('/:id', async (req, res) => {
-  const guide = await prisma.markingGuide.findUnique({
-    where: { id: req.params.id },
+  const where = await accessibleGuidesWhere(prisma, req.user)
+  const guide = await prisma.markingGuide.findFirst({
+    where: { id: req.params.id, ...where },
     include: { questions: { orderBy: { order: 'asc' } } },
   })
-  if (!guide) return res.status(404).json({ error: 'Marking guide not found.' })
-  if (req.user.role === 'LECTURER' && guide.createdById !== req.user.id) {
-    return res.status(403).json({ error: 'You do not have permission to view this guide.' })
+  if (!guide) {
+    const exists = await prisma.markingGuide.findUnique({ where: { id: req.params.id }, select: { id: true } })
+    return exists
+      ? res.status(403).json({ error: 'You do not have permission to view this guide.' })
+      : res.status(404).json({ error: 'Marking guide not found.' })
   }
   res.json(guide)
 })
@@ -112,6 +116,9 @@ router.get('/:id/claimStatus', async (req, res) => {
 
     const session = await prisma.markingSession.findFirst({ where: { guideId: guide.id } })
     if (!session) return res.status(404).json({ error: 'No session is using this guide yet.' })
+    if (!(await canAccessSession(prisma, req.user, session.id))) {
+      return res.status(403).json({ error: 'You do not have permission to view this session.' })
+    }
 
     const markers = await prisma.sessionMarker.findMany({
       where: { sessionId: session.id, status: 'APPROVED' },
@@ -156,6 +163,9 @@ router.put('/:id/questions/:questionId/claim', requireRole('LECTURER', 'ADMIN'),
 
     const session = await prisma.markingSession.findFirst({ where: { guideId: req.params.id } })
     if (!session) return res.status(404).json({ error: 'No session is using this guide yet.' })
+    if (!(await canAccessSession(prisma, req.user, session.id))) {
+      return res.status(403).json({ error: 'You do not have permission to change this session.' })
+    }
 
     const isCoordinator = session.createdById === req.user.id || req.user.role === 'ADMIN'
     const { targetUserId } = req.body
@@ -163,7 +173,9 @@ router.put('/:id/questions/:questionId/claim', requireRole('LECTURER', 'ADMIN'),
     const finalTargetId = wantsSelf ? req.user.id : targetUserId // null here means "unclaim"
 
     const alreadyTaken = question.assignedMarkerId && question.assignedMarkerId !== req.user.id
-    if (!isCoordinator && (alreadyTaken || !wantsSelf)) {
+    // A marker may release a question they hold themselves.
+    const releasingOwn = targetUserId === null && question.assignedMarkerId === req.user.id
+    if (!isCoordinator && (alreadyTaken || (!wantsSelf && !releasingOwn))) {
       return res.status(403).json({
         error: alreadyTaken
           ? 'This question is already claimed by someone else. Ask your Coordinator to reassign it if needed.'
@@ -175,7 +187,7 @@ router.put('/:id/questions/:questionId/claim', requireRole('LECTURER', 'ADMIN'),
       const isMarker = await prisma.sessionMarker.findUnique({
         where: { sessionId_userId: { sessionId: session.id, userId: finalTargetId } },
       })
-      if (!isMarker) {
+      if (!isMarker || isMarker.status !== 'APPROVED') {
         return res.status(400).json({ error: 'That person needs to join this session with its code first.' })
       }
     }
@@ -235,45 +247,94 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   }
 })
 
-// PUT /api/guides/:id - full edit: title, subject, isDraft, and replace all questions.
+// PUT /api/guides/:id - full edit: title, subject, isDraft, and the question
+// list. Questions are matched to the saved ones by number and part, so a
+// question that scripts have already been marked against is updated in
+// place (keeping its answers and whoever claimed it) instead of being
+// deleted and recreated.
+const questionKey = (q) => `${String(q.number || '1').trim()}|${q.subLabel || ''}`
+const questionData = (q, i) => ({
+  number: q.number || '1',
+  subLabel: q.subLabel || null,
+  text: q.text || '',
+  modelAnswer: q.modelAnswer || '',
+  keywords: q.keywords || '',
+  maxMarks: Number(q.maxMarks) || 0,
+  order: i,
+  isCalculationHeavy: !!q.isCalculationHeavy,
+  steps: Array.isArray(q.steps) && q.steps.length > 0 ? q.steps : Prisma.DbNull,
+})
+
 router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
     const { title, subject, isDraft, questions, questionPaperUrl, questionPaperMimeType } = req.body
 
-    const guide = await prisma.markingGuide.update({
+    const existing = await prisma.markingGuide.findUnique({
       where: { id: req.params.id },
-      data: {
-        title,
-        subject,
-        isDraft: !!isDraft,
-        ...(questionPaperUrl !== undefined ? { questionPaperUrl } : {}),
-        ...(questionPaperMimeType !== undefined ? { questionPaperMimeType } : {}),
-        questions: {
-          deleteMany: {},
-          create: (questions || []).map((q, i) => ({
-            number: q.number || '1',
-            subLabel: q.subLabel || null,
-            text: q.text || '',
-            modelAnswer: q.modelAnswer || '',
-            keywords: q.keywords || '',
-            maxMarks: Number(q.maxMarks) || 0,
-            order: i,
-            isCalculationHeavy: !!q.isCalculationHeavy,
-            steps: Array.isArray(q.steps) && q.steps.length > 0 ? q.steps : undefined,
-          })),
-        },
-      },
-      include: { questions: { orderBy: { order: 'asc' } } },
+      include: { questions: { include: { _count: { select: { scriptAnswers: true } } } } },
     })
-    res.json(guide)
+    if (!existing) return res.status(404).json({ error: 'Marking guide not found.' })
+    if (!canEditGuide(req.user, existing)) {
+      return res.status(403).json({ error: 'Only the lecturer who wrote this guide can change it.' })
+    }
+
+    const incoming = (questions || []).map(questionData)
+    const keep = new Set(incoming.map(questionKey))
+    const removedMarked = existing.questions.filter((q) => !keep.has(questionKey(q)) && q._count.scriptAnswers > 0)
+    if (removedMarked.length) {
+      const labels = removedMarked.map((q) => `Q${q.number}${q.subLabel || ''}`).join(', ')
+      return res.status(409).json({
+        error: `Scripts have already been marked against ${labels}, so it cannot be removed. Change its text or marks instead.`,
+      })
+    }
+
+    const byKey = new Map(existing.questions.map((q) => [questionKey(q), q]))
+    // Questions scripts were already marked against whose marking content
+    // changed: the frontend offers to re mark them with the new version.
+    const markingFields = ['text', 'modelAnswer', 'keywords', 'maxMarks', 'isCalculationHeavy']
+    const changedMarked = incoming
+      .map((data) => ({ data, match: byKey.get(questionKey(data)) }))
+      .filter(
+        ({ data, match }) =>
+          match &&
+          match._count.scriptAnswers > 0 &&
+          (markingFields.some((f) => data[f] !== match[f]) ||
+            JSON.stringify(data.steps === Prisma.DbNull ? null : data.steps) !== JSON.stringify(match.steps ?? null))
+      )
+      .map(({ match }) => ({ id: match.id, label: `Q${match.number}${match.subLabel || ''}`, markedAnswers: match._count.scriptAnswers }))
+    const guide = await prisma.$transaction(async (tx) => {
+      await tx.question.deleteMany({ where: { guideId: existing.id, id: { in: existing.questions.filter((q) => !keep.has(questionKey(q))).map((q) => q.id) } } })
+      for (const data of incoming) {
+        const match = byKey.get(questionKey(data))
+        if (match) await tx.question.update({ where: { id: match.id }, data })
+        else await tx.question.create({ data: { ...data, guideId: existing.id } })
+      }
+      return tx.markingGuide.update({
+        where: { id: existing.id },
+        data: {
+          title,
+          subject,
+          isDraft: !!isDraft,
+          ...(questionPaperUrl !== undefined ? { questionPaperUrl } : {}),
+          ...(questionPaperMimeType !== undefined ? { questionPaperMimeType } : {}),
+        },
+        include: { questions: { orderBy: { order: 'asc' } } },
+      })
+    })
+    res.json({ ...guide, changedMarkedQuestions: changedMarked })
   } catch (err) {
     console.error(err)
-    res.status(404).json({ error: 'Marking guide not found.' })
+    res.status(500).json({ error: 'Could not save the marking guide.' })
   }
 })
 
 router.delete('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
+    const guide = await prisma.markingGuide.findUnique({ where: { id: req.params.id } })
+    if (!guide) return res.status(404).json({ error: 'Marking guide not found.' })
+    if (!canEditGuide(req.user, guide)) {
+      return res.status(403).json({ error: 'Only the lecturer who wrote this guide can delete it.' })
+    }
     await prisma.markingGuide.delete({ where: { id: req.params.id } })
     res.status(204).end()
   } catch (err) {

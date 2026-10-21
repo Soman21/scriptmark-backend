@@ -1,10 +1,18 @@
 import express from 'express'
 import prisma from '../lib/prisma.js'
 import { requireAuth } from '../middleware/auth.js'
-import { chatWithAssistantTools } from '../lib/groq.js'
-import { accessibleSessionsWhere, canAccessSession } from '../lib/access.js'
+import { chatWithAssistantTools, reviewScriptChat, pageAssistantChat } from '../lib/groq.js'
+import { buildReviewContext, cleanReviewReply } from '../lib/review.js'
+import { accessibleSessionsWhere, canAccessSession, canAccessScript } from '../lib/access.js'
 import { findUnresolvedScripts } from '../lib/roster.js'
 import { computeSessionAnalytics } from '../lib/analytics.js'
+import { PAGES, PAGE_PROMPTS, buildPageContext, cleanPageReply } from '../lib/pageAssistant.js'
+import { withDuplicateFlags } from '../lib/duplicates.js'
+import { resultRow } from '../lib/resultRows.js'
+import { loadTodayList } from '../lib/today.js'
+import { loadSessionComparison } from '../lib/cohort.js'
+import { REPORT_PROMPT, buildReportFacts, weakAnswerReasons, reportContext, cleanReport } from '../lib/report.js'
+import { buildEvaluationReport, loadEvaluationRows } from '../lib/evaluation.js'
 
 const router = express.Router()
 router.use(requireAuth)
@@ -68,7 +76,7 @@ async function toolFindStudent(user, { query, sessionId }) {
         { regNumber: { contains: query, mode: 'insensitive' } },
       ],
     },
-    include: { answers: { include: { question: true } } },
+    include: { answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } } },
     take: 10,
   })
 
@@ -123,10 +131,23 @@ async function toolPrepareExport(user, { sessionId, format }) {
   if (unresolved.length > 0) {
     return {
       eligible: false,
-      reason: `${unresolved.length} student${unresolved.length !== 1 ? 's have' : ' has'} an unresolved name conflict in the class list — resolve them on the Results page before exporting.`,
+      reason: `${unresolved.length} student${unresolved.length !== 1 ? 's have' : ' has'} an unresolved name conflict in the class list. Resolve them on the Results page before exporting.`,
     }
   }
   return { eligible: true, sessionId, sessionTitle: session.title, format: format || 'both' }
+}
+
+async function toolCompareSessions(user, { sessionIds } = {}) {
+  const where = await accessibleSessionsWhere(prisma, user)
+  const ids = Array.isArray(sessionIds) ? sessionIds.filter((x) => typeof x === 'string').slice(0, 10) : []
+  const sessions = await loadSessionComparison(ids.length ? { AND: [where, { id: { in: ids } }] } : where)
+  // The weakest question only for a handful, since each needs a full read.
+  for (const s of sessions.slice(0, 4)) {
+    const per = (await computeSessionAnalytics(s.id)).perQuestion.filter((q) => q.averagePercent != null)
+    const weakest = per.sort((a, b) => a.averagePercent - b.averagePercent)[0]
+    s.weakestQuestion = weakest ? { question: `Q${weakest.number}${weakest.subLabel || ''}`, averagePercent: weakest.averagePercent } : null
+  }
+  return { sessions, passMark: 40 }
 }
 
 async function executeTool(name, args, user) {
@@ -143,6 +164,10 @@ async function executeTool(name, args, user) {
       return toolGetAnalytics(user, args)
     case 'prepare_export':
       return toolPrepareExport(user, args)
+    case 'compare_sessions':
+      return toolCompareSessions(user, args)
+    case 'get_todo_list':
+      return { items: (await loadTodayList(prisma, user, await accessibleSessionsWhere(prisma, user))).map(({ session, text }) => ({ session, text })) }
     default:
       return { error: `Unknown tool: ${name}` }
   }
@@ -156,8 +181,13 @@ const MAX_TOOL_ITERATIONS = 4
 // not a restriction, since the assistant can look up any session the user has access to.
 router.post('/chat', async (req, res) => {
   try {
-    const { messages, activeSessionId } = req.body
-    if (!Array.isArray(messages) || messages.length === 0) {
+    const { activeSessionId } = req.body
+    // Only the conversation itself comes from the browser. Anything else,
+    // like a system message, could rewrite the assistant's rules.
+    const messages = (Array.isArray(req.body.messages) ? req.body.messages : [])
+      .filter((m) => (m?.role === 'user' || m?.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+      .map((m) => ({ role: m.role, content: m.content }))
+    if (messages.length === 0 || messages.at(-1).role !== 'user') {
       return res.status(400).json({ error: 'At least one message is required.' })
     }
 
@@ -177,7 +207,8 @@ router.post('/chat', async (req, res) => {
       const message = await chatWithAssistantTools(working)
 
       if (!message.tool_calls || message.tool_calls.length === 0) {
-        return res.json({ reply: message.content, action })
+        const reply = message.content?.trim() || "Sorry, I couldn't put an answer together. Could you ask that another way?"
+        return res.json({ reply, action })
       }
 
       working.push({ role: 'assistant', content: message.content || null, tool_calls: message.tool_calls })
@@ -206,7 +237,144 @@ router.post('/chat', async (req, res) => {
     })
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'The assistant could not respond: ' + err.message })
+    // The details (often a raw provider error) stay in the server log.
+    res.status(502).json({ error: 'The AI Assistant could not answer just now. Please try again in a moment.' })
+  }
+})
+
+// GET /api/assistant/today - what needs the user across every open session.
+router.get('/today', async (req, res) => {
+  try {
+    const items = await loadTodayList(prisma, req.user, await accessibleSessionsWhere(prisma, req.user))
+    res.json({ items })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load your list for today.' })
+  }
+})
+
+// POST /api/assistant/report - body: { sessionId }. Drafts an examiner's
+// report: the numbers come from analytics, the model writes the prose.
+router.post('/report', async (req, res) => {
+  try {
+    const session = await canAccessSession(prisma, req.user, req.body?.sessionId)
+    if (!session) return res.status(403).json({ error: 'That session was not found, or you do not have access to it.' })
+
+    const analytics = await computeSessionAnalytics(session.id)
+    if (!analytics.scoredCount) return res.status(400).json({ error: 'Mark some scripts first, then the report has something to say.' })
+    const evaluation = buildEvaluationReport(await loadEvaluationRows(session.id))
+    const facts = buildReportFacts(session, analytics, evaluation)
+
+    const answers = await prisma.scriptAnswer.findMany({
+      where: { script: { sessionId: session.id } },
+      select: { reasoning: true, suggestedScore: true, confirmedScore: true, question: { select: { number: true, subLabel: true, maxMarks: true } } },
+    })
+    const context = reportContext(facts, weakAnswerReasons(answers, facts.hardest))
+    const raw = await pageAssistantChat(REPORT_PROMPT, context, [{ role: 'user', content: 'Write the report.' }])
+    res.json({ facts, ...cleanReport(raw, facts) })
+  } catch (err) {
+    console.error(err)
+    res.status(502).json({ error: 'The report could not be drafted just now. Please try again in a moment.' })
+  }
+})
+
+// POST /api/assistant/review - body: { scriptId, messages }
+// The assistant beside a script in Results: explains its scores and can
+// propose one changed score, which the frontend only puts in the score box.
+router.post('/review', async (req, res) => {
+  try {
+    const { scriptId } = req.body
+    if (!scriptId || !(await canAccessScript(prisma, req.user, scriptId)).session) {
+      return res.status(403).json({ error: 'You do not have access to this script.' })
+    }
+    const messages = (Array.isArray(req.body.messages) ? req.body.messages : [])
+      .filter((m) => (m?.role === 'user' || m?.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }))
+      .slice(-12)
+    if (messages.length === 0 || messages.at(-1).role !== 'user') {
+      return res.status(400).json({ error: 'At least one message is required.' })
+    }
+    const script = await prisma.script.findUnique({
+      where: { id: scriptId },
+      include: { answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } } },
+    })
+    if (!script.answers.length) return res.status(400).json({ error: 'This script has not been marked yet.' })
+
+    const raw = await reviewScriptChat(buildReviewContext(script), messages)
+    const { reply, proposal } = cleanReviewReply(raw, script.answers)
+    res.json({ reply: reply || "Sorry, I couldn't put an answer together. Could you ask that another way?", proposal })
+  } catch (err) {
+    console.error(err)
+    res.status(502).json({ error: 'The marking assistant could not answer just now. Please try again in a moment.' })
+  }
+})
+
+// Loads what one page shows, for the chat helper on that page.
+async function loadPageData(page, session, user) {
+  if (page === 'claim') {
+    const questions = session.guideId
+      ? await prisma.question.findMany({
+          where: { guideId: session.guideId },
+          orderBy: { order: 'asc' },
+          include: { assignedMarker: { select: { id: true, name: true } } },
+        })
+      : []
+    const markers = await prisma.sessionMarker.findMany({
+      where: { sessionId: session.id, status: 'APPROVED' },
+      include: { user: { select: { id: true, name: true } } },
+    })
+    const mine = markers.find((m) => m.userId === user.id)
+    const canManage = user.role === 'ADMIN' || session.createdById === user.id || mine?.accessLevel === 'FULL'
+    return { questions, markers: markers.map((m) => m.user), canManage }
+  }
+  if (page === 'queue') {
+    const answers = await prisma.scriptAnswer.findMany({
+      where: { question: { assignedMarkerId: user.id }, script: { sessionId: session.id } },
+      include: { question: true, script: { select: { id: true, studentName: true, regNumber: true } } },
+      orderBy: [{ question: { order: 'asc' } }, { script: { regNumber: 'asc' } }],
+    })
+    return { answers }
+  }
+  const scripts = await prisma.script.findMany({
+    where: { sessionId: session.id },
+    include: { answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } } },
+    orderBy: { uploadedAt: 'asc' },
+  })
+  if (page === 'results') return { scripts: withDuplicateFlags(scripts) }
+  const analytics = await computeSessionAnalytics(session.id)
+  const students = scripts.map((s) => {
+    const row = resultRow(s, 'total')
+    return { ...row, exam: row.exam ?? s.totalScore, studentName: s.studentName, examMax: s.answers.reduce((sum, a) => sum + (a.question?.maxMarks || 0), 0) }
+  })
+  return { analytics, students }
+}
+
+// POST /api/assistant/page - body: { sessionId, page, messages }
+// The chat helper on Claim Questions, My Queue, Results and Analytics. It
+// returns a reply and checked actions; the browser carries the actions out
+// through the page's normal routes, so their permission checks still apply.
+router.post('/page', async (req, res) => {
+  try {
+    const { sessionId, page } = req.body
+    if (!PAGES.includes(page)) return res.status(400).json({ error: 'Unknown page.' })
+    const session = sessionId ? await canAccessSession(prisma, req.user, sessionId) : null
+    if (!session) return res.status(403).json({ error: 'You do not have access to this session.' })
+    const messages = (Array.isArray(req.body.messages) ? req.body.messages : [])
+      .filter((m) => (m?.role === 'user' || m?.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }))
+      .slice(-12)
+    if (messages.length === 0 || messages.at(-1).role !== 'user') {
+      return res.status(400).json({ error: 'At least one message is required.' })
+    }
+
+    const data = await loadPageData(page, session, req.user)
+    const { context, refs } = buildPageContext(page, data, req.user.id)
+    const raw = await pageAssistantChat(PAGE_PROMPTS[page], context, messages)
+    const { reply, actions } = cleanPageReply(page, raw, refs, { userId: req.user.id, canManage: data.canManage })
+    res.json({ reply: reply || "Sorry, I couldn't put an answer together. Could you ask that another way?", actions })
+  } catch (err) {
+    console.error(err)
+    res.status(502).json({ error: 'The assistant could not answer just now. Please try again in a moment.' })
   }
 })
 
