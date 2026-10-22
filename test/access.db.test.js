@@ -35,6 +35,7 @@ before(async () => {
   app.use('/api/sessions', (await import('../src/routes/sessions.js')).default)
   app.use('/api/results', (await import('../src/routes/results.js')).default)
   app.use('/api/assistant', (await import('../src/routes/assistant.js')).default)
+  app.use('/api/notifications', (await import('../src/routes/notifications.js')).default)
   await new Promise((resolve) => {
     server = app.listen(0, resolve)
   })
@@ -536,4 +537,48 @@ test('the session overview shows counts and lecturers, and the code only to the 
 
   // Someone outside the session gets nothing.
   assert.equal((await call('GET', `/sessions/${c.session.id}/overview`, users.bola)).status, 403)
+})
+
+test('a join request reaches the bell, Grant access clears it and tells the lecturer', { skip }, async () => {
+  const chidi = await prisma.user.findFirst({ where: { email: 'chidi@unizik.edu.ng' } })
+  const tc = tokenFor(chidi)
+  const tk = (await signup('Kemi', 'LECTURER')).token
+  const kemi = await prisma.user.findFirst({ where: { email: 'kemi@unizik.edu.ng' } })
+
+  assert.equal((await call('POST', `/sessions/${c.session.id}/requestAccess`, tk)).status, 201)
+  let bell = (await call('GET', '/notifications', tc)).body
+  const req = bell.items.find((i) => i.type === 'JOIN_REQUEST' && i.actorId === kemi.id)
+  assert.ok(req, JSON.stringify(bell))
+  assert.equal(req.pending, true)
+  assert.match(req.text, /Kemi asked to join/)
+  assert.ok(bell.unread >= 1)
+
+  assert.equal((await call('PUT', `/sessions/${c.session.id}/markers/${kemi.id}/approve`, tc)).status, 200)
+  bell = (await call('GET', '/notifications', tc)).body
+  assert.equal(bell.items.find((i) => i.id === req.id).pending, false)
+
+  const kb = (await call('GET', '/notifications', tk)).body
+  assert.ok(kb.items.some((i) => i.type === 'REQUEST_APPROVED' && /Added to .* by Chidi/.test(i.text)), JSON.stringify(kb))
+  // Kemi has claimed nothing yet on a published guide.
+  assert.ok(kb.reminders.some((r) => r.type === 'REMINDER_CLAIM' && r.sessionId === c.session.id))
+
+  // Opening the bell marks stored items read; reminders stay.
+  assert.equal((await call('POST', '/notifications/read', tk)).status, 200)
+  const after = (await call('GET', '/notifications', tk)).body
+  assert.equal(after.items.every((i) => i.read), true)
+  assert.equal(after.unread, after.reminders.length)
+
+  // Nobody else sees Kemi's notifications.
+  assert.equal((await call('GET', '/notifications', users.bola)).body.items.some((i) => i.actorId === kemi.id), false)
+})
+
+test('the coordinator hears once when every script in the session is confirmed', { skip }, async () => {
+  const bola = await prisma.user.findFirst({ where: { email: 'bola@unizik.edu.ng' } })
+  const tb = tokenFor(bola)
+  const open = await prisma.scriptAnswer.findMany({ where: { script: { sessionId: b.session.id }, confirmedAt: null } })
+  for (const a of open) assert.equal((await call('PUT', `/results/${a.id}/confirm`, tb, { confirmedScore: 3 })).status, 200)
+  const done = await prisma.scriptAnswer.findFirst({ where: { script: { sessionId: b.session.id } } })
+  await call('PUT', `/results/${done.id}/confirm`, tb, { confirmedScore: 3 })
+  const n = await prisma.notification.count({ where: { userId: bola.id, type: 'SESSION_CONFIRMED', sessionId: b.session.id } })
+  assert.equal(n, 1)
 })

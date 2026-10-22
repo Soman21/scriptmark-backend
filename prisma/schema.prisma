@@ -42,6 +42,28 @@ model User {
   markerOfSessions  SessionMarker[]
   assignedQuestions Question[]         @relation("AssignedQuestions")
   changedAnswers    ScriptAnswer[]     @relation("ChangedAnswers")
+  notifications     Notification[]
+}
+
+// One line in a user's notification bell. Events that happened (a join
+// request, an approval) are stored here; reminders that depend on the
+// current state (no questions claimed yet) are worked out on each request
+// instead, so they disappear on their own once the work is done.
+// type: JOIN_REQUEST | REQUEST_APPROVED | REQUEST_DECLINED | JOINED | SESSION_CONFIRMED
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  sessionId String?
+  // Who caused it, e.g. the lecturer asking to join. Kept as a plain id so
+  // deleting that account does not delete other people's notifications.
+  actorId   String?
+  text      String
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
 }
 
 // A lecturer attached to a session as one of its markers, separate from

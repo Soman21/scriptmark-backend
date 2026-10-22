@@ -2,6 +2,7 @@ import express from 'express'
 import multer from 'multer'
 import ExcelJS from 'exceljs'
 import prisma from '../lib/prisma.js'
+import { notify, sessionManagerIds } from '../lib/notifications.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { extractTextFromImage } from '../lib/vision.js'
@@ -170,6 +171,13 @@ async function notifySessionManagers(req, session, requester) {
   const approveUrl = `${baseUrl}/api/sessions/approveByLink?token=${approveToken}`
   const denyUrl = `${baseUrl}/api/sessions/denyByLink?token=${denyToken}`
 
+  await notify(await sessionManagerIds(session), {
+    type: 'JOIN_REQUEST',
+    sessionId: session.id,
+    actorId: requester.id,
+    text: `${requester.name} asked to join ${session.courseCode || session.title}`,
+  })
+
   for (const [email, name] of recipients) {
     sendEmail({
       to: email,
@@ -223,6 +231,14 @@ router.post('/join', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, r
       // Two join requests at once (a double tap, or the join link opening
       // twice): the other one already added this lecturer, which is fine.
       if (err.code !== 'P2002') throw err
+    }
+
+    if (!existing) {
+      const joiner = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } })
+      await notify(
+        (await sessionManagerIds(session)).filter((id) => id !== req.user.id),
+        { type: 'JOINED', sessionId: session.id, actorId: req.user.id, text: `${joiner?.name || 'A lecturer'} joined ${session.courseCode || session.title}` }
+      )
     }
 
     res.json({ id: session.id, title: session.title })
@@ -538,10 +554,15 @@ router.get('/:id/pendingRequests', async (req, res) => {
 })
 
 // PUT /api/sessions/:id/markers/:userId/approve
-async function approveMarkerCore(session, userId) {
+async function approveMarkerCore(session, userId, approverName) {
   await prisma.sessionMarker.update({
     where: { sessionId_userId: { sessionId: session.id, userId } },
     data: { status: 'APPROVED' },
+  })
+  await notify([userId], {
+    type: 'REQUEST_APPROVED',
+    sessionId: session.id,
+    text: `Added to ${session.courseCode || session.title}${approverName ? ` by ${approverName}` : ''}`,
   })
   const requester = await prisma.user.findUnique({ where: { id: userId } })
   if (requester) {
@@ -557,6 +578,11 @@ async function denyMarkerCore(session, userId) {
   const requester = await prisma.user.findUnique({ where: { id: userId } })
   await prisma.sessionMarker.delete({
     where: { sessionId_userId: { sessionId: session.id, userId } },
+  })
+  await notify([userId], {
+    type: 'REQUEST_DECLINED',
+    sessionId: session.id,
+    text: `Your request to join ${session.courseCode || session.title} was declined`,
   })
   if (requester) {
     sendEmail({
@@ -575,7 +601,7 @@ router.put('/:id/markers/:userId/approve', async (req, res) => {
       return res.status(403).json({ error: 'You do not have permission to approve markers.' })
     }
 
-    await approveMarkerCore(session, req.params.userId)
+    await approveMarkerCore(session, req.params.userId, req.user.name)
     res.json({ message: 'Approved.' })
   } catch (err) {
     console.error(err)
