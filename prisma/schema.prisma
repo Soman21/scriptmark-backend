@@ -297,3 +297,21 @@ model ScriptAnswer {
   // for transparency during review.
   stepBreakdown Json?
 }
+
+// One page view or click, for the Analytics tab on the Admin page. No
+// names or emails: visitorId is a random id kept in the browser, and paths
+// have their ids replaced (/sessions/:id/results).
+// type: PAGE_VIEW | CLICK
+model AnalyticsEvent {
+  id        String   @id @default(cuid())
+  type      String
+  path      String
+  label     String?
+  visitorId String
+  userId    String?
+  device    String?
+  referrer  String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
