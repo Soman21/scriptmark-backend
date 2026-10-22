@@ -21,7 +21,7 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
     if (!script) return res.status(404).json({ error: 'Script not found.' })
     if (!session) return res.status(403).json({ error: 'You do not have permission to mark this script.' })
     if (!script.ocrText) {
-      return res.status(400).json({ error: 'This script has no extracted text yet — OCR may still be processing.' })
+      return res.status(400).json({ error: 'This script has no extracted text yet. Reading may still be in progress.' })
     }
 
     const guide = await prisma.markingGuide.findFirst({

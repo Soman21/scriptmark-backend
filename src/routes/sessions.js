@@ -93,6 +93,17 @@ async function generateUniqueJoinCode() {
   throw new Error('Could not generate a unique join code, please try again.')
 }
 
+// Gives a session without a join code a new one. Two people opening the
+// same old session at once could both try; the unique index on joinCode and
+// the `joinCode: null` condition mean only the first write lands, and the
+// second simply reads back the code the first one saved.
+async function assignJoinCode(sessionId) {
+  const code = await generateUniqueJoinCode()
+  await prisma.markingSession.updateMany({ where: { id: sessionId, joinCode: null }, data: { joinCode: code } })
+  const fresh = await prisma.markingSession.findUnique({ where: { id: sessionId }, select: { joinCode: true } })
+  return fresh.joinCode
+}
+
 // Shared by every /:id/... route below: Lecturers can only reach their own
 // sessions, Reviewers and Admins can reach any session. Attaches the loaded
 // session to req.markingSession so routes don't have to re-fetch it.
@@ -163,7 +174,7 @@ async function notifySessionManagers(req, session, requester) {
     sendEmail({
       to: email,
       subject: `${requester.name} wants to join ${session.title}`,
-      html: `<p>Hi ${name},</p><p>${requester.name} (${requester.email}) has requested to join <strong>${session.title}</strong> as a marker on ScriptMark.</p><p style="margin:20px 0;"><a href="${approveUrl}" style="background:#059669;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:bold;margin-right:10px;">Grant Access</a><a href="${denyUrl}" style="background:#f1f5f9;color:#475569;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">Deny</a></p><p>Or open Claim Questions in the session to review it there instead.</p>`,
+      html: `<p>Hi ${name},</p><p>${requester.name} (${requester.email}) has requested to join <strong>${session.title}</strong> as a marker on ScriptMark.</p><p style="margin:20px 0;"><a href="${approveUrl}" style="background:#1F5FAD;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:bold;margin-right:10px;">Grant Access</a><a href="${denyUrl}" style="background:#f1f5f9;color:#475569;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">Deny</a></p><p>Or open Claim Questions in the session to review it there instead.</p>`,
     }).catch((err) => console.error('Request notification email failed:', err))
   }
 }
@@ -337,15 +348,21 @@ router.get('/:id', async (req, res) => {
     }
   }
 
+  const accessLevel = isCreator || req.user.role === 'ADMIN' ? 'FULL' : myMembership.accessLevel
+
+  // Sessions made before join codes existed have none, which hid Add
+  // lecturers on them. The first time someone who can add lecturers opens
+  // such a session, it gets a code, so every session ends up with one
+  // without a separate database script.
+  if (!session.joinCode && accessLevel === 'FULL') {
+    session.joinCode = await assignJoinCode(session.id)
+  }
+
   // Tells the frontend what this specific user can do in this specific
   // session, so the workspace tab bar can be built from real membership
   // rather than the user's global account role (a LECTURER account is not
   // automatically the coordinator of every session they can see).
-  res.json({
-    ...session,
-    isCreator,
-    accessLevel: isCreator || req.user.role === 'ADMIN' ? 'FULL' : myMembership.accessLevel,
-  })
+  res.json({ ...session, isCreator, accessLevel })
 })
 
 router.put('/:id', requireRole('LECTURER', 'ADMIN'), requireMembership, async (req, res) => {
@@ -666,7 +683,7 @@ router.post('/:id/inviteByEmail', async (req, res) => {
     // The link signs them in (or up) and joins in one step; the code is the fallback.
     const appUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '')
     const joinLink = appUrl
-      ? `<p><a href="${appUrl}/join/${session.joinCode}" style="display:inline-block;background:#0ea5e9;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600;">Join the session</a></p><p>Or sign in and enter this join code:</p>`
+      ? `<p><a href="${appUrl}/join/${session.joinCode}" style="display:inline-block;background:#1F5FAD;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600;">Join the session</a></p><p>Or sign in and enter this join code:</p>`
       : `<p>If you don't have an account yet, sign up first, then log in and use this join code:</p>`
 
     await sendEmail({
@@ -694,7 +711,7 @@ router.get('/scripts/:scriptId', requireScriptMembership, async (req, res) => {
 router.put('/scripts/:scriptId/studentInfo', requireRole('LECTURER', 'ADMIN'), requireScriptMembership, async (req, res) => {
   try {
     const { studentName, regNumber } = req.body
-    const identifier = [studentName, regNumber].filter(Boolean).join(' — ') || null
+    const identifier = [studentName, regNumber].filter(Boolean).join(', ') || null
     const script = await prisma.script.update({
       where: { id: req.params.scriptId },
       data: {
@@ -740,7 +757,7 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
       if (!script) return res.status(404).json({ error: 'That script was not found in this session.' })
     } else {
       isFirstPageOfNewScript = true
-      const identifier = [studentName, regNumber].filter(Boolean).join(' — ') || null
+      const identifier = [studentName, regNumber].filter(Boolean).join(', ') || null
       script = await prisma.script.create({
         data: {
           sessionId: req.params.id,
@@ -794,7 +811,7 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
         classListEntryId = match.entry.id
       }
       if (detected.name || detected.regNumber) {
-        const identifier = [detected.name, detected.regNumber].filter(Boolean).join(' — ') || null
+        const identifier = [detected.name, detected.regNumber].filter(Boolean).join(', ') || null
         await prisma.script.update({
           where: { id: script.id },
           data: {
@@ -929,7 +946,7 @@ router.post('/:id/scripts/bulkConfirm', requireRole('LECTURER', 'ADMIN'), requir
     const createdScripts = []
 
     for (const group of groups) {
-      const identifier = [group.studentName, group.regNumber].filter(Boolean).join(' — ') || null
+      const identifier = [group.studentName, group.regNumber].filter(Boolean).join(', ') || null
       const script = await prisma.script.create({
         data: {
           sessionId: req.params.id,
@@ -1218,7 +1235,7 @@ async function runMarkingQueue(scripts, guide, session) {
             studentName,
             regNumber,
             classListEntryId,
-            studentIdentifier: [studentName, regNumber].filter(Boolean).join(' — ') || script.studentIdentifier,
+            studentIdentifier: [studentName, regNumber].filter(Boolean).join(', ') || script.studentIdentifier,
           },
         })
       }
@@ -1328,6 +1345,85 @@ router.get('/:id/markingStatus', requireMembership, async (req, res) => {
 // GET /api/sessions/:id/coordinatorOverview - session-wide progress plus a
 // per-marker breakdown, for the Coordinator's oversight dashboard. Only the
 // coordinator, a Full access marker or the Admin can see how others are doing.
+// GET /api/sessions/:id/overview - the session at a glance for anyone in
+// it: details, counts and who the lecturers are. The join code and pending
+// requests are only included for people who can add lecturers, since the
+// code lets anyone who has it straight in.
+router.get('/:id/overview', requireMembership, async (req, res) => {
+  try {
+    const session = await prisma.markingSession.findUnique({
+      where: { id: req.params.id },
+      include: {
+        createdBy: { select: { id: true, name: true } },
+        guide: { select: { id: true, title: true, isDraft: true, questions: { select: { number: true, subLabel: true, assignedMarkerId: true }, orderBy: { order: 'asc' } } } },
+        markers: { where: { status: { in: ['APPROVED', 'PENDING'] } }, include: { user: { select: { id: true, name: true, email: true } } } },
+      },
+    })
+    const canManage = await canManageMarkers(session, req.user.id, req.user.role)
+    if (canManage && !session.joinCode) session.joinCode = await assignJoinCode(session.id)
+
+    const [scriptsScanned, answers] = await Promise.all([
+      prisma.script.count({ where: { sessionId: session.id } }),
+      prisma.scriptAnswer.findMany({
+        where: { script: { sessionId: session.id } },
+        select: { confirmedAt: true, autoAccepted: true },
+      }),
+    ])
+    // An answer counts as marked once a lecturer confirmed it, or the AI
+    // score was accepted automatically under the session's setting.
+    const marked = answers.filter((a) => a.confirmedAt || a.autoAccepted).length
+    const roster = Array.isArray(session.classList) ? session.classList.length : 0
+
+    const questions = session.guide?.questions || []
+    const label = (q) => `Q${q.number}${q.subLabel || ''}`
+    const lecturers = session.markers
+      .filter((m) => m.status === 'APPROVED')
+      .map((m) => ({
+        id: m.user.id,
+        name: m.user.name,
+        email: m.user.email,
+        accessLevel: m.accessLevel,
+        isCoordinator: m.user.id === session.createdById,
+        questions: questions.filter((q) => q.assignedMarkerId === m.user.id).map(label),
+      }))
+      .sort((a, b) => Number(b.isCoordinator) - Number(a.isCoordinator) || a.name.localeCompare(b.name))
+    const pending = session.markers.filter((m) => m.status === 'PENDING').map((m) => ({ id: m.user.id, name: m.user.name, email: m.user.email }))
+
+    res.json({
+      id: session.id,
+      title: session.title,
+      courseCode: session.courseCode,
+      examinationType: session.examinationType,
+      academicSession: session.academicSession,
+      semester: session.semester,
+      department: session.department,
+      faculty: session.faculty,
+      status: session.status,
+      createdAt: session.createdAt,
+      createdBy: session.createdBy,
+      guide: session.guide ? { id: session.guide.id, title: session.guide.title, published: !session.guide.isDraft, questionCount: questions.length } : null,
+      joinCode: canManage ? session.joinCode : null,
+      canManage,
+      counts: {
+        lecturers: lecturers.length,
+        // Students on the class list when one was uploaded, otherwise one
+        // per scanned script.
+        students: roster || scriptsScanned,
+        scriptsScanned,
+        answers: answers.length,
+        marked,
+        markedPercent: answers.length ? Math.round((marked / answers.length) * 100) : 0,
+        unclaimedQuestions: questions.filter((q) => !q.assignedMarkerId).length,
+      },
+      lecturers,
+      pending: canManage ? pending : [],
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load the session overview: ' + err.message })
+  }
+})
+
 router.get('/:id/coordinatorOverview', requireMembership, async (req, res) => {
   try {
     const session = await prisma.markingSession.findUnique({

@@ -500,3 +500,40 @@ test('the assistant compares only the sessions you can see', { skip }, async () 
   assert.deepEqual(tool.sessions.map((s) => s.id), [b.session.id])
   assert.ok('weakestQuestion' in tool.sessions[0])
 })
+
+test('an old session without a join code gets one when its coordinator opens it', { skip }, async () => {
+  await prisma.markingSession.update({ where: { id: c.session.id }, data: { joinCode: null } })
+  const chidi = await prisma.user.findFirst({ where: { email: 'chidi@unizik.edu.ng' } })
+  const r = await call('GET', `/sessions/${c.session.id}`, tokenFor(chidi))
+  assert.equal(r.status, 200)
+  assert.match(r.body.joinCode, /^[A-Z2-9]{6}$/)
+  const saved = await prisma.markingSession.findUnique({ where: { id: c.session.id } })
+  assert.equal(saved.joinCode, r.body.joinCode)
+  // Opening it again keeps the same code.
+  assert.equal((await call('GET', `/sessions/${c.session.id}`, tokenFor(chidi))).body.joinCode, saved.joinCode)
+})
+
+test('the session overview shows counts and lecturers, and the code only to the coordinator', { skip }, async () => {
+  const chidi = await prisma.user.findFirst({ where: { email: 'chidi@unizik.edu.ng' } })
+  const tc = tokenFor(chidi)
+  const owner = await call('GET', `/sessions/${c.session.id}/overview`, tc)
+  assert.equal(owner.status, 200)
+  assert.equal(owner.body.canManage, true)
+  assert.ok(owner.body.joinCode)
+  assert.equal(owner.body.counts.scriptsScanned, 1)
+  assert.equal(owner.body.counts.answers, 1)
+  assert.equal(owner.body.lecturers[0].isCoordinator, true)
+
+  // A lecturer who joins with the code sees the overview but not the code.
+  const tm = (await signup('Ngozi', 'LECTURER')).token
+  assert.equal((await call('POST', '/sessions/join', tm, { code: owner.body.joinCode })).status, 200)
+  const member = await call('GET', `/sessions/${c.session.id}/overview`, tm)
+  assert.equal(member.status, 200)
+  assert.equal(member.body.canManage, false)
+  assert.equal(member.body.joinCode, null)
+  assert.deepEqual(member.body.pending, [])
+  assert.equal(member.body.counts.lecturers, 2)
+
+  // Someone outside the session gets nothing.
+  assert.equal((await call('GET', `/sessions/${c.session.id}/overview`, users.bola)).status, 403)
+})
