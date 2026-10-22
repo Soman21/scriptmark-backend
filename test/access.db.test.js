@@ -36,6 +36,7 @@ before(async () => {
   app.use('/api/results', (await import('../src/routes/results.js')).default)
   app.use('/api/assistant', (await import('../src/routes/assistant.js')).default)
   app.use('/api/notifications', (await import('../src/routes/notifications.js')).default)
+  app.use('/api/courses', (await import('../src/routes/courses.js')).default)
   await new Promise((resolve) => {
     server = app.listen(0, resolve)
   })
@@ -581,4 +582,50 @@ test('the coordinator hears once when every script in the session is confirmed',
   await call('PUT', `/results/${done.id}/confirm`, tb, { confirmedScore: 3 })
   const n = await prisma.notification.count({ where: { userId: bola.id, type: 'SESSION_CONFIRMED', sessionId: b.session.id } })
   assert.equal(n, 1)
+})
+
+test('sessions with the same course code combine into one result sheet', { skip }, async () => {
+  const tt = (await signup('Tunde', 'LECTURER')).token
+  // One exam and one test of MTH 201, each with one 5 mark question.
+  async function assessment(title, examinationType, regNumber, score) {
+    const guide = (await call('POST', '/guides', tt, guideBody(`${title} guide`))).body
+    const session = (await call('POST', '/sessions', tt, { title, guideId: guide.id, courseCode: 'mth 201', examinationType })).body
+    const script = await prisma.script.create({ data: { sessionId: session.id, studentName: 'Ada Obi', regNumber, status: 'SCORED' } })
+    await prisma.scriptAnswer.create({
+      data: { scriptId: script.id, questionId: guide.questions[0].id, suggestedScore: score, confirmedScore: score, confirmedAt: new Date(), confidence: 'high' },
+    })
+    return session
+  }
+  const exam = await assessment('MTH201 Exam', 'Examination', '2017364085', 3)
+  const testSession = await assessment('MTH201 Test', 'Test', '2017/364085', 4)
+
+  const courses = (await call('GET', '/courses', tt)).body
+  assert.equal(courses.length, 1)
+  assert.equal(courses[0].courseCode, 'MTH201')
+  assert.deepEqual(courses[0].sessions.map((s) => s.weight), [70, 30])
+
+  const sheet = await call('GET', '/courses/results?code=MTH201', tt)
+  assert.equal(sheet.status, 200)
+  assert.equal(sheet.body.canEdit, true)
+  assert.equal(sheet.body.rows.length, 1)
+  const row = sheet.body.rows[0]
+  assert.equal(row.ca, 24) // 4 of 5, scaled to 30
+  assert.equal(row.exam, 42) // 3 of 5, scaled to 70
+  assert.equal(row.total, 66)
+  assert.equal(row.grade, 'B')
+
+  const weights = { [exam.id]: 60, [testSession.id]: 30 }
+  assert.equal((await call('PUT', '/courses/weights', tt, { code: 'MTH201', weights })).status, 400)
+  weights[testSession.id] = 40
+  const saved = await call('PUT', '/courses/weights', tt, { code: 'MTH201', weights })
+  assert.equal(saved.status, 200)
+  assert.equal(saved.body.rows[0].total, 68) // 36 + 32
+
+  // Chidi is not in any MTH201 session.
+  assert.equal((await call('GET', '/courses/results?code=MTH201', users.chidi)).status, 404)
+  assert.equal((await call('PUT', '/courses/weights', users.chidi, { code: 'MTH201', weights })).status, 404)
+
+  const xlsx = await fetch(`${base}/courses/export?code=MTH201`, { headers: { Authorization: `Bearer ${tt}` } })
+  assert.equal(xlsx.status, 200)
+  assert.match(xlsx.headers.get('content-type'), /spreadsheetml/)
 })
