@@ -7,6 +7,8 @@ import { examScoreOf } from './resultRows.js'
 // Examination (or no type) is the exam.
 
 export const normalizeCode = (code) => (code || '').toUpperCase().replace(/\s+/g, '')
+// How the course code is shown: as the lecturer typed it, tidied.
+export const displayCode = (code) => (code || '').trim().toUpperCase().replace(/\s+/g, ' ')
 
 export function courseKey(session) {
   const code = normalizeCode(session.courseCode)
@@ -24,7 +26,7 @@ export function groupCourses(sessions) {
     if (!groups.has(key)) {
       groups.set(key, {
         key,
-        courseCode: normalizeCode(s.courseCode),
+        courseCode: displayCode(s.courseCode),
         academicSession: s.academicSession || null,
         semester: s.semester || null,
         sessions: [],

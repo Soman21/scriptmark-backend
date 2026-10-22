@@ -601,7 +601,7 @@ test('sessions with the same course code combine into one result sheet', { skip 
 
   const courses = (await call('GET', '/courses', tt)).body
   assert.equal(courses.length, 1)
-  assert.equal(courses[0].courseCode, 'MTH201')
+  assert.equal(courses[0].courseCode, 'MTH 201')
   assert.deepEqual(courses[0].sessions.map((s) => s.weight), [70, 30])
 
   const sheet = await call('GET', '/courses/results?code=MTH201', tt)

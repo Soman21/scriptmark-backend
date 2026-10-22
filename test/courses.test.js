@@ -15,7 +15,7 @@ test('sessions group by course code, academic session and semester', () => {
   ])
   assert.equal(groups.length, 2)
   assert.deepEqual(groups[0].sessions.map((s) => s.id), ['a', 'b'])
-  assert.equal(groups[0].courseCode, 'ECE432')
+  assert.equal(groups[0].courseCode, 'ECE 432')
   assert.equal(courseKey({ courseCode: '' }), null)
 })
 
