@@ -43,6 +43,34 @@ model User {
   assignedQuestions Question[]         @relation("AssignedQuestions")
   changedAnswers    ScriptAnswer[]     @relation("ChangedAnswers")
   notifications     Notification[]
+  adminGrant        AdminGrant?
+}
+
+// An account the owner made an Admin from the Admin page. Kept apart from
+// User.role on purpose: a stored role of ADMIN is never trusted on its own
+// (see lib/roles.js), only this table and the Admin email list are.
+model AdminGrant {
+  userId      String   @id
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  grantedById String
+  createdAt   DateTime @default(now())
+}
+
+// What happened in the app, newest first, for the Admin page. Names are
+// copied in, not linked, so the history stays readable after an account or
+// session is deleted.
+// type: SIGNUP | SESSION_CREATED | GUIDE_CREATED | LECTURER_JOINED |
+//   SCRIPTS_UPLOADED | RESULTS_EXPORTED | ADMIN_ADDED | ADMIN_REMOVED
+model ActivityLog {
+  id        String   @id @default(cuid())
+  type      String
+  actorId   String?
+  actorName String?
+  sessionId String?
+  text      String
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
 }
 
 // One line in a user's notification bell. Events that happened (a join
