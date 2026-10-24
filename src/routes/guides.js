@@ -1,4 +1,5 @@
 import express from 'express'
+import { logActivity } from '../lib/activity.js'
 import { Prisma } from '@prisma/client'
 import multer from 'multer'
 import prisma from '../lib/prisma.js'
@@ -240,6 +241,7 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
       include: { questions: true },
     })
 
+    await logActivity({ type: 'GUIDE_CREATED', actor: req.user, text: `${req.user.name} created the guide ${guide.title}` })
     res.status(201).json(guide)
   } catch (err) {
     console.error(err)

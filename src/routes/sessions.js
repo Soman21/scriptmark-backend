@@ -3,6 +3,7 @@ import multer from 'multer'
 import ExcelJS from 'exceljs'
 import prisma from '../lib/prisma.js'
 import { notify, sessionManagerIds } from '../lib/notifications.js'
+import { logActivity } from '../lib/activity.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { extractTextFromImage } from '../lib/vision.js'
@@ -239,6 +240,7 @@ router.post('/join', requireRole('LECTURER', 'REVIEWER', 'ADMIN'), async (req, r
         (await sessionManagerIds(session)).filter((id) => id !== req.user.id),
         { type: 'JOINED', sessionId: session.id, actorId: req.user.id, text: `${joiner?.name || 'A lecturer'} joined ${session.courseCode || session.title}` }
       )
+      await logActivity({ type: 'LECTURER_JOINED', actor: req.user, sessionId: session.id, text: `${req.user.name} joined ${session.title} with the code` })
     }
 
     res.json({ id: session.id, title: session.title })
@@ -339,6 +341,7 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
       },
       include: { markers: { include: { user: { select: { id: true, name: true, email: true } } } } },
     })
+    await logActivity({ type: 'SESSION_CREATED', actor: req.user, sessionId: session.id, text: `${req.user.name} created ${session.title}` })
     res.status(201).json(session)
   } catch (err) {
     console.error(err)
@@ -560,6 +563,12 @@ async function approveMarkerCore(session, userId, approverName) {
     text: `Added to ${session.courseCode || session.title}${approverName ? ` by ${approverName}` : ''}`,
   })
   const requester = await prisma.user.findUnique({ where: { id: userId } })
+  await logActivity({
+    type: 'LECTURER_JOINED',
+    actor: requester,
+    sessionId: session.id,
+    text: `${requester?.name || 'A lecturer'} was added to ${session.title}${approverName ? ` by ${approverName}` : ''}`,
+  })
   if (requester) {
     sendEmail({
       to: requester.email,
@@ -992,6 +1001,7 @@ router.post('/:id/scripts/bulkConfirm', requireRole('LECTURER', 'ADMIN'), requir
       createdScripts.push(script)
     }
 
+    await logActivity({ type: 'SCRIPTS_UPLOADED', actor: req.user, sessionId: req.params.id, text: `${req.user.name} uploaded ${createdScripts.length} script${createdScripts.length === 1 ? '' : 's'} to ${req.markingSession.title}` })
     res.status(201).json({ scripts: createdScripts })
   } catch (err) {
     console.error(err)
@@ -1058,6 +1068,7 @@ router.post('/:id/scripts/batchUpload', requireRole('LECTURER', 'ADMIN'), requir
       createdScripts.push(updated)
     }
 
+    await logActivity({ type: 'SCRIPTS_UPLOADED', actor: req.user, sessionId: req.params.id, text: `${req.user.name} uploaded ${createdScripts.length} script${createdScripts.length === 1 ? '' : 's'} to ${req.markingSession.title}` })
     res.status(201).json({ scripts: createdScripts })
   } catch (err) {
     console.error(err)
@@ -1655,6 +1666,7 @@ router.get('/:id/export', requireMembership, async (req, res) => {
     const columns = RESULT_COLUMNS[scores]
     const rows = scripts.map((s) => resultRow(s, scores))
     const safeName = session.title.replace(/[^a-z0-9]/gi, '_')
+    await logActivity({ type: 'RESULTS_EXPORTED', actor: req.user, sessionId: session.id, text: `${req.user.name} exported results for ${session.title}` })
 
     if (format === 'pdf') {
       res.setHeader('Content-Type', 'application/pdf')

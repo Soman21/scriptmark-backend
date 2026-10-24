@@ -37,6 +37,7 @@ before(async () => {
   app.use('/api/assistant', (await import('../src/routes/assistant.js')).default)
   app.use('/api/notifications', (await import('../src/routes/notifications.js')).default)
   app.use('/api/courses', (await import('../src/routes/courses.js')).default)
+  app.use('/api/admin', (await import('../src/routes/admin.js')).default)
   await new Promise((resolve) => {
     server = app.listen(0, resolve)
   })
@@ -628,4 +629,46 @@ test('sessions with the same course code combine into one result sheet', { skip 
   const xlsx = await fetch(`${base}/courses/export?code=MTH201`, { headers: { Authorization: `Bearer ${tt}` } })
   assert.equal(xlsx.status, 200)
   assert.match(xlsx.headers.get('content-type'), /spreadsheetml/)
+})
+
+test('the admin page is Admin only, and only the owner can add or remove admins', { skip }, async () => {
+  const chidi = await prisma.user.findFirst({ where: { email: 'chidi@unizik.edu.ng' } })
+  const tc = tokenFor(chidi)
+  assert.equal((await call('GET', '/admin/overview', tc)).status, 403)
+  // A token that claims ADMIN is not enough.
+  assert.equal((await call('GET', '/admin/overview', tokenFor({ ...chidi, role: 'ADMIN' }))).status, 403)
+
+  // The owner signed up in an earlier test.
+  const owner = await prisma.user.findFirst({ where: { email: 'somancreatives@gmail.com' } })
+  const to = tokenFor(owner)
+  const overview = await call('GET', '/admin/overview', to)
+  assert.equal(overview.status, 200)
+  assert.ok(overview.body.totals.users >= 5)
+  assert.ok(overview.body.totals.sessions >= 2)
+  assert.equal(overview.body.status.database.ok, true)
+  assert.ok(overview.body.activity.some((a) => a.type === 'SIGNUP' && a.actorName === 'Soma'))
+  assert.ok(overview.body.activity.some((a) => a.type === 'SESSION_CREATED'))
+  assert.ok(overview.body.lecturers.some((l) => l.email === 'chidi@unizik.edu.ng' && l.sessionsCreated >= 1))
+
+  let admins = (await call('GET', '/admin/admins', to)).body
+  assert.equal(admins.canChange, true)
+  assert.deepEqual(admins.admins.map((a) => [a.email, a.source, a.removable]), [['somancreatives@gmail.com', 'OWNER', false]])
+
+  assert.equal((await call('POST', '/admin/admins', to, { email: 'nobody@unizik.edu.ng' })).status, 404)
+  assert.equal((await call('POST', '/admin/admins', to, { email: 'Chidi@UNIZIK.edu.ng' })).status, 201)
+  // Chidi's existing token works at once, and /auth/me says Admin.
+  assert.equal((await call('GET', '/admin/overview', tc)).status, 200)
+  assert.equal((await call('GET', '/auth/me', tc)).body.user.role, 'ADMIN')
+  // An Admin who is not the owner can look but not change admins.
+  const asChidi = (await call('GET', '/admin/admins', tc)).body
+  assert.equal(asChidi.canChange, false)
+  assert.equal((await call('POST', '/admin/admins', tc, { email: 'bola@unizik.edu.ng' })).status, 403)
+
+  assert.equal((await call('DELETE', `/admin/admins/${owner.id}`, to)).status, 404)
+  assert.equal((await call('DELETE', `/admin/admins/${chidi.id}`, to)).status, 200)
+  assert.equal((await call('GET', '/admin/overview', tc)).status, 403)
+  assert.equal((await call('GET', '/auth/me', tc)).body.user.role, 'LECTURER')
+
+  const types = (await call('GET', '/admin/overview', to)).body.activity.map((a) => a.type)
+  assert.ok(types.includes('ADMIN_ADDED') && types.includes('ADMIN_REMOVED'))
 })

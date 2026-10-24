@@ -5,6 +5,7 @@ import prisma from '../lib/prisma.js'
 import { sendEmail, sixDigitCode } from '../lib/email.js'
 import { requireAuth } from '../middleware/auth.js'
 import { effectiveRole } from '../lib/roles.js'
+import { logActivity } from '../lib/activity.js'
 
 const router = express.Router()
 
@@ -17,14 +18,14 @@ const findUserByEmail = (email) =>
 // Brings a stored role in line with the Admin email rule before a token is
 // issued, so the database and the token agree.
 async function withSyncedRole(user) {
-  const role = effectiveRole(user.email, user.role)
+  const role = effectiveRole(user.email, user.role, user.id)
   if (role === user.role) return user
   return prisma.user.update({ where: { id: user.id }, data: { role } })
 }
 
 function signToken(user) {
   return jwt.sign(
-    { id: user.id, email: user.email, name: user.name, role: effectiveRole(user.email, user.role) },
+    { id: user.id, email: user.email, name: user.name, role: effectiveRole(user.email, user.role, user.id) },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   )
@@ -57,6 +58,7 @@ router.post('/signup', async (req, res) => {
       },
     })
 
+    await logActivity({ type: 'SIGNUP', actor: user, text: `${user.name} signed up` })
     const token = signToken(user)
     res.status(201).json({
       token,
@@ -281,6 +283,12 @@ router.post('/resetPassword', async (req, res) => {
     console.error(err)
     res.status(500).json({ error: 'Something went wrong.' })
   }
+})
+
+// GET /api/auth/me - who the server says you are now. The app calls it on
+// open so a role change (made Admin, or removed) shows without signing out.
+router.get('/me', requireAuth, (req, res) => {
+  res.json({ user: { id: req.user.id, name: req.user.name, email: req.user.email, role: req.user.role } })
 })
 
 // PUT /api/auth/me - body: { name }. Updates the signed in user's display

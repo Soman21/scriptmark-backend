@@ -11,7 +11,7 @@ export function requireAuth(req, res, next) {
 
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET)
-    req.user = { ...payload, role: effectiveRole(payload.email, payload.role) }
+    req.user = { ...payload, role: effectiveRole(payload.email, payload.role, payload.id) }
     next()
   } catch (err) {
     return res.status(401).json({ error: 'Invalid or expired token. Please log in again.' })

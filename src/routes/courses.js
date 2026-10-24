@@ -3,6 +3,7 @@ import ExcelJS from 'exceljs'
 import prisma from '../lib/prisma.js'
 import { requireAuth } from '../middleware/auth.js'
 import { accessibleSessionsWhere, canManageSession } from '../lib/access.js'
+import { logActivity } from '../lib/activity.js'
 import { courseKey, groupCourses, courseWeights, checkWeights, buildCourseSheet } from '../lib/courses.js'
 
 const router = express.Router()
@@ -189,6 +190,7 @@ router.get('/export', async (req, res) => {
       col.width = i === 0 ? 28 : 16
     })
 
+    await logActivity({ type: 'RESULTS_EXPORTED', actor: req.user, text: `${req.user.name} exported the ${course.courseCode} result sheet` })
     const safeName = (course.courseCode || 'course').replace(/[^a-z0-9]/gi, '_')
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}_result_sheet.xlsx"`)
