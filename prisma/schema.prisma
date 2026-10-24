@@ -36,6 +36,17 @@ model User {
   role         Role     @default(LECTURER)
   createdAt    DateTime @default(now())
 
+  // Lecturer profile. lecturerId is given by ScriptMark (NAU0042), never
+  // typed. A suspended account keeps all its work but cannot sign in.
+  lecturerId    String?      @unique
+  institutionId String?
+  institution   Institution? @relation(fields: [institutionId], references: [id])
+  departmentId  String?
+  department    Department?  @relation(fields: [departmentId], references: [id])
+  suspendedAt   DateTime?
+  suspendReason String?
+  lastActiveAt  DateTime?
+
   markingGuides     MarkingGuide[]
   markingSessions   MarkingSession[]
   verificationCodes VerificationCode[]
@@ -314,4 +325,36 @@ model AnalyticsEvent {
   createdAt DateTime @default(now())
 
   @@index([createdAt])
+}
+
+// Institution > Faculty > Department. The list is kept in
+// src/lib/institutions.js and copied in at start up. nextNumber hands out
+// lecturer IDs one by one (NAU0001, NAU0002, ...).
+model Institution {
+  id         String    @id
+  name       String
+  code       String    @unique
+  nextNumber Int       @default(1)
+  faculties  Faculty[]
+  users      User[]
+}
+
+model Faculty {
+  id            String       @id @default(cuid())
+  name          String
+  institutionId String
+  institution   Institution  @relation(fields: [institutionId], references: [id])
+  departments   Department[]
+
+  @@unique([institutionId, name])
+}
+
+model Department {
+  id        String  @id @default(cuid())
+  name      String
+  facultyId String
+  faculty   Faculty @relation(fields: [facultyId], references: [id])
+  users     User[]
+
+  @@unique([facultyId, name])
 }

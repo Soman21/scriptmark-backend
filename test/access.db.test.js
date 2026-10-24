@@ -719,3 +719,121 @@ test('visits and clicks are recorded without personal data and summed for the Ad
   assert.deepEqual(stats.body.referrers, [{ referrer: 'google.com', visitors: 1 }])
   assert.equal(stats.body.hours.length, 24)
 })
+
+test('lecturer profile: faculties list, NAU IDs in order, department at sign up and in Settings', { skip }, async () => {
+  const { syncInstitutions } = await import('../src/lib/institutions.js')
+  await syncInstitutions(prisma)
+  await syncInstitutions(prisma) // running it twice adds nothing
+
+  const s = await call('GET', '/auth/structure')
+  assert.equal(s.status, 200)
+  assert.equal(s.body.institution.code, 'NAU')
+  const eng = s.body.faculties.find((f) => f.name === 'Engineering')
+  const ece = eng.departments.find((d) => d.name === 'Electronics Engineering')
+  const cpe = eng.departments.find((d) => d.name === 'Computer Engineering')
+  assert.ok(ece && cpe, 'Electronics and Computer Engineering are separate')
+  assert.equal(await prisma.department.count({ where: { name: 'Electronics Engineering' } }), 1)
+
+  const a = await call('POST', '/auth/signup', null, { name: 'Ifeoma', email: 'ifeoma@unizik.edu.ng', password: 'password123', departmentId: ece.id })
+  assert.equal(a.status, 201, JSON.stringify(a.body))
+  const b = await call('POST', '/auth/signup', null, { name: 'Obinna', email: 'obinna@unizik.edu.ng', password: 'password123' })
+  const na = Number(a.body.user.lecturerId.slice(3))
+  assert.match(a.body.user.lecturerId, /^NAU\d{4}$/)
+  assert.equal(b.body.user.lecturerId, `NAU${String(na + 1).padStart(4, '0')}`)
+  assert.equal(a.body.user.institution, 'Nnamdi Azikiwe University')
+  assert.deepEqual(a.body.user.faculty, { id: eng.id, name: 'Engineering' })
+  assert.equal(a.body.user.department.name, 'Electronics Engineering')
+  assert.equal(b.body.user.department, null)
+
+  const bad = await call('POST', '/auth/signup', null, { name: 'X', email: 'x@unizik.edu.ng', password: 'password123', departmentId: 'nope' })
+  assert.equal(bad.status, 400)
+
+  // Obinna is asked once, then picks Computer Engineering.
+  const t = b.body.token
+  assert.equal((await call('PUT', '/auth/me', t, { departmentId: 'nope' })).status, 400)
+  const put = await call('PUT', '/auth/me', t, { departmentId: cpe.id })
+  assert.equal(put.status, 200)
+  assert.equal(put.body.user.department.name, 'Computer Engineering')
+  const me = await call('GET', '/auth/me', t)
+  assert.equal(me.body.user.faculty.name, 'Engineering')
+  assert.equal(me.body.user.lecturerId, b.body.user.lecturerId)
+})
+
+test('admin: lecturer page, suspend signs out at once, rules on who can suspend, restore', { skip }, async () => {
+  const owner = await prisma.user.findFirst({ where: { email: 'somancreatives@gmail.com' } })
+  const ifeoma = await prisma.user.findFirst({ where: { email: 'ifeoma@unizik.edu.ng' } })
+  const obinna = await prisma.user.findFirst({ where: { email: 'obinna@unizik.edu.ng' } })
+  const ownerT = tokenFor(owner)
+  const ifeomaT = tokenFor(ifeoma)
+
+  const list = await call('GET', '/admin/overview', ownerT)
+  const row = list.body.lecturers.find((l) => l.id === ifeoma.id)
+  assert.equal(row.faculty, 'Engineering')
+  assert.equal(row.department, 'Electronics Engineering')
+  assert.match(row.lecturerId, /^NAU\d{4}$/)
+  assert.equal(row.suspended, false)
+
+  // Ifeoma's activity and work show on her page.
+  await call('POST', '/guides', ifeomaT, guideBody('EEE 501 guide'))
+  const page = await call('GET', `/admin/lecturers/${ifeoma.id}`, ownerT)
+  assert.equal(page.status, 200)
+  assert.equal(page.body.lecturer.department, 'Electronics Engineering')
+  assert.equal(page.body.stats.guides, 1)
+  assert.ok(page.body.activity.some((a) => a.text.includes('Ifeoma')))
+  assert.equal(page.body.canSuspend, true)
+  assert.equal((await call('GET', '/admin/lecturers/missing', ownerT)).status, 404)
+  assert.equal((await call('GET', `/admin/lecturers/${obinna.id}`, ifeomaT)).status, 403)
+
+  // A reason is required.
+  assert.equal((await call('POST', `/admin/lecturers/${ifeoma.id}/suspend`, ownerT, {})).status, 400)
+  const sus = await call('POST', `/admin/lecturers/${ifeoma.id}/suspend`, ownerT, { reason: 'Left the department' })
+  assert.equal(sus.status, 200)
+  // Her existing token stops working on the next request, and she cannot sign in.
+  const blocked = await call('GET', '/auth/me', ifeomaT)
+  assert.equal(blocked.status, 403)
+  assert.equal(blocked.body.code, 'SUSPENDED')
+  const login = await call('POST', '/auth/login', null, { email: 'ifeoma@unizik.edu.ng', password: 'password123' })
+  assert.equal(login.status, 403)
+  // Her work is kept.
+  assert.equal(await prisma.markingGuide.count({ where: { createdById: ifeoma.id } }), 1)
+  const after = await call('GET', `/admin/lecturers/${ifeoma.id}`, ownerT)
+  assert.equal(after.body.lecturer.suspendReason, 'Left the department')
+
+  // Never yourself, never the owner, and only the owner suspends an admin.
+  assert.equal((await call('POST', `/admin/lecturers/${owner.id}/suspend`, ownerT, { reason: 'x' })).status, 403)
+  await call('POST', '/admin/admins', ownerT, { email: 'obinna@unizik.edu.ng' })
+  const obinnaT = tokenFor({ ...obinna, role: 'ADMIN' })
+  assert.equal((await call('POST', `/admin/lecturers/${obinna.id}/suspend`, obinnaT, { reason: 'x' })).status, 403)
+  assert.equal((await call('POST', `/admin/lecturers/${owner.id}/suspend`, obinnaT, { reason: 'x' })).status, 403)
+  const other = (await signup('Uche')).user
+  await call('POST', '/admin/admins', ownerT, { email: 'uche@unizik.edu.ng' })
+  assert.equal((await call('POST', `/admin/lecturers/${other.id}/suspend`, obinnaT, { reason: 'x' })).status, 403)
+  await call('DELETE', `/admin/admins/${obinna.id}`, ownerT)
+  await call('DELETE', `/admin/admins/${other.id}`, ownerT)
+
+  const restore = await call('POST', `/admin/lecturers/${ifeoma.id}/restore`, ownerT)
+  assert.equal(restore.status, 200)
+  assert.equal((await call('GET', '/auth/me', ifeomaT)).status, 200)
+  assert.equal((await call('POST', `/admin/lecturers/${ifeoma.id}/restore`, ownerT)).status, 400)
+
+  const log = await prisma.activityLog.findMany({ where: { type: { in: ['LECTURER_SUSPENDED', 'LECTURER_RESTORED'] } } })
+  assert.equal(log.length, 2)
+})
+
+test('admin: a coordinator marker row on their own session counts as created, not joined', { skip }, async () => {
+  const owner = await prisma.user.findFirst({ where: { email: 'somancreatives@gmail.com' } })
+  const ifeoma = await prisma.user.findFirst({ where: { email: 'ifeoma@unizik.edu.ng' } })
+  const t = tokenFor(ifeoma)
+  const guide = (await call('POST', '/guides', t, guideBody('EEE 502 guide'))).body
+  const session = (await call('POST', '/sessions', t, { title: 'EEE 502', guideId: guide.id, courseCode: 'EEE502' })).body
+  await prisma.sessionMarker.upsert({
+    where: { sessionId_userId: { sessionId: session.id, userId: ifeoma.id } },
+    update: {},
+    create: { sessionId: session.id, userId: ifeoma.id, status: 'APPROVED' },
+  })
+  const page = await call('GET', `/admin/lecturers/${ifeoma.id}`, tokenFor(owner))
+  assert.ok(page.body.sessionsCreated.some((s) => s.id === session.id))
+  assert.ok(!page.body.sessionsJoined.some((s) => s.id === session.id))
+  const row = (await call('GET', '/admin/overview', tokenFor(owner))).body.lecturers.find((l) => l.id === ifeoma.id)
+  assert.equal(row.sessionsJoined, page.body.stats.sessionsJoined)
+})
