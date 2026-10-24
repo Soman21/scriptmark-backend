@@ -1,5 +1,6 @@
 import express from 'express'
 import prisma from '../lib/prisma.js'
+import { notifyIfSessionConfirmed } from '../lib/notifications.js'
 import { requireAuth } from '../middleware/auth.js'
 import { scoreScriptAgainstGuide } from '../lib/groq.js'
 import { accessibleGuidesWhere, canAccessScript, canAccessSession } from '../lib/access.js'
@@ -115,10 +116,11 @@ router.put('/:answerId/confirm', async (req, res) => {
     })
     const total = allAnswers.reduce((sum, a) => sum + (a.confirmedScore ?? a.suggestedScore ?? 0), 0)
 
-    await prisma.script.update({
+    const script = await prisma.script.update({
       where: { id: answer.scriptId },
       data: { totalScore: total, status: 'REVIEWED' },
     })
+    await notifyIfSessionConfirmed(script.sessionId)
 
     res.json(answer)
   } catch (err) {
