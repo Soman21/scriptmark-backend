@@ -16,7 +16,7 @@ import { computeSessionAnalytics } from '../lib/analytics.js'
 import { courseDetailsToFill } from '../lib/frontPage.js'
 import { loadEvaluationRows, buildEvaluationReport, evaluationCsv } from '../lib/evaluation.js'
 import { loadCohortReport, loadSessionComparison } from '../lib/cohort.js'
-import { accessibleSessionsWhere } from '../lib/access.js'
+import { accessibleSessionsWhere, canManageSession } from '../lib/access.js'
 import { pdfToPageImages } from '../lib/pdfSplit.js'
 import { greyPages, scoreAgainstCover, coverThreshold, groupsFromScores } from '../lib/coverDetect.js'
 import { sendEmail } from '../lib/email.js'
@@ -428,13 +428,8 @@ router.get('/:id/markers', requireMembership, async (req, res) => {
 
 // Whether userId can manage this session's membership: its Coordinator, an
 // Admin, or any of its own APPROVED Full-access markers.
-async function canManageMarkers(session, userId, userRole) {
-  if (userRole === 'ADMIN') return true
-  if (session.createdById === userId) return true
-  const marker = await prisma.sessionMarker.findUnique({
-    where: { sessionId_userId: { sessionId: session.id, userId } },
-  })
-  return !!marker && marker.status === 'APPROVED' && marker.accessLevel === 'FULL'
+function canManageMarkers(session, userId, userRole) {
+  return canManageSession(prisma, session, { id: userId, role: userRole })
 }
 
 // Gate for any /:id/... route that should only be reachable by people who

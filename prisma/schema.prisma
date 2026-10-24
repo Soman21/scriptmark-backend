@@ -157,6 +157,9 @@ model MarkingSession {
   examinationType  String?
   academicSession  String?
   semester         String?
+  // Share of the course total this assessment carries, e.g. 70 for the
+  // exam and 20 for a test. Null means use the default (see courses.js).
+  weight           Float?
   // Coordinator is NOT a separate role — whoever created the session (below)
   // administers it. autoAcceptHighConfidence controls whether high-confidence
   // AI scores skip human review entirely for this session, per that decision.

@@ -41,3 +41,14 @@ export async function accessibleGuidesWhere(prisma, user) {
 export function canEditGuide(user, guide) {
   return user.role === 'ADMIN' || guide.createdById === user.id
 }
+
+// Who may change a session's settings and lecturers: its creator, an Admin,
+// or an approved Full access marker.
+export async function canManageSession(prisma, session, user) {
+  if (user.role === 'ADMIN') return true
+  if (session.createdById === user.id) return true
+  const marker = await prisma.sessionMarker.findUnique({
+    where: { sessionId_userId: { sessionId: session.id, userId: user.id } },
+  })
+  return !!marker && marker.status === 'APPROVED' && marker.accessLevel === 'FULL'
+}

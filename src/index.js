@@ -8,6 +8,7 @@ import sessionRoutes from './routes/sessions.js'
 import resultRoutes from './routes/results.js'
 import assistantRoutes from './routes/assistant.js'
 import notificationRoutes from './routes/notifications.js'
+import courseRoutes from './routes/courses.js'
 
 const app = express()
 
@@ -26,6 +27,7 @@ app.use('/api/sessions', sessionRoutes)
 app.use('/api/results', resultRoutes)
 app.use('/api/assistant', assistantRoutes)
 app.use('/api/notifications', notificationRoutes)
+app.use('/api/courses', courseRoutes)
 
 app.use((err, req, res, next) => {
   console.error(err)
