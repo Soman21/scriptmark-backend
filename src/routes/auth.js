@@ -6,6 +6,8 @@ import { sendEmail, sixDigitCode } from '../lib/email.js'
 import { requireAuth } from '../middleware/auth.js'
 import { effectiveRole } from '../lib/roles.js'
 import { logActivity } from '../lib/activity.js'
+import { assignLecturerId, DEFAULT_INSTITUTION_ID } from '../lib/institutions.js'
+import { SUSPENDED_MESSAGE } from '../lib/suspension.js'
 
 const router = express.Router()
 
@@ -23,6 +25,33 @@ async function withSyncedRole(user) {
   return prisma.user.update({ where: { id: user.id }, data: { role } })
 }
 
+// What the app gets back about the signed in person. Faculty and department
+// come from the department row, so they can never disagree.
+const PROFILE = { department: { include: { faculty: true } }, institution: true }
+
+function publicUser(user) {
+  const dept = user.department
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: effectiveRole(user.email, user.role, user.id),
+    lecturerId: user.lecturerId || null,
+    institution: user.institution?.name || null,
+    faculty: dept ? { id: dept.faculty.id, name: dept.faculty.name } : null,
+    department: dept ? { id: dept.id, name: dept.name } : null,
+  }
+}
+
+const loadProfile = (id) => prisma.user.findUnique({ where: { id }, include: PROFILE })
+
+// A department id from the client must be a real department of the
+// lecturer's institution, or it is refused.
+async function findDepartment(id, institutionId = DEFAULT_INSTITUTION_ID) {
+  if (!id || typeof id !== 'string') return null
+  return prisma.department.findFirst({ where: { id, faculty: { institutionId } } })
+}
+
 function signToken(user) {
   return jwt.sign(
     { id: user.id, email: user.email, name: user.name, role: effectiveRole(user.email, user.role, user.id) },
@@ -30,6 +59,30 @@ function signToken(user) {
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   )
 }
+
+// GET /api/auth/structure - faculties and their departments, for the sign
+// up and profile forms. Open to anyone, because sign up comes before a token.
+router.get('/structure', async (req, res) => {
+  try {
+    const institution = await prisma.institution.findUnique({
+      where: { id: DEFAULT_INSTITUTION_ID },
+      include: {
+        faculties: {
+          orderBy: { name: 'asc' },
+          include: { departments: { orderBy: { name: 'asc' }, select: { id: true, name: true } } },
+        },
+      },
+    })
+    if (!institution) return res.json({ institution: null, faculties: [] })
+    res.json({
+      institution: { name: institution.name, code: institution.code },
+      faculties: institution.faculties.map((f) => ({ id: f.id, name: f.name, departments: f.departments })),
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load faculties.' })
+  }
+})
 
 router.post('/signup', async (req, res) => {
   try {
@@ -45,25 +98,37 @@ router.post('/signup', async (req, res) => {
       return res.status(409).json({ error: 'An account with that email already exists.' })
     }
 
+    let departmentId = null
+    if (req.body.departmentId) {
+      const dept = await findDepartment(req.body.departmentId)
+      if (!dept) return res.status(400).json({ error: 'Choose a department from the list.' })
+      departmentId = dept.id
+    }
+
     const passwordHash = await bcrypt.hash(password, 10)
 
-    const user = await prisma.user.create({
-      data: {
-        name: String(name).trim(),
-        email,
-        passwordHash,
-        // Everyone signs up as a Lecturer. Admin is never self chosen; it
-        // follows the Admin email list in lib/roles.js.
-        role: effectiveRole(email, 'LECTURER'),
-      },
+    // The account and its lecturer ID are made together: if either fails,
+    // neither is saved.
+    const created = await prisma.$transaction(async (tx) => {
+      const u = await tx.user.create({
+        data: {
+          name: String(name).trim(),
+          email,
+          passwordHash,
+          // Everyone signs up as a Lecturer. Admin is never self chosen; it
+          // follows the Admin email list in lib/roles.js.
+          role: effectiveRole(email, 'LECTURER'),
+          departmentId,
+        },
+      })
+      await assignLecturerId(tx, u.id)
+      return u
     })
+    const user = await loadProfile(created.id)
 
     await logActivity({ type: 'SIGNUP', actor: user, text: `${user.name} signed up` })
     const token = signToken(user)
-    res.status(201).json({
-      token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
-    })
+    res.status(201).json({ token, user: publicUser(user) })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Something went wrong creating your account.' })
@@ -86,6 +151,9 @@ router.post('/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.passwordHash)
     if (!valid) {
       return res.status(401).json({ error: 'Invalid email or password.' })
+    }
+    if (user.suspendedAt) {
+      return res.status(403).json({ error: SUSPENDED_MESSAGE, code: 'SUSPENDED' })
     }
 
     // Password checks out, but the real login token isn't issued yet. A one
@@ -186,13 +254,13 @@ router.post('/verifyOtp', async (req, res) => {
 
     otpFailures.delete(user.id)
     await prisma.verificationCode.update({ where: { id: matchedCode.id }, data: { used: true } })
+    if (user.suspendedAt) {
+      return res.status(403).json({ error: SUSPENDED_MESSAGE, code: 'SUSPENDED' })
+    }
 
     user = await withSyncedRole(user)
     const token = signToken(user)
-    res.json({
-      token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
-    })
+    res.json({ token, user: publicUser(await loadProfile(user.id)) })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Something went wrong verifying your code.' })
@@ -287,20 +355,40 @@ router.post('/resetPassword', async (req, res) => {
 
 // GET /api/auth/me - who the server says you are now. The app calls it on
 // open so a role change (made Admin, or removed) shows without signing out.
-router.get('/me', requireAuth, (req, res) => {
-  res.json({ user: { id: req.user.id, name: req.user.name, email: req.user.email, role: req.user.role } })
+// It also carries the lecturer profile (ID, faculty, department).
+router.get('/me', requireAuth, async (req, res) => {
+  try {
+    const user = await loadProfile(req.user.id)
+    if (!user) return res.status(401).json({ error: 'Invalid or expired token. Please log in again.' })
+    res.json({ user: publicUser(user) })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load your profile.' })
+  }
 })
 
-// PUT /api/auth/me - body: { name }. Updates the signed in user's display
-// name. The name travels inside the token, so a fresh token comes back too.
+// PUT /api/auth/me - body: { name?, departmentId? }. Updates the signed in
+// user's name and department. The name travels inside the token, so a fresh
+// token comes back too.
 router.put('/me', requireAuth, async (req, res) => {
   try {
-    const name = typeof req.body.name === 'string' ? req.body.name.trim() : ''
-    if (!name) return res.status(400).json({ error: 'Name cannot be empty.' })
-    if (name.length > 100) return res.status(400).json({ error: 'Name must be 100 characters or fewer.' })
+    const data = {}
+    if (req.body.name !== undefined) {
+      const name = typeof req.body.name === 'string' ? req.body.name.trim() : ''
+      if (!name) return res.status(400).json({ error: 'Name cannot be empty.' })
+      if (name.length > 100) return res.status(400).json({ error: 'Name must be 100 characters or fewer.' })
+      data.name = name
+    }
+    if (req.body.departmentId !== undefined) {
+      const dept = await findDepartment(req.body.departmentId)
+      if (!dept) return res.status(400).json({ error: 'Choose a department from the list.' })
+      data.departmentId = dept.id
+    }
+    if (!Object.keys(data).length) return res.status(400).json({ error: 'Nothing to update.' })
 
-    const user = await prisma.user.update({ where: { id: req.user.id }, data: { name } })
-    res.json({ token: signToken(user), user: { id: user.id, name: user.name, email: user.email, role: user.role } })
+    await prisma.user.update({ where: { id: req.user.id }, data })
+    const user = await loadProfile(req.user.id)
+    res.json({ token: signToken(user), user: publicUser(user) })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not update your profile.' })

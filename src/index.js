@@ -13,6 +13,8 @@ import adminRoutes from './routes/admin.js'
 import trackRoutes from './routes/track.js'
 import prisma from './lib/prisma.js'
 import { loadAdminGrants } from './lib/roles.js'
+import { loadSuspended } from './lib/suspension.js'
+import { syncInstitutions } from './lib/institutions.js'
 
 const app = express()
 
@@ -44,7 +46,13 @@ const PORT = process.env.PORT || 4000
 // Admins made on the Admin page are held in memory for fast checks; load
 // them now and refresh once a minute.
 loadAdminGrants(prisma)
-setInterval(() => loadAdminGrants(prisma), 60000).unref()
+loadSuspended(prisma)
+setInterval(() => {
+  loadAdminGrants(prisma)
+  loadSuspended(prisma)
+}, 60000).unref()
+// Faculties and departments come from src/lib/institutions.js.
+syncInstitutions(prisma)
 
 app.listen(PORT, () => {
   console.log(`ScriptMark API running on http://localhost:${PORT}`)

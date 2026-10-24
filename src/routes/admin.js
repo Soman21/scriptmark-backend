@@ -1,7 +1,8 @@
 import express from 'express'
 import prisma from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
-import { adminEmails, isOwner, OWNER_EMAIL, loadAdminGrants } from '../lib/roles.js'
+import { adminEmails, isOwner, OWNER_EMAIL, loadAdminGrants, effectiveRole } from '../lib/roles.js'
+import { setSuspended } from '../lib/suspension.js'
 import { logActivity } from '../lib/activity.js'
 import { dayRange } from '../lib/siteStats.js'
 
@@ -35,7 +36,12 @@ router.get('/overview', async (req, res) => {
           id: true,
           name: true,
           email: true,
+          role: true,
           createdAt: true,
+          lecturerId: true,
+          suspendedAt: true,
+          lastActiveAt: true,
+          department: { select: { name: true, faculty: { select: { name: true } } } },
           _count: { select: { markingSessions: true, markerOfSessions: { where: { status: 'APPROVED' } } } },
         },
       }),
@@ -73,6 +79,12 @@ router.get('/overview', async (req, res) => {
         name: u.name,
         email: u.email,
         createdAt: u.createdAt,
+        lecturerId: u.lecturerId,
+        faculty: u.department?.faculty.name || null,
+        department: u.department?.name || null,
+        admin: effectiveRole(u.email, u.role, u.id) === 'ADMIN',
+        suspended: !!u.suspendedAt,
+        lastActiveAt: u.lastActiveAt,
         sessionsCreated: u._count.markingSessions,
         sessionsJoined: u._count.markerOfSessions,
       })),
@@ -159,6 +171,129 @@ router.delete('/admins/:userId', requireOwner, async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not remove the admin.' })
+  }
+})
+
+// GET /api/admin/lecturers/:id - one lecturer: profile, sessions, how much
+// they have marked, and their own activity.
+router.get('/lecturers/:id', async (req, res) => {
+  try {
+    const u = await prisma.user.findUnique({
+      where: { id: req.params.id },
+      include: {
+        department: { include: { faculty: true } },
+        institution: true,
+        markingSessions: {
+          orderBy: { createdAt: 'desc' },
+          select: { id: true, title: true, courseCode: true, examinationType: true, status: true, createdAt: true },
+        },
+        markerOfSessions: {
+          where: { status: 'APPROVED' },
+          orderBy: { createdAt: 'desc' },
+          select: {
+            createdAt: true,
+            accessLevel: true,
+            session: { select: { id: true, title: true, courseCode: true, examinationType: true, status: true } },
+          },
+        },
+      },
+    })
+    if (!u) return res.status(404).json({ error: 'Lecturer not found.' })
+
+    const [answersMarked, questionsClaimed, guides, activity] = await Promise.all([
+      // Confirmed by a person (not auto accepted) on questions this lecturer claimed.
+      prisma.scriptAnswer.count({
+        where: { question: { assignedMarkerId: u.id }, confirmedAt: { not: null }, autoAccepted: false },
+      }),
+      prisma.question.count({ where: { assignedMarkerId: u.id } }),
+      prisma.markingGuide.count({ where: { createdById: u.id } }),
+      prisma.activityLog.findMany({ where: { actorId: u.id }, orderBy: { createdAt: 'desc' }, take: 30 }),
+    ])
+
+    const role = effectiveRole(u.email, u.role, u.id)
+    res.json({
+      lecturer: {
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        lecturerId: u.lecturerId,
+        institution: u.institution?.name || null,
+        faculty: u.department?.faculty.name || null,
+        department: u.department?.name || null,
+        admin: role === 'ADMIN',
+        owner: isOwner(u.email),
+        createdAt: u.createdAt,
+        lastActiveAt: u.lastActiveAt,
+        suspendedAt: u.suspendedAt,
+        suspendReason: u.suspendReason,
+      },
+      stats: {
+        sessionsCreated: u.markingSessions.length,
+        sessionsJoined: u.markerOfSessions.length,
+        guides,
+        questionsClaimed,
+        answersMarked,
+      },
+      sessionsCreated: u.markingSessions,
+      sessionsJoined: u.markerOfSessions.map((m) => ({ ...m.session, joinedAt: m.createdAt, accessLevel: m.accessLevel })),
+      activity,
+      canSuspend: canSuspend(req.user, u).ok,
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load the lecturer.' })
+  }
+})
+
+// Who may suspend whom: never yourself, never the owner, and only the owner
+// may suspend another Admin.
+function canSuspend(actor, target) {
+  if (actor.id === target.id) return { ok: false, error: 'You cannot suspend your own account.' }
+  if (isOwner(target.email)) return { ok: false, error: 'The owner account cannot be suspended.' }
+  if (effectiveRole(target.email, target.role, target.id) === 'ADMIN' && !isOwner(actor.email)) {
+    return { ok: false, error: 'Only the owner can suspend an admin.' }
+  }
+  return { ok: true }
+}
+
+// POST /api/admin/lecturers/:id/suspend  body: { reason }
+// The account keeps all its work but is signed out and cannot sign in.
+router.post('/lecturers/:id/suspend', async (req, res) => {
+  try {
+    const reason = String(req.body.reason || '').trim()
+    if (!reason) return res.status(400).json({ error: 'Give a reason for the suspension.' })
+    if (reason.length > 300) return res.status(400).json({ error: 'Keep the reason under 300 characters.' })
+    const target = await prisma.user.findUnique({ where: { id: req.params.id } })
+    if (!target) return res.status(404).json({ error: 'Lecturer not found.' })
+    const check = canSuspend(req.user, target)
+    if (!check.ok) return res.status(403).json({ error: check.error })
+
+    await prisma.user.update({ where: { id: target.id }, data: { suspendedAt: new Date(), suspendReason: reason } })
+    setSuspended(target.id, true)
+    await logActivity({ type: 'LECTURER_SUSPENDED', actor: req.user, text: `${req.user.name} suspended ${target.name}` })
+    res.json({ ok: true })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not suspend the lecturer.' })
+  }
+})
+
+// POST /api/admin/lecturers/:id/restore - lets a suspended account sign in again.
+router.post('/lecturers/:id/restore', async (req, res) => {
+  try {
+    const target = await prisma.user.findUnique({ where: { id: req.params.id } })
+    if (!target) return res.status(404).json({ error: 'Lecturer not found.' })
+    if (!target.suspendedAt) return res.status(400).json({ error: 'This account is not suspended.' })
+    const check = canSuspend(req.user, target)
+    if (!check.ok) return res.status(403).json({ error: check.error })
+
+    await prisma.user.update({ where: { id: target.id }, data: { suspendedAt: null, suspendReason: null } })
+    setSuspended(target.id, false)
+    await logActivity({ type: 'LECTURER_RESTORED', actor: req.user, text: `${req.user.name} restored ${target.name}` })
+    res.json({ ok: true })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not restore the lecturer.' })
   }
 })
 
