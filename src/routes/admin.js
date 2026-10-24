@@ -3,6 +3,7 @@ import prisma from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { adminEmails, isOwner, OWNER_EMAIL, loadAdminGrants } from '../lib/roles.js'
 import { logActivity } from '../lib/activity.js'
+import { dayRange } from '../lib/siteStats.js'
 
 const router = express.Router()
 // Every route here is Admin only. The role is worked out on the server for
@@ -158,6 +159,94 @@ router.delete('/admins/:userId', requireOwner, async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not remove the admin.' })
+  }
+})
+
+const n = (v) => Number(v || 0)
+// Postgres stores UTC; the dashboard speaks Lagos time.
+const LOCAL = `(("createdAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Lagos')`
+
+// GET /api/admin/analytics?days=7|30|90 - visitors, page views and clicks
+// recorded by the app's own tracker (POST /api/track).
+router.get('/analytics', async (req, res) => {
+  try {
+    const days = [7, 30, 90].includes(Number(req.query.days)) ? Number(req.query.days) : 30
+    const range = dayRange(days)
+    // Midnight Lagos time on the first day, as UTC.
+    const since = new Date(`${range[0]}T00:00:00+01:00`)
+
+    const [totals, daily, pages, clicks, devices, referrers, hours, signups] = await Promise.all([
+      prisma.$queryRawUnsafe(
+        `SELECT COUNT(DISTINCT "visitorId") AS visitors,
+                COUNT(*) FILTER (WHERE type = 'PAGE_VIEW') AS views,
+                COUNT(*) FILTER (WHERE type = 'CLICK') AS clicks,
+                COUNT(DISTINCT "userId") AS lecturers
+         FROM "AnalyticsEvent" WHERE "createdAt" >= $1`,
+        since
+      ),
+      prisma.$queryRawUnsafe(
+        `SELECT to_char(${LOCAL}, 'YYYY-MM-DD') AS day, COUNT(DISTINCT "visitorId") AS visitors,
+                COUNT(*) FILTER (WHERE type = 'PAGE_VIEW') AS views
+         FROM "AnalyticsEvent" WHERE "createdAt" >= $1 GROUP BY day`,
+        since
+      ),
+      prisma.$queryRawUnsafe(
+        `SELECT path, COUNT(*) AS views, COUNT(DISTINCT "visitorId") AS visitors
+         FROM "AnalyticsEvent" WHERE "createdAt" >= $1 AND type = 'PAGE_VIEW'
+         GROUP BY path ORDER BY views DESC LIMIT 10`,
+        since
+      ),
+      prisma.$queryRawUnsafe(
+        `SELECT label, path, COUNT(*) AS clicks
+         FROM "AnalyticsEvent" WHERE "createdAt" >= $1 AND type = 'CLICK'
+         GROUP BY label, path ORDER BY clicks DESC LIMIT 10`,
+        since
+      ),
+      prisma.$queryRawUnsafe(
+        `SELECT COALESCE(device, 'unknown') AS device, COUNT(DISTINCT "visitorId") AS visitors
+         FROM "AnalyticsEvent" WHERE "createdAt" >= $1 GROUP BY 1 ORDER BY visitors DESC`,
+        since
+      ),
+      prisma.$queryRawUnsafe(
+        `SELECT referrer, COUNT(DISTINCT "visitorId") AS visitors
+         FROM "AnalyticsEvent" WHERE "createdAt" >= $1 AND referrer IS NOT NULL
+         GROUP BY referrer ORDER BY visitors DESC LIMIT 8`,
+        since
+      ),
+      prisma.$queryRawUnsafe(
+        `SELECT EXTRACT(HOUR FROM ${LOCAL})::int AS hour, COUNT(*) AS views
+         FROM "AnalyticsEvent" WHERE "createdAt" >= $1 AND type = 'PAGE_VIEW' GROUP BY hour`,
+        since
+      ),
+      prisma.user.count({ where: { createdAt: { gte: since } } }),
+    ])
+
+    const t = totals[0] || {}
+    const byDay = new Map(daily.map((d) => [d.day, d]))
+    const byHour = new Map(hours.map((h) => [n(h.hour), n(h.views)]))
+    const visitors = n(t.visitors)
+    const views = n(t.views)
+    res.json({
+      days,
+      totals: {
+        visitors,
+        views,
+        clicks: n(t.clicks),
+        lecturers: n(t.lecturers),
+        signups,
+        viewsPerVisitor: visitors ? Math.round((views / visitors) * 10) / 10 : 0,
+        signupRate: visitors ? Math.round((signups / visitors) * 1000) / 10 : 0,
+      },
+      daily: range.map((day) => ({ day, visitors: n(byDay.get(day)?.visitors), views: n(byDay.get(day)?.views) })),
+      pages: pages.map((p) => ({ path: p.path, views: n(p.views), visitors: n(p.visitors) })),
+      clicks: clicks.map((c) => ({ label: c.label, path: c.path, clicks: n(c.clicks) })),
+      devices: devices.map((d) => ({ device: d.device, visitors: n(d.visitors) })),
+      referrers: referrers.map((r) => ({ referrer: r.referrer, visitors: n(r.visitors) })),
+      hours: Array.from({ length: 24 }, (_, hour) => ({ hour, views: byHour.get(hour) || 0 })),
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not load analytics.' })
   }
 })
 

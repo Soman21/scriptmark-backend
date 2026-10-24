@@ -38,6 +38,7 @@ before(async () => {
   app.use('/api/notifications', (await import('../src/routes/notifications.js')).default)
   app.use('/api/courses', (await import('../src/routes/courses.js')).default)
   app.use('/api/admin', (await import('../src/routes/admin.js')).default)
+  app.use('/api/track', (await import('../src/routes/track.js')).default)
   await new Promise((resolve) => {
     server = app.listen(0, resolve)
   })
@@ -671,4 +672,50 @@ test('the admin page is Admin only, and only the owner can add or remove admins'
 
   const types = (await call('GET', '/admin/overview', to)).body.activity.map((a) => a.type)
   assert.ok(types.includes('ADMIN_ADDED') && types.includes('ADMIN_REMOVED'))
+})
+
+test('visits and clicks are recorded without personal data and summed for the Admin', { skip }, async () => {
+  const before = await prisma.analyticsEvent.count()
+  const visitor = 'v-1234567890abcdef'
+  const anon = await call('POST', '/track', null, {
+    visitorId: visitor,
+    events: [
+      { type: 'PAGE_VIEW', path: '/', device: 'mobile', referrer: 'https://www.google.com/search?q=x' },
+      { type: 'PAGE_VIEW', path: '/signup', device: 'mobile' },
+      { type: 'CLICK', path: '/', label: 'Get started', device: 'mobile' },
+      { type: 'CLICK', path: '/sessions/cm2abcdefghijklmnop/results', label: 'Ada Obi, 2017364085' },
+      { type: 'PAGE_VIEW', path: '/admin' },
+      { type: 'HACK', path: '/' },
+    ],
+  })
+  assert.equal(anon.status, 204)
+  const chidi = await prisma.user.findFirst({ where: { email: 'chidi@unizik.edu.ng' } })
+  await call('POST', '/track', tokenFor(chidi), {
+    visitorId: 'v-chidi-0000000001',
+    events: [{ type: 'PAGE_VIEW', path: '/sessions/cm2abcdefghijklmnop/results', device: 'desktop' }],
+  })
+  // A bad visitor id records nothing.
+  await call('POST', '/track', null, { visitorId: 'x', events: [{ type: 'PAGE_VIEW', path: '/' }] })
+
+  const rows = await prisma.analyticsEvent.findMany({ orderBy: { createdAt: 'asc' }, skip: before })
+  assert.equal(rows.length, 4)
+  assert.ok(rows.every((r) => !/\d{6}/.test(r.label || '') && !r.path.startsWith('/admin')))
+  assert.equal(rows.find((r) => r.userId === chidi.id).path, '/sessions/:id/results')
+  assert.equal(rows[0].referrer, 'google.com')
+
+  assert.equal((await call('GET', '/admin/analytics', tokenFor(chidi))).status, 403)
+  const owner = await prisma.user.findFirst({ where: { email: 'somancreatives@gmail.com' } })
+  const stats = await call('GET', '/admin/analytics?days=7', tokenFor(owner))
+  assert.equal(stats.status, 200)
+  assert.equal(stats.body.totals.visitors, 2)
+  assert.equal(stats.body.totals.views, 3)
+  assert.equal(stats.body.totals.clicks, 1)
+  assert.equal(stats.body.totals.lecturers, 1)
+  assert.equal(stats.body.daily.length, 7)
+  assert.equal(stats.body.daily.at(-1).visitors, 2)
+  assert.deepEqual(stats.body.clicks, [{ label: 'Get started', path: '/', clicks: 1 }])
+  assert.equal(stats.body.pages[0].views, 1)
+  assert.deepEqual(stats.body.devices.map((d) => d.device).sort(), ['desktop', 'mobile'])
+  assert.deepEqual(stats.body.referrers, [{ referrer: 'google.com', visitors: 1 }])
+  assert.equal(stats.body.hours.length, 24)
 })
