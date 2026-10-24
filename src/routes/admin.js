@@ -42,7 +42,10 @@ router.get('/overview', async (req, res) => {
           suspendedAt: true,
           lastActiveAt: true,
           department: { select: { name: true, faculty: { select: { name: true } } } },
-          _count: { select: { markingSessions: true, markerOfSessions: { where: { status: 'APPROVED' } } } },
+          _count: { select: { markingSessions: true } },
+          // A coordinator can also have a marker row on their own session;
+          // those are counted as created, not joined.
+          markerOfSessions: { where: { status: 'APPROVED' }, select: { session: { select: { createdById: true } } } },
         },
       }),
       prisma.markingSession.findMany({
@@ -86,7 +89,7 @@ router.get('/overview', async (req, res) => {
         suspended: !!u.suspendedAt,
         lastActiveAt: u.lastActiveAt,
         sessionsCreated: u._count.markingSessions,
-        sessionsJoined: u._count.markerOfSessions,
+        sessionsJoined: u.markerOfSessions.filter((m) => m.session.createdById !== u.id).length,
       })),
       sessions: sessionList.map((s) => ({
         id: s.id,
@@ -193,7 +196,7 @@ router.get('/lecturers/:id', async (req, res) => {
           select: {
             createdAt: true,
             accessLevel: true,
-            session: { select: { id: true, title: true, courseCode: true, examinationType: true, status: true } },
+            session: { select: { id: true, title: true, courseCode: true, examinationType: true, status: true, createdById: true } },
           },
         },
       },
@@ -210,6 +213,7 @@ router.get('/lecturers/:id', async (req, res) => {
       prisma.activityLog.findMany({ where: { actorId: u.id }, orderBy: { createdAt: 'desc' }, take: 30 }),
     ])
 
+    const joined = u.markerOfSessions.filter((m) => m.session.createdById !== u.id)
     const role = effectiveRole(u.email, u.role, u.id)
     res.json({
       lecturer: {
@@ -229,13 +233,13 @@ router.get('/lecturers/:id', async (req, res) => {
       },
       stats: {
         sessionsCreated: u.markingSessions.length,
-        sessionsJoined: u.markerOfSessions.length,
+        sessionsJoined: joined.length,
         guides,
         questionsClaimed,
         answersMarked,
       },
       sessionsCreated: u.markingSessions,
-      sessionsJoined: u.markerOfSessions.map((m) => ({ ...m.session, joinedAt: m.createdAt, accessLevel: m.accessLevel })),
+      sessionsJoined: joined.map(({ session: { createdById, ...s }, createdAt, accessLevel }) => ({ ...s, joinedAt: createdAt, accessLevel })),
       activity,
       canSuspend: canSuspend(req.user, u).ok,
     })

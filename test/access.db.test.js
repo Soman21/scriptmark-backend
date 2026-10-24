@@ -819,3 +819,21 @@ test('admin: lecturer page, suspend signs out at once, rules on who can suspend,
   const log = await prisma.activityLog.findMany({ where: { type: { in: ['LECTURER_SUSPENDED', 'LECTURER_RESTORED'] } } })
   assert.equal(log.length, 2)
 })
+
+test('admin: a coordinator marker row on their own session counts as created, not joined', { skip }, async () => {
+  const owner = await prisma.user.findFirst({ where: { email: 'somancreatives@gmail.com' } })
+  const ifeoma = await prisma.user.findFirst({ where: { email: 'ifeoma@unizik.edu.ng' } })
+  const t = tokenFor(ifeoma)
+  const guide = (await call('POST', '/guides', t, guideBody('EEE 502 guide'))).body
+  const session = (await call('POST', '/sessions', t, { title: 'EEE 502', guideId: guide.id, courseCode: 'EEE502' })).body
+  await prisma.sessionMarker.upsert({
+    where: { sessionId_userId: { sessionId: session.id, userId: ifeoma.id } },
+    update: {},
+    create: { sessionId: session.id, userId: ifeoma.id, status: 'APPROVED' },
+  })
+  const page = await call('GET', `/admin/lecturers/${ifeoma.id}`, tokenFor(owner))
+  assert.ok(page.body.sessionsCreated.some((s) => s.id === session.id))
+  assert.ok(!page.body.sessionsJoined.some((s) => s.id === session.id))
+  const row = (await call('GET', '/admin/overview', tokenFor(owner))).body.lecturers.find((l) => l.id === ifeoma.id)
+  assert.equal(row.sessionsJoined, page.body.stats.sessionsJoined)
+})
