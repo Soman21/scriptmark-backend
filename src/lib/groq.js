@@ -101,6 +101,12 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
     if (!res.ok) {
       const errText = await res.text()
       lastError = new Error(`Groq API error (${res.status}): ${errText}`)
+      // Out of the day's allowance: retrying within seconds cannot help, so
+      // say so straight away and let the marking run pause.
+      if (res.status === 429 && /per day/i.test(errText)) {
+        lastError.code = AI_DAILY_LIMIT
+        throw lastError
+      }
       // Bad key, bad request etc. will not fix themselves, so fail straight away.
       if (!RETRYABLE_STATUSES.has(res.status)) throw lastError
       if (!isLast) await sleep(retryDelayMs(res, attempt))
@@ -134,6 +140,12 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
 }
 
 const SCORE_MAX_ATTEMPTS = 3
+
+// Error code for "the AI's daily allowance is used up". Groq says which
+// limit was hit in the error text, for example "tokens per day (TPD)" or
+// "requests per day (RPD)"; per minute limits clear by themselves and are
+// retried as before.
+export const AI_DAILY_LIMIT = 'AI_DAILY_LIMIT'
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504])
 
 // Honours Groq's Retry-After header on a 429 when present, otherwise backs

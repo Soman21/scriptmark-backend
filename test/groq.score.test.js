@@ -2,7 +2,7 @@
 // fetch so no real Groq requests are made. Run with: npm test
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { scoreScriptAgainstGuide, validateScoreResults } from '../src/lib/groq.js'
+import { scoreScriptAgainstGuide, validateScoreResults, AI_DAILY_LIMIT } from '../src/lib/groq.js'
 
 const questions = [
   { id: 'q1', number: '1', subLabel: null, text: 'Define OCR', modelAnswer: 'Optical character recognition', keywords: 'OCR', maxMarks: 10 },
@@ -51,7 +51,7 @@ function reply(item) {
       ok: false,
       status: item.status,
       headers: new Headers(item.headers || {}),
-      text: async () => 'fake error body',
+      text: async () => item.body || 'fake error body',
     }
   }
   const content = typeof item === 'string' ? item : JSON.stringify({ results: item })
@@ -99,6 +99,21 @@ test('retries on 503 with backoff, then succeeds', async () => {
   const results = await scoreScriptAgainstGuide('text', questions, noSleep)
   assert.equal(calls, 3)
   assert.deepEqual(sleeps, [1000, 2000])
+  assert.equal(results.length, 2)
+})
+
+test('stops at once when the daily allowance is used up, with a code the queue can pause on', async () => {
+  const body = 'Rate limit reached for model `openai/gpt-oss-120b` on tokens per day (TPD): Limit 200000, Used 199655'
+  queue.push({ status: 429, headers: { 'retry-after': '71' }, body }, good)
+  await assert.rejects(scoreScriptAgainstGuide('text', questions, noSleep), (err) => err.code === AI_DAILY_LIMIT)
+  assert.equal(calls, 1)
+  assert.deepEqual(sleeps, [])
+})
+
+test('a per minute 429 is still retried', async () => {
+  queue.push({ status: 429, headers: { 'retry-after': '3' }, body: 'Rate limit reached on tokens per minute (TPM)' }, good)
+  const results = await scoreScriptAgainstGuide('text', questions, noSleep)
+  assert.equal(calls, 2)
   assert.equal(results.length, 2)
 })
 
