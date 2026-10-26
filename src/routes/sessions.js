@@ -11,14 +11,15 @@ import { extractTextFromDocument } from '../lib/docParse.js'
 import { withDuplicateFlags, findDuplicates } from '../lib/duplicates.js'
 import { resultRow, RESULT_COLUMNS } from '../lib/resultRows.js'
 import { writeResultsPdf } from '../lib/pdfExport.js'
-import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, parseClassList } from '../lib/groq.js'
+import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, parseClassList, AI_DAILY_LIMIT } from '../lib/groq.js'
+import { mapLimit } from '../lib/mapLimit.js'
 import { matchRegNumber, mergeClassListEntries, normalizeRegNumber, findUnresolvedScripts } from '../lib/roster.js'
 import { computeSessionAnalytics } from '../lib/analytics.js'
 import { courseDetailsToFill } from '../lib/frontPage.js'
 import { loadEvaluationRows, buildEvaluationReport, evaluationCsv } from '../lib/evaluation.js'
 import { loadCohortReport, loadSessionComparison } from '../lib/cohort.js'
 import { accessibleSessionsWhere, canManageSession } from '../lib/access.js'
-import { pdfToPageImages } from '../lib/pdfSplit.js'
+import { pageImages, PAGE_MIME_TYPE } from '../lib/pdfSplit.js'
 import { greyPages, scoreAgainstCover, coverThreshold, groupsFromScores } from '../lib/coverDetect.js'
 import { sendEmail } from '../lib/email.js'
 import jwt from 'jsonwebtoken'
@@ -923,17 +924,18 @@ router.post('/:id/scripts/bulkSplit', requireRole('LECTURER', 'ADMIN'), requireM
     // A whole number of at least 1; anything else once looped forever.
     const pagesPerSubmission = Math.max(1, Math.floor(Number(req.body.pagesPerSubmission)) || 1)
 
-    const pageBuffers = pdfToPageImages(req.file.buffer)
-    if (pageBuffers.length === 0) {
-      return res.status(400).json({ error: 'Could not read any pages from that PDF.' })
-    }
-
     // Upload every page image up front, so the lecturer sees real thumbnails
-    // while reviewing, and nothing needs re-uploading at confirm time.
+    // while reviewing, and nothing needs re-uploading at confirm time. Each
+    // page is rendered, uploaded and let go before the next one is rendered,
+    // so only one page image is ever held in memory.
     const pages = []
-    for (let i = 0; i < pageBuffers.length; i++) {
-      const imageUrl = await uploadScriptImage(pageBuffers[i], `bulk_page_${i + 1}.png`, 'image/png')
-      pages.push({ pageNumber: i + 1, imageUrl })
+    for (const image of pageImages(req.file.buffer)) {
+      const pageNumber = pages.length + 1
+      const imageUrl = await uploadScriptImage(image, `bulk_page_${pageNumber}.jpg`, PAGE_MIME_TYPE)
+      pages.push({ pageNumber, imageUrl })
+    }
+    if (pages.length === 0) {
+      return res.status(400).json({ error: 'Could not read any pages from that PDF.' })
     }
 
     if (auto) {
@@ -977,6 +979,12 @@ router.post('/:id/scripts/bulkConfirm', requireRole('LECTURER', 'ADMIN'), requir
 
     for (const group of groups) {
       const identifier = [group.studentName, group.regNumber].filter(Boolean).join(', ') || null
+      // The script and all its pages are written in one go. A marking run
+      // already going looks for new scripts as it works, and must never
+      // find a script whose pages are still being added.
+      // Page order at this point reflects whatever the lecturer dragged/
+      // dropped into place — re-number 1..N based on current array order,
+      // not the page's original position in the source PDF.
       const script = await prisma.script.create({
         data: {
           sessionId: req.params.id,
@@ -985,18 +993,9 @@ router.post('/:id/scripts/bulkConfirm', requireRole('LECTURER', 'ADMIN'), requir
           studentIdentifier: identifier,
           imageUrl: group.pages[0]?.imageUrl || null,
           status: 'PENDING',
+          pages: { create: group.pages.map((p, i) => ({ pageNumber: i + 1, imageUrl: p.imageUrl })) },
         },
       })
-
-      // Page order at this point reflects whatever the lecturer dragged/
-      // dropped into place — re-number 1..N based on current array order,
-      // not the page's original position in the source PDF.
-      for (let i = 0; i < group.pages.length; i++) {
-        const p = group.pages[i]
-        await prisma.scriptPage.create({
-          data: { scriptId: script.id, pageNumber: i + 1, imageUrl: p.imageUrl },
-        })
-      }
 
       createdScripts.push(script)
     }
@@ -1047,25 +1046,28 @@ router.post('/:id/scripts/batchUpload', requireRole('LECTURER', 'ADMIN'), requir
     for (const file of req.files) {
       const isPdf = file.mimetype === 'application/pdf'
       if (!isPdf && !file.mimetype.startsWith('image/')) continue // a Word file or similar is not a script
-      const pageBuffers = isPdf ? pdfToPageImages(file.buffer) : [file.buffer]
+      const images = isPdf ? pageImages(file.buffer) : [file.buffer]
+      const mime = isPdf ? PAGE_MIME_TYPE : file.mimetype
+      const ext = isPdf ? 'jpg' : mime.split('/')[1] || 'png'
 
-      if (pageBuffers.length === 0) continue
+      // Upload the pages first, then write the script and all its pages in
+      // one go, so a marking run never finds it half made. A PDF with no
+      // readable pages leaves nothing behind.
+      const urls = []
+      for (const image of images) {
+        urls.push(await uploadScriptImage(image, `${file.originalname}_page_${urls.length + 1}.${ext}`, mime))
+      }
+      if (urls.length === 0) continue
 
       const script = await prisma.script.create({
-        data: { sessionId: req.params.id, status: 'PENDING' },
+        data: {
+          sessionId: req.params.id,
+          status: 'PENDING',
+          imageUrl: urls[0],
+          pages: { create: urls.map((imageUrl, i) => ({ pageNumber: i + 1, imageUrl })) },
+        },
       })
-
-      let firstPageUrl = null
-      for (let i = 0; i < pageBuffers.length; i++) {
-        const mime = isPdf ? 'image/png' : file.mimetype
-        const ext = isPdf ? 'png' : mime.split('/')[1] || 'png'
-        const imageUrl = await uploadScriptImage(pageBuffers[i], `${file.originalname}_page_${i + 1}.${ext}`, mime)
-        if (i === 0) firstPageUrl = imageUrl
-        await prisma.scriptPage.create({ data: { scriptId: script.id, pageNumber: i + 1, imageUrl } })
-      }
-
-      const updated = await prisma.script.update({ where: { id: script.id }, data: { imageUrl: firstPageUrl } })
-      createdScripts.push(updated)
+      createdScripts.push(script)
     }
 
     await logActivity({ type: 'SCRIPTS_UPLOADED', actor: req.user, sessionId: req.params.id, text: `${req.user.name} uploaded ${createdScripts.length} script${createdScripts.length === 1 ? '' : 's'} to ${req.markingSession.title}` })
@@ -1098,17 +1100,25 @@ router.post('/:id/mark', requireRole('LECTURER', 'ADMIN'), requireMembership, as
       return res.status(400).json({ error: 'The marking guide for this session has no questions.' })
     }
 
-    const scripts = await prisma.script.findMany({
-      where: { sessionId: session.id, status: { in: ['PENDING', 'DIGITIZED'] } },
-      include: { pages: { orderBy: { pageNumber: 'asc' } } },
-    })
+    const queued = await prisma.script.count({ where: { sessionId: session.id, ...MARKABLE } })
+    const run = markingRuns.get(session.id)
+    const alreadyRunning = Boolean(run)
+    // Tell a run already going to look again before it stops, in case it
+    // has just checked and found nothing left.
+    if (run) run.lookAgain = true
+    res.json({ started: true, queued, alreadyRunning })
 
-    res.json({ started: true, queued: scripts.length })
+    // Only one run per session. Every confirmed upload calls this route, and
+    // each call used to start its own run over the same unmarked scripts, so
+    // pages were read and scored several times over. A run already going
+    // looks for new scripts each time it reaches the end of its list, so
+    // scripts uploaded meanwhile are picked up by it.
+    if (alreadyRunning) return
 
     // Fire-and-forget: do not await this. It keeps running in the Node
-    // process on Railway after the response has already gone back, so it
-    // survives the lecturer navigating away or closing the tab.
-    runMarkingQueue(scripts, guide, session).catch((err) => console.error('Marking queue failed:', err))
+    // process after the response has already gone back, so it survives the
+    // lecturer navigating away or closing the tab.
+    runMarkingQueue(guide, session).catch((err) => console.error('Marking queue failed:', err))
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not start marking: ' + err.message })
@@ -1209,140 +1219,199 @@ async function fillBlankCourseDetails(session, detected) {
   }
 }
 
-async function runMarkingQueue(scripts, guide, session) {
-  for (const script of scripts) {
-    try {
-      let ocrText = script.ocrText
+// Scripts a marking run should take: not marked yet, or flagged by an
+// earlier run that failed before any answer was saved. A script a lecturer
+// flagged by hand has answers, so it is left alone.
+const MARKABLE = {
+  OR: [{ status: { in: ['PENDING', 'DIGITIZED'] } }, { status: 'FLAGGED', answers: { none: {} } }],
+}
 
-      if (!ocrText) {
-        const pageTexts = []
-        let confidenceSum = 0
-        for (const page of script.pages) {
-          const result = await extractTextFromImage(page.imageUrl)
-          await prisma.scriptPage.update({
-            where: { id: page.id },
-            data: { ocrText: result.text, ocrConfidence: result.confidence },
-          })
-          pageTexts.push(result.text || '')
-          confidenceSum += result.confidence
-        }
-        ocrText = pageTexts.join('\n\n--- page break ---\n\n')
-        const avgConfidence = script.pages.length ? confidenceSum / script.pages.length : 0
+// Sessions with a marking run going in this server process, and sessions
+// whose last run stopped because the AI's daily allowance ran out. Held in
+// memory: Render runs one server process, and after a restart nothing is
+// running, so pressing Mark again simply starts a fresh run.
+const markingRuns = new Map() // sessionId -> { lookAgain }
+const markingPaused = new Map() // sessionId -> { reason, at }
 
-        // Student info detection was deferred from splitting to right here —
-        // only fill in whatever the lecturer didn't already type in manually.
-        let studentName = script.studentName
-        let regNumber = script.regNumber
-        if ((!studentName || !regNumber) && pageTexts[0]) {
-          const detected = await extractStudentInfo(pageTexts[0], session.classList)
-          await fillBlankCourseDetails(session, detected)
-          studentName = studentName || detected.name
-          regNumber = regNumber || detected.regNumber
-        }
+// Google Vision pages read at the same time for one script. Reading them
+// one by one was the slowest part of marking (about 1 s a page).
+const OCR_PAGES_AT_ONCE = 4
 
-        // If the session has a roster (attendance sheet and/or official
-        // class list, merged), a matching reg number overrides both the
-        // manually typed and AI-detected name/reg number with the roster's
-        // canonical values — reg number is the one field OCR/manual entry
-        // gets reliably enough to match on, name is not. Still matches even
-        // if the roster entry is itself currently flagged, so the script
-        // stays associated with it and picks up the corrected name
-        // automatically once the lecturer resolves the flag.
-        let classListEntryId = null
-        if (regNumber && Array.isArray(session.classList) && session.classList.length > 0) {
-          const match = matchRegNumber(regNumber, session.classList)
-          if (match) {
-            studentName = match.entry.name
-            regNumber = match.entry.regNumber
-            classListEntryId = match.entry.id
-          }
-        }
+async function runMarkingQueue(guide, session) {
+  const run = { lookAgain: false }
+  markingRuns.set(session.id, run)
+  markingPaused.delete(session.id)
+  const tried = new Set()
+  try {
+    // Keeps going until no markable script is left, so scripts uploaded
+    // while this run was busy are marked too. Each script is tried once per
+    // run, so one that keeps failing cannot loop forever.
+    for (;;) {
+      const scripts = await prisma.script.findMany({
+        where: { sessionId: session.id, id: { notIn: [...tried] }, ...MARKABLE },
+        include: { pages: { orderBy: { pageNumber: 'asc' } } },
+        orderBy: { uploadedAt: 'asc' },
+      })
+      if (scripts.length === 0) {
+        if (!run.lookAgain) return
+        run.lookAgain = false
+        continue
+      }
+      for (const script of scripts) {
+        tried.add(script.id)
+        const outcome = await markScript(script, guide, session)
+        if (outcome === 'paused') return
+      }
+    }
+  } finally {
+    markingRuns.delete(session.id)
+  }
+}
 
-        await prisma.script.update({
-          where: { id: script.id },
-          data: {
-            ocrText,
-            ocrConfidence: avgConfidence,
-            status: 'DIGITIZED',
-            studentName,
-            regNumber,
-            classListEntryId,
-            studentIdentifier: [studentName, regNumber].filter(Boolean).join(', ') || script.studentIdentifier,
-          },
+// OCRs (if needed) and scores one script. Returns 'paused' when the AI's
+// daily allowance has run out, so the run stops instead of failing every
+// remaining script the same way.
+async function markScript(script, guide, session) {
+  try {
+    let ocrText = script.ocrText
+
+    if (!ocrText) {
+      const results = await mapLimit(script.pages, OCR_PAGES_AT_ONCE, async (page) => {
+        const result = await extractTextFromImage(page.imageUrl)
+        await prisma.scriptPage.update({
+          where: { id: page.id },
+          data: { ocrText: result.text, ocrConfidence: result.confidence },
         })
+        return result
+      })
+      const pageTexts = results.map((r) => r.text || '')
+      const confidenceSum = results.reduce((sum, r) => sum + r.confidence, 0)
+      ocrText = pageTexts.join('\n\n--- page break ---\n\n')
+      const avgConfidence = script.pages.length ? confidenceSum / script.pages.length : 0
+
+      // Student info detection was deferred from splitting to right here —
+      // only fill in whatever the lecturer didn't already type in manually.
+      let studentName = script.studentName
+      let regNumber = script.regNumber
+      if ((!studentName || !regNumber) && pageTexts[0]) {
+        const detected = await extractStudentInfo(pageTexts[0], session.classList)
+        await fillBlankCourseDetails(session, detected)
+        studentName = studentName || detected.name
+        regNumber = regNumber || detected.regNumber
       }
 
-      const results = await scoreScriptAgainstGuide(ocrText, guide.questions)
-
-      // For calculation heavy questions, standard OCR is unreliable on
-      // mathematical notation, so re transcribe that question's answer
-      // directly from the page image(s) with the vision model and re score
-      // just that question against the corrected transcript. Runs after the
-      // normal batch score above so a vision failure just leaves the
-      // original OCR based result in place rather than losing the question.
-      const pageImageUrls = script.pages.map((p) => p.imageUrl).filter(Boolean)
-      const calcHeavyQuestions = guide.questions.filter((q) => q.isCalculationHeavy)
-      for (const q of calcHeavyQuestions) {
-        try {
-          const visionTranscript = await transcribeCalculationFromImage(pageImageUrls, {
-            text: q.text,
-            maxMarks: q.maxMarks,
-          })
-          if (!visionTranscript) continue
-
-          const [rescored] = await scoreScriptAgainstGuide(visionTranscript, [q])
-          if (!rescored) continue
-
-          const idx = results.findIndex((r) => r.questionId === q.id)
-          const withTranscript = { ...rescored, visionTranscript }
-          if (idx >= 0) {
-            results[idx] = withTranscript
-          } else {
-            results.push(withTranscript)
-          }
-        } catch (err) {
-          console.error(`Calculation heavy re transcription failed for question ${q.id}:`, err)
+      // If the session has a roster (attendance sheet and/or official
+      // class list, merged), a matching reg number overrides both the
+      // manually typed and AI-detected name/reg number with the roster's
+      // canonical values — reg number is the one field OCR/manual entry
+      // gets reliably enough to match on, name is not. Still matches even
+      // if the roster entry is itself currently flagged, so the script
+      // stays associated with it and picks up the corrected name
+      // automatically once the lecturer resolves the flag.
+      let classListEntryId = null
+      if (regNumber && Array.isArray(session.classList) && session.classList.length > 0) {
+        const match = matchRegNumber(regNumber, session.classList)
+        if (match) {
+          studentName = match.entry.name
+          regNumber = match.entry.regNumber
+          classListEntryId = match.entry.id
         }
-      }
-
-      let totalSuggested = 0
-      let hasLowConfidence = false
-
-      for (const r of results) {
-        const existing = await prisma.scriptAnswer.findFirst({
-          where: { scriptId: script.id, questionId: r.questionId },
-        })
-        // High-confidence auto-accept: if this session has it enabled and the
-        // AI is confident, the score is confirmed immediately, no human
-        // review step needed. Anything not high-confidence still goes
-        // through the normal human confirm flow untouched.
-        const autoAccept = session.autoAcceptHighConfidence && r.confidence === 'high'
-        const answerData = {
-          suggestedScore: r.suggestedScore,
-          reasoning: r.reasoning,
-          confidence: r.confidence || null,
-          extractedText: r.answerText || ocrText,
-          visionTranscript: r.visionTranscript || null,
-          stepBreakdown: r.stepBreakdown || null,
-          ...(autoAccept ? { confirmedScore: r.suggestedScore, confirmedAt: new Date(), autoAccepted: true } : {}),
-        }
-        if (existing) {
-          await prisma.scriptAnswer.update({ where: { id: existing.id }, data: answerData })
-        } else {
-          await prisma.scriptAnswer.create({ data: { scriptId: script.id, questionId: r.questionId, ...answerData } })
-        }
-        totalSuggested += r.suggestedScore || 0
-        if (r.confidence === 'low') hasLowConfidence = true
       }
 
       await prisma.script.update({
         where: { id: script.id },
-        data: { totalScore: totalSuggested, hasLowConfidenceScore: hasLowConfidence, status: 'SCORED' },
+        data: {
+          ocrText,
+          ocrConfidence: avgConfidence,
+          status: 'DIGITIZED',
+          studentName,
+          regNumber,
+          classListEntryId,
+          studentIdentifier: [studentName, regNumber].filter(Boolean).join(', ') || script.studentIdentifier,
+        },
       })
-    } catch (err) {
-      console.error(`Marking failed for script ${script.id}:`, err)
-      await prisma.script.update({ where: { id: script.id }, data: { status: 'FLAGGED' } }).catch(() => {})
     }
+
+    const results = await scoreScriptAgainstGuide(ocrText, guide.questions)
+
+    // For calculation heavy questions, standard OCR is unreliable on
+    // mathematical notation, so re transcribe that question's answer
+    // directly from the page image(s) with the vision model and re score
+    // just that question against the corrected transcript. Runs after the
+    // normal batch score above so a vision failure just leaves the
+    // original OCR based result in place rather than losing the question.
+    const pageImageUrls = script.pages.map((p) => p.imageUrl).filter(Boolean)
+    const calcHeavyQuestions = guide.questions.filter((q) => q.isCalculationHeavy)
+    for (const q of calcHeavyQuestions) {
+      try {
+        const visionTranscript = await transcribeCalculationFromImage(pageImageUrls, {
+          text: q.text,
+          maxMarks: q.maxMarks,
+        })
+        if (!visionTranscript) continue
+
+        const [rescored] = await scoreScriptAgainstGuide(visionTranscript, [q])
+        if (!rescored) continue
+
+        const idx = results.findIndex((r) => r.questionId === q.id)
+        const withTranscript = { ...rescored, visionTranscript }
+        if (idx >= 0) {
+          results[idx] = withTranscript
+        } else {
+          results.push(withTranscript)
+        }
+      } catch (err) {
+        if (err.code === AI_DAILY_LIMIT) throw err
+        console.error(`Calculation heavy re transcription failed for question ${q.id}:`, err)
+      }
+    }
+
+    let totalSuggested = 0
+    let hasLowConfidence = false
+
+    for (const r of results) {
+      const existing = await prisma.scriptAnswer.findFirst({
+        where: { scriptId: script.id, questionId: r.questionId },
+      })
+      // High-confidence auto-accept: if this session has it enabled and the
+      // AI is confident, the score is confirmed immediately, no human
+      // review step needed. Anything not high-confidence still goes
+      // through the normal human confirm flow untouched.
+      const autoAccept = session.autoAcceptHighConfidence && r.confidence === 'high'
+      const answerData = {
+        suggestedScore: r.suggestedScore,
+        reasoning: r.reasoning,
+        confidence: r.confidence || null,
+        extractedText: r.answerText || ocrText,
+        visionTranscript: r.visionTranscript || null,
+        stepBreakdown: r.stepBreakdown || null,
+        ...(autoAccept ? { confirmedScore: r.suggestedScore, confirmedAt: new Date(), autoAccepted: true } : {}),
+      }
+      if (existing) {
+        await prisma.scriptAnswer.update({ where: { id: existing.id }, data: answerData })
+      } else {
+        await prisma.scriptAnswer.create({ data: { scriptId: script.id, questionId: r.questionId, ...answerData } })
+      }
+      totalSuggested += r.suggestedScore || 0
+      if (r.confidence === 'low') hasLowConfidence = true
+    }
+
+    await prisma.script.update({
+      where: { id: script.id },
+      data: { totalScore: totalSuggested, hasLowConfidenceScore: hasLowConfidence, status: 'SCORED' },
+    })
+    return 'done'
+  } catch (err) {
+    if (err.code === AI_DAILY_LIMIT) {
+      // Not this script's fault: leave it as it is (its OCR text is saved)
+      // so the next run picks it up without reading the pages again.
+      console.warn(`Marking paused for session ${session.id}: ${err.message}`)
+      markingPaused.set(session.id, { reason: 'AI_DAILY_LIMIT', at: new Date() })
+      return 'paused'
+    }
+    console.error(`Marking failed for script ${script.id}:`, err)
+    await prisma.script.update({ where: { id: script.id }, data: { status: 'FLAGGED' } }).catch(() => {})
+    return 'failed'
   }
 }
 
@@ -1367,7 +1436,13 @@ router.get('/:id/markingStatus', requireMembership, async (req, res) => {
     })
     const total = scripts.length
     const markedCount = scripts.filter((s) => s.status === 'SCORED' || s.status === 'REVIEWED').length
-    res.json({ total, markedCount, scripts: withDuplicateFlags(scripts) })
+    res.json({
+      total,
+      markedCount,
+      running: markingRuns.has(req.params.id),
+      paused: markingPaused.get(req.params.id) || null,
+      scripts: withDuplicateFlags(scripts),
+    })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not load marking status: ' + err.message })

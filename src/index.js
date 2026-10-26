@@ -23,7 +23,9 @@ app.use(
     origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   })
 )
-app.use(express.json())
+// Confirming a large split sends every page's address in one request; the
+// default 100 KB cap was hit at about 50 scripts of 16 pages.
+app.use(express.json({ limit: '2mb' }))
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }))
 

@@ -17,6 +17,7 @@ let prisma
 const realFetch = globalThis.fetch
 let groqCalls = []
 let groqReplies = []
+let groqDelayMs = 0
 
 before(async () => {
   if (skip) return
@@ -49,6 +50,8 @@ before(async () => {
     if (String(url).startsWith('http://127.0.0.1')) return realFetch(url, opts)
     groqCalls.push(JSON.parse(opts.body))
     const message = groqReplies.shift()
+    if (groqDelayMs) await new Promise((r) => setTimeout(r, groqDelayMs))
+    if (message?.status) return { ok: false, status: message.status, headers: new Headers(), text: async () => message.body }
     return { ok: true, status: 200, json: async () => ({ choices: [{ message }] }), text: async () => '' }
   }
 
@@ -836,4 +839,74 @@ test('admin: a coordinator marker row on their own session counts as created, no
   assert.ok(!page.body.sessionsJoined.some((s) => s.id === session.id))
   const row = (await call('GET', '/admin/overview', tokenFor(owner))).body.lecturers.find((l) => l.id === ifeoma.id)
   assert.equal(row.sessionsJoined, page.body.stats.sessionsJoined)
+})
+
+test('marking: one run per session, new scripts join it, hand flagged scripts are left alone', { skip }, async () => {
+  const guide = (await call('POST', '/guides', users.bola, guideBody('Queue guide'))).body
+  const session = (await call('POST', '/sessions', users.bola, { title: 'Queue test', guideId: guide.id })).body
+  const qid = guide.questions[0].id
+  const make = (status) => prisma.script.create({ data: { sessionId: session.id, status, ocrText: 'X(z) is the sum of x[n] z^-n' } })
+  const ready = [await make('DIGITIZED'), await make('DIGITIZED'), await make('DIGITIZED')]
+  // Flagged by an earlier run that failed before saving anything: retried.
+  const failedBefore = await make('FLAGGED')
+  // Flagged by a lecturer after marking: has an answer, so it is not touched.
+  const byHand = await make('FLAGGED')
+  await prisma.scriptAnswer.create({ data: { scriptId: byHand.id, questionId: qid, suggestedScore: 2 } })
+
+  const score = { content: JSON.stringify({ results: [{ questionId: qid, suggestedScore: 4, answerText: 'X(z)', confidence: 'medium', reasoning: 'ok' }] }) }
+  groqCalls = []
+  groqReplies = Array.from({ length: 10 }, () => score)
+  groqDelayMs = 40
+  const first = await call('POST', `/sessions/${session.id}/mark`, users.bola)
+  assert.equal(first.body.queued, 4)
+  assert.equal(first.body.alreadyRunning, false)
+  // A second upload while the run is busy: it must not start a second run.
+  const late = await make('DIGITIZED')
+  const second = await call('POST', `/sessions/${session.id}/mark`, users.bola)
+  assert.equal(second.body.alreadyRunning, true)
+
+  let status
+  for (let i = 0; i < 100; i++) {
+    status = (await call('GET', `/sessions/${session.id}/markingStatus`, users.bola)).body
+    if (!status.running) break
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  groqDelayMs = 0
+  assert.equal(groqCalls.length, 5, 'each markable script scored exactly once')
+  const byId = Object.fromEntries(status.scripts.map((x) => [x.id, x.status]))
+  for (const x of [...ready, failedBefore, late]) assert.equal(byId[x.id], 'SCORED')
+  assert.equal(byId[byHand.id], 'FLAGGED')
+  assert.equal(status.paused, null)
+})
+
+test('marking: the AI daily limit pauses the run without flagging, and Mark resumes it', { skip }, async () => {
+  const guide = (await call('POST', '/guides', users.bola, guideBody('Limit guide'))).body
+  const session = (await call('POST', '/sessions', users.bola, { title: 'Limit test', guideId: guide.id })).body
+  const qid = guide.questions[0].id
+  const scripts = []
+  for (let i = 0; i < 3; i++) scripts.push(await prisma.script.create({ data: { sessionId: session.id, status: 'DIGITIZED', ocrText: 'answer' } }))
+
+  groqCalls = []
+  groqReplies = [{ status: 429, body: 'Rate limit reached on tokens per day (TPD): Limit 200000, Used 199900' }]
+  await call('POST', `/sessions/${session.id}/mark`, users.bola)
+  let status
+  for (let i = 0; i < 100; i++) {
+    status = (await call('GET', `/sessions/${session.id}/markingStatus`, users.bola)).body
+    if (!status.running) break
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  assert.equal(groqCalls.length, 1, 'stops after the first refusal instead of trying every script')
+  assert.equal(status.paused.reason, 'AI_DAILY_LIMIT')
+  assert.deepEqual(status.scripts.map((x) => x.status), ['DIGITIZED', 'DIGITIZED', 'DIGITIZED'])
+
+  const score = { content: JSON.stringify({ results: [{ questionId: qid, suggestedScore: 3, answerText: 'a', confidence: 'medium', reasoning: 'ok' }] }) }
+  groqReplies = [score, score, score]
+  await call('POST', `/sessions/${session.id}/mark`, users.bola)
+  for (let i = 0; i < 100; i++) {
+    status = (await call('GET', `/sessions/${session.id}/markingStatus`, users.bola)).body
+    if (!status.running) break
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  assert.equal(status.paused, null)
+  assert.deepEqual(status.scripts.map((x) => x.status), ['SCORED', 'SCORED', 'SCORED'])
 })
