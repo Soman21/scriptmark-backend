@@ -24,7 +24,12 @@ router.get('/', async (req, res) => {
   const where = await accessibleGuidesWhere(prisma, req.user)
   const guides = await prisma.markingGuide.findMany({
     where,
-    include: { questions: { orderBy: { order: 'asc' } }, createdBy: { select: { name: true } } },
+    // sessions: so a guide in Recent Guides can open the session using it.
+    include: {
+      questions: { orderBy: { order: 'asc' } },
+      createdBy: { select: { name: true } },
+      sessions: { select: { id: true, title: true }, orderBy: { createdAt: 'desc' } },
+    },
     orderBy: { updatedAt: 'desc' },
   })
   res.json(guides.map((g) => ({ ...g, warnings: checkGuideTotals(g.questions) })))
