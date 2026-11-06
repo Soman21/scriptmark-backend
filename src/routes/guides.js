@@ -4,7 +4,7 @@ import { Prisma } from '@prisma/client'
 import multer from 'multer'
 import prisma from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
-import { extractTextFromDocument } from '../lib/docParse.js'
+import { extractDocument } from '../lib/docParse.js'
 import { parseMarkingSchemeDocument, generateModelAnswers } from '../lib/groq.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { accessibleGuidesWhere, canAccessSession, canEditGuide } from '../lib/access.js'
@@ -44,7 +44,8 @@ router.get('/:id', async (req, res) => {
   res.json(guide)
 })
 
-// POST /api/guides/parse - upload an existing marking scheme (PDF or DOCX),
+// POST /api/guides/parse - upload an existing marking scheme (PDF, DOCX, or
+// a scanned PDF or photo, read with OCR),
 // get back structured questions to review in the SAME editable question
 // builder used for manual entry. Nothing is saved here — this only returns
 // a suggestion for the lecturer to check and adjust before actually saving
@@ -55,9 +56,13 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
       return res.status(400).json({ error: 'No document was uploaded (expected field name "document").' })
     }
 
-    const rawText = await extractTextFromDocument(req.file.buffer, req.file.mimetype)
+    const { text: rawText, ocrPages } = await extractDocument(req.file.buffer, req.file.mimetype)
     if (!rawText || !rawText.trim()) {
-      return res.status(400).json({ error: 'Could not find any readable text in that document.' })
+      return res.status(400).json({
+        error: ocrPages
+          ? 'No text found on the scanned pages. Check the scan is clear and the right way up.'
+          : 'Could not find any readable text in that document.',
+      })
     }
 
     const parsed = await parseMarkingSchemeDocument(rawText)
@@ -69,7 +74,7 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
     // can preview it in its real layout later, on the Claim Questions page.
     const documentUrl = await uploadScriptImage(req.file.buffer, req.file.originalname, req.file.mimetype)
 
-    res.json({ ...parsed, previewText: rawText.slice(0, 8000), documentUrl, documentMimeType: req.file.mimetype })
+    res.json({ ...parsed, previewText: rawText.slice(0, 8000), documentUrl, documentMimeType: req.file.mimetype, ocrPages })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not parse this document: ' + err.message })
