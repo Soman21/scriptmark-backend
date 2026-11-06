@@ -3,6 +3,7 @@ import prisma from '../lib/prisma.js'
 import { notifyIfSessionConfirmed } from '../lib/notifications.js'
 import { requireAuth } from '../middleware/auth.js'
 import { scoreScriptAgainstGuide } from '../lib/groq.js'
+import { applyPointScores } from '../lib/markingPoints.js'
 import { accessibleGuidesWhere, canAccessScript, canAccessSession } from '../lib/access.js'
 
 const router = express.Router()
@@ -78,12 +79,23 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
 // "override" and requires a reason, recorded in the audit trail below.
 router.put('/:answerId/confirm', async (req, res) => {
   try {
-    const { confirmedScore, extractedText, reason } = req.body
+    const { extractedText, reason, pointScores } = req.body
+    let { confirmedScore } = req.body
 
     const existing = await prisma.scriptAnswer.findUnique({ where: { id: req.params.answerId } })
     if (!existing) return res.status(404).json({ error: 'Answer not found.' })
     if (!(await canAccessScript(prisma, req.user, existing.scriptId)).session) {
       return res.status(403).json({ error: 'You do not have permission to confirm this score.' })
+    }
+
+    // Marked point by point: the score is the sum of the lecturer's point
+    // marks, and each is kept beside the AI's for point level agreement.
+    let pointBreakdown
+    if (pointScores !== undefined) {
+      const applied = applyPointScores(existing.stepBreakdown, pointScores)
+      if (applied.error) return res.status(400).json({ error: applied.error })
+      pointBreakdown = applied.breakdown
+      confirmedScore = applied.total
     }
 
     // Signing off an already confirmed (often auto accepted) score without
@@ -98,6 +110,7 @@ router.put('/:answerId/confirm', async (req, res) => {
       data: {
         confirmedScore: Number(confirmedScore),
         extractedText: extractedText ?? undefined,
+        ...(pointBreakdown ? { stepBreakdown: pointBreakdown } : {}),
         confirmedAt: new Date(),
         autoAccepted: false, // a human just made the call, this is no longer an unreviewed auto-accept
         ...(isOverride

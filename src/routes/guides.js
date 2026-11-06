@@ -8,6 +8,7 @@ import { extractDocument } from '../lib/docParse.js'
 import { parseMarkingSchemeDocument, generateModelAnswers } from '../lib/groq.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { accessibleGuidesWhere, canAccessSession, canEditGuide } from '../lib/access.js'
+import { cleanPoints, checkGuideTotals } from '../lib/markingPoints.js'
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -26,7 +27,7 @@ router.get('/', async (req, res) => {
     include: { questions: { orderBy: { order: 'asc' } }, createdBy: { select: { name: true } } },
     orderBy: { updatedAt: 'desc' },
   })
-  res.json(guides)
+  res.json(guides.map((g) => ({ ...g, warnings: checkGuideTotals(g.questions) })))
 })
 
 router.get('/:id', async (req, res) => {
@@ -41,7 +42,7 @@ router.get('/:id', async (req, res) => {
       ? res.status(403).json({ error: 'You do not have permission to view this guide.' })
       : res.status(404).json({ error: 'Marking guide not found.' })
   }
-  res.json(guide)
+  res.json({ ...guide, warnings: checkGuideTotals(guide.questions) })
 })
 
 // POST /api/guides/parse - upload an existing marking scheme (PDF, DOCX, or
@@ -56,7 +57,9 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
       return res.status(400).json({ error: 'No document was uploaded (expected field name "document").' })
     }
 
-    const { text: rawText, ocrPages } = await extractDocument(req.file.buffer, req.file.mimetype)
+    // figures: drawings in the guide are described by the vision model and
+    // attached to their marking points (see docParse.js).
+    const { text: rawText, ocrPages, figures, wordShapes } = await extractDocument(req.file.buffer, req.file.mimetype, { figures: true })
     if (!rawText || !rawText.trim()) {
       return res.status(400).json({
         error: ocrPages
@@ -74,7 +77,16 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
     // can preview it in its real layout later, on the Claim Questions page.
     const documentUrl = await uploadScriptImage(req.file.buffer, req.file.originalname, req.file.mimetype)
 
-    res.json({ ...parsed, previewText: rawText.slice(0, 8000), documentUrl, documentMimeType: req.file.mimetype, ocrPages })
+    res.json({
+      ...parsed,
+      previewText: rawText.slice(0, 8000),
+      documentUrl,
+      documentMimeType: req.file.mimetype,
+      ocrPages,
+      figures,
+      wordShapes,
+      warnings: checkGuideTotals(parsed.questions),
+    })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not parse this document: ' + err.message })
@@ -237,9 +249,10 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
             modelAnswer: q.modelAnswer || '',
             keywords: q.keywords || '',
             maxMarks: Number(q.maxMarks) || 0,
+            questionTotal: toTotal(q.questionTotal),
             order: i,
             isCalculationHeavy: !!q.isCalculationHeavy,
-            steps: Array.isArray(q.steps) && q.steps.length > 0 ? q.steps : undefined,
+            steps: cleanPoints(q.steps).length > 0 ? cleanPoints(q.steps) : undefined,
           })),
         },
       },
@@ -247,7 +260,7 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
     })
 
     await logActivity({ type: 'GUIDE_CREATED', actor: req.user, text: `${req.user.name} created the guide ${guide.title}` })
-    res.status(201).json(guide)
+    res.status(201).json({ ...guide, warnings: checkGuideTotals(guide.questions) })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not create marking guide.' })
@@ -259,6 +272,11 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
 // question that scripts have already been marked against is updated in
 // place (keeping its answers and whoever claimed it) instead of being
 // deleted and recreated.
+// Printed total of the whole question, or null when none was given.
+const toTotal = (v) => {
+  const n = Number(v)
+  return v === '' || v == null || !Number.isFinite(n) || n <= 0 ? null : n
+}
 const questionKey = (q) => `${String(q.number || '1').trim()}|${q.subLabel || ''}`
 const questionData = (q, i) => ({
   number: q.number || '1',
@@ -267,9 +285,10 @@ const questionData = (q, i) => ({
   modelAnswer: q.modelAnswer || '',
   keywords: q.keywords || '',
   maxMarks: Number(q.maxMarks) || 0,
+  questionTotal: toTotal(q.questionTotal),
   order: i,
   isCalculationHeavy: !!q.isCalculationHeavy,
-  steps: Array.isArray(q.steps) && q.steps.length > 0 ? q.steps : Prisma.DbNull,
+  steps: cleanPoints(q.steps).length > 0 ? cleanPoints(q.steps) : Prisma.DbNull,
 })
 
 router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
@@ -328,7 +347,7 @@ router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         include: { questions: { orderBy: { order: 'asc' } } },
       })
     })
-    res.json({ ...guide, changedMarkedQuestions: changedMarked })
+    res.json({ ...guide, changedMarkedQuestions: changedMarked, warnings: checkGuideTotals(guide.questions) })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not save the marking guide.' })

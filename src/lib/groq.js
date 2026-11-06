@@ -4,6 +4,7 @@
 
 import { pickRegNumber } from './roster.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
+import { cleanPoints, roundQuarter, pointResult } from './markingPoints.js'
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
@@ -26,14 +27,24 @@ subpart as its own separate item to score, using its own max marks.
 For each question given, read the student's extracted answer text and compare it to the
 model answer and keywords. Judge conceptual correctness, not exact wording match.
 
-Some questions include a STEP RUBRIC: a list of specific steps, each with its own marks,
-that together add up to the question's max marks. When a question has a step rubric, do
-not give one holistic score — instead judge each step separately against what the student
-wrote, decide how many of that step's marks to award, and give a short reason for each
-step's award. The question's suggestedScore is then the sum of the marks you awarded
-across its steps. This lets a student earn credit for correct working even when a later
-step or the final answer is wrong. Questions with no step rubric are scored holistically
-as before.
+Some questions include MARKING POINTS: a list of specific points, each with its own marks,
+that together add up to the question's max marks. When a question has marking points, do
+not give one holistic score. Judge each point separately against what the student wrote:
+award the point's full marks if the student covers it, part of its marks if the student
+covers it only partly (in steps of 0.25), or 0 if it is missing or wrong. Give a short reason
+for each point. The question's suggestedScore is then the sum of the marks you awarded
+across its points. This lets a student earn credit for each correct point even when
+another point is missing or wrong. Questions with no marking points are scored holistically.
+
+DRAWINGS: some answers are drawings (block diagrams, circuits, graphs, sketches). Mark a
+drawing by the concept it shows, not its format: a correct concept shown as a drawing earns
+the same marks as the same concept written in words. Labels are required: a drawing whose
+parts are not labelled earns only an attempt mark of about one fifth of the point's marks
+(to the nearest 0.25), unless the point is marked [Labels optional]. A point marked
+[Labelled diagram] expects a drawing. A point may give "Expected drawing:", a description of
+the drawing in the marking guide; compare the student's drawing with it by concept. When the
+text includes a section "DIAGRAM SEEN ON THE PAGE", that is a description of the student's
+drawing made by a model that looked at the page image; use it as part of the student's answer.
 
 For each question, also copy out the specific portion of the student's text that answers
 THAT question (not the whole script) — this lets a human reviewer see exactly what you
@@ -44,12 +55,13 @@ Use "low" whenever the student's answer is ambiguous, the OCR text looks garbled
 incomplete, or the question and answer are hard to match up confidently.
 
 Respond with ONLY a JSON object of this exact shape, and nothing else. Omit "stepBreakdown"
-entirely for a question that has no step rubric; include it, with one entry per step in the
-same order given, ONLY for a question that has one:
-{"results": [{"questionId": "the question's id", "suggestedScore": number, "answerText": "the relevant portion of the student's text for this question", "confidence": "high" | "medium" | "low", "reasoning": "a short, specific explanation", "stepBreakdown": [{"description": "the step as given", "marks": number, "awarded": number, "reasoning": "short reason for this step's award"}]}]}`
+entirely for a question that has no marking points; include it, with one entry per point in
+the same order given, ONLY for a question that has them:
+{"results": [{"questionId": "the question's id", "suggestedScore": number, "answerText": "the relevant portion of the student's text for this question", "confidence": "high" | "medium" | "low", "reasoning": "a short, specific explanation", "stepBreakdown": [{"description": "the point as given", "marks": number, "awarded": number, "reasoning": "short reason for this point's award"}]}]}`
 
 // questions: array of { id, number, subLabel, text, modelAnswer, keywords, maxMarks, steps? }
-// steps, when present, is an array of { description, marks } that should sum to maxMarks.
+// steps, when present, is the question's marking points: an array of
+// { description, marks, note } that should sum to maxMarks (see markingPoints.js).
 // ocrText: the full text extracted from the student's script via OCR (already substituted
 // with the vision model's re transcription for any calculation heavy question, see
 // transcribeCalculationFromImage — this function itself does not know or care which).
@@ -68,7 +80,7 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
       const label = q.subLabel ? `Question ${q.number}${q.subLabel}` : `Question ${q.number}`
       const stepsBlock =
         Array.isArray(q.steps) && q.steps.length > 0
-          ? `\nStep Rubric:\n${q.steps.map((s, i) => `  ${i + 1}. ${s.description} (${s.marks} marks)`).join('\n')}`
+          ? `\nMarking Points:\n${q.steps.map((s, i) => `  ${i + 1}. ${s.description} (${s.marks} marks)${NOTE_TEXT[s.note] || ''}${s.diagram ? `\n     Expected drawing: ${s.diagram}` : ''}`).join('\n')}`
           : ''
       return `Question ID: ${q.id}\n${label}: ${q.text}\nModel Answer: ${q.modelAnswer}\nKeywords: ${q.keywords}\nMax Marks: ${q.maxMarks}${stepsBlock}`
     })
@@ -141,6 +153,8 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
 
 const SCORE_MAX_ATTEMPTS = 3
 
+const NOTE_TEXT = { DIAGRAM: ' [Labelled diagram]', LABELS_OPTIONAL: ' [Labelled diagram] [Labels optional]' }
+
 // Error code for "the AI's daily allowance is used up". Groq says which
 // limit was hit in the error text, for example "tokens per day (TPD)" or
 // "requests per day (RPD)"; per minute limits clear by themselves and are
@@ -212,7 +226,13 @@ export function validateScoreResults(rawResults, questions) {
 
     const maxMarks = toNumber(q.maxMarks) ?? 0
     let score = toNumber(r.suggestedScore)
-    if (score === null) {
+    const steps = Array.isArray(q.steps) ? q.steps : []
+    const markedByPoint = steps.length > 0 && Array.isArray(r.stepBreakdown) && r.stepBreakdown.length > 0
+    // With point marks the score is their sum, so the AI's own total is
+    // not checked; it is replaced below.
+    if (markedByPoint) {
+      score = null
+    } else if (score === null) {
       notes.push('the AI gave no usable score')
     } else if (score < 0 || score > maxMarks) {
       notes.push(`the AI suggested ${score} which is outside 0 to ${maxMarks}, so it was capped`)
@@ -220,27 +240,41 @@ export function validateScoreResults(rawResults, questions) {
     }
 
     let stepBreakdown = null
-    const steps = Array.isArray(q.steps) ? q.steps : []
-    if (steps.length > 0 && Array.isArray(r.stepBreakdown) && r.stepBreakdown.length > 0) {
-      stepBreakdown = r.stepBreakdown.map((s, i) => {
-        const stepMarks = toNumber(steps[i]?.marks) ?? toNumber(s?.marks) ?? 0
+    if (steps.length > 0 && !markedByPoint) {
+      notes.push('the AI did not mark the points one by one')
+    }
+    if (markedByPoint) {
+      if (r.stepBreakdown.length !== steps.length) {
+        notes.push(`the AI marked ${r.stepBreakdown.length} points but the guide has ${steps.length}`)
+      }
+      // One entry per guide point, in guide order, whatever the AI sent.
+      // The guide's own wording and marks win over the AI's copy of them.
+      stepBreakdown = steps.map((step, i) => {
+        const s = r.stepBreakdown[i] || {}
+        const stepMarks = toNumber(step?.marks) ?? toNumber(s?.marks) ?? 0
         let awarded = toNumber(s?.awarded)
         if (awarded === null) {
-          notes.push(`step ${i + 1} has no usable award`)
+          notes.push(`point ${i + 1} has no usable award`)
           awarded = 0
         } else if (awarded < 0 || awarded > stepMarks) {
-          notes.push(`step ${i + 1} award ${awarded} is outside 0 to ${stepMarks}, so it was capped`)
+          notes.push(`point ${i + 1} award ${awarded} is outside 0 to ${stepMarks}, so it was capped`)
           awarded = clamp(awarded, 0, stepMarks)
         }
-        return { ...s, marks: stepMarks, awarded }
+        // Quarter marks only; never round a part award up to more than the point.
+        awarded = Math.min(roundQuarter(awarded), stepMarks)
+        return {
+          description: step?.description ?? s?.description ?? '',
+          marks: stepMarks,
+          note: step?.note ?? null,
+          ...(step?.diagram ? { diagram: step.diagram } : {}),
+          awarded,
+          result: pointResult(awarded, stepMarks),
+          reasoning: typeof s?.reasoning === 'string' ? s.reasoning : '',
+        }
       })
-      const stepTotal = clamp(stepBreakdown.reduce((sum, s) => sum + s.awarded, 0), 0, maxMarks)
-      if (score !== null && Math.abs(stepTotal - score) > 1e-9) {
-        notes.push(`the score ${score} did not match the step awards, so the step total ${stepTotal} was used`)
-        score = stepTotal
-      } else if (score === null) {
-        score = stepTotal
-      }
+      // The points are the source of truth: the score is their sum. A total
+      // that did not match was the AI's arithmetic, not a judgement call.
+      score = clamp(stepBreakdown.reduce((sum, s) => sum + s.awarded, 0), 0, maxMarks)
     }
 
     let confidence = typeof r.confidence === 'string' ? r.confidence.toLowerCase().trim() : ''
@@ -337,6 +371,116 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
     console.error('Vision transcription failed:', err)
     return null
   }
+}
+
+// Sends one request to the vision model and returns its parsed JSON reply,
+// or null on any failure. Callers treat null as "the model could not see
+// anything usable" and carry on with what they had.
+async function visionJson(systemPrompt, userContent) {
+  try {
+    const res = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: VISION_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userContent },
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.1,
+      }),
+    })
+    if (!res.ok) {
+      const errText = await res.text()
+      if (res.status === 429 && /per day/i.test(errText)) {
+        const err = new Error(`Groq vision API error (${res.status}): ${errText}`)
+        err.code = AI_DAILY_LIMIT
+        throw err
+      }
+      console.error(`Groq vision API error (${res.status}):`, errText)
+      return null
+    }
+    const data = await res.json()
+    const content = data.choices?.[0]?.message?.content
+    return content ? JSON.parse(content) : null
+  } catch (err) {
+    if (err.code === AI_DAILY_LIMIT) throw err
+    console.error('Vision request failed:', err)
+    return null
+  }
+}
+
+// Looks at a student's page images for a drawing that answers one question
+// part (block diagram, circuit, graph, sketch) and describes it in words,
+// so the text model can mark it by concept against the guide's points.
+// question: { text, maxMarks, steps }. Returns
+// { present, labelled, description } or null when nothing usable came back.
+// labelled is false only when the drawing clearly has no labels.
+export async function describeDiagramFromImage(imageUrls, question) {
+  if (!Array.isArray(imageUrls) || imageUrls.length === 0) return null
+
+  const systemPrompt = `You are given page image(s) from a handwritten exam script. Find the student's
+drawing (diagram, block diagram, circuit, graph, sketch or table drawn as a figure) that
+answers the question below, if there is one.
+
+Describe the drawing in plain words so that someone who cannot see it can mark it: what kind
+of drawing it is, every part or block shown, the text of every label exactly as written, how
+the parts are connected (arrows and their direction), and any axes, values or units. Describe
+only what is drawn; do not correct it, judge it, or add anything the student did not draw.
+Ignore drawings that belong to other questions.
+
+"labelled" is true if the parts of the drawing carry written labels, false if the drawing
+has no labels or almost none.
+
+Respond with ONLY a JSON object of this exact shape, nothing else:
+{"present": true or false, "labelled": true or false, "description": "the description, or empty string if no drawing"}`
+
+  const points = Array.isArray(question?.steps) ? question.steps : []
+  const pointLines = points.length ? `\nMarking points:\n${points.map((p, i) => `  ${i + 1}. ${p.description}`).join('\n')}` : ''
+  const parsed = await visionJson(systemPrompt, [
+    { type: 'text', text: `Question (${question?.maxMarks ?? '?'} marks): ${question?.text ?? ''}${pointLines}` },
+    ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
+  ])
+  if (!parsed) return null
+  const description = typeof parsed.description === 'string' ? parsed.description.trim() : ''
+  if (!parsed.present || !description) return { present: false, labelled: null, description: '' }
+  return { present: true, labelled: parsed.labelled === false ? false : true, description }
+}
+
+// Describes the drawings on one page of an uploaded marking guide or
+// question paper, so diagrams in the guide itself become text the parser
+// can attach to the right marking point. imageUrl may be a data: URL.
+// pageText is the page's text, to help place each drawing. Returns
+// [{ question, description }] (empty when the page has no drawings).
+export async function describeGuideFigures(imageUrl, pageText) {
+  const systemPrompt = `You are given one page of an exam marking guide or question paper. Find every
+drawing on the page (diagram, block diagram, circuit, graph, sketch, labelled figure). Ignore
+logos, crests, signatures, stamps, plain tables of text and decorative lines.
+
+For each drawing, describe it in plain words so that someone who cannot see it could check a
+student's drawing against it: what kind of drawing it is, every part or block, the text of
+every label exactly as written, how parts are connected (arrows and their direction), and any
+axes, values or units. Also say which question it belongs to, as written on the page, for
+example "3(i)" or "2b", using the nearest question number above it; use null if unclear.
+
+Respond with ONLY a JSON object of this exact shape, nothing else:
+{"figures": [{"question": "3(i)" or null, "description": "..."}]}`
+
+  const parsed = await visionJson(systemPrompt, [
+    { type: 'text', text: `Text on this page:\n${String(pageText || '').slice(0, 4000)}` },
+    { type: 'image_url', image_url: { url: imageUrl } },
+  ])
+  const figures = Array.isArray(parsed?.figures) ? parsed.figures : []
+  return figures
+    .map((f) => ({
+      question: typeof f?.question === 'string' && f.question.trim() ? f.question.trim() : null,
+      description: typeof f?.description === 'string' ? f.description.trim() : '',
+    }))
+    .filter((f) => f.description)
 }
 
 // Reads the front page of a script and tries to pick out the student's reg
@@ -454,10 +598,26 @@ Rules:
   or a multi step derivation, where a student's handwritten answer would contain
   fractions, exponents, or similar notation. It is false for questions answered mainly in
   prose, definitions, or short factual statements, even within a technical subject.
+- Keep the subpart label exactly as written: if the document uses roman numerals "(i)",
+  "(ii)", set subLabel to "i", "ii"; if it uses letters, "a", "b".
+- "questionTotal" is the total printed for the WHOLE question (all its subparts together),
+  as a number, repeated on every subpart of that question. Use null if no total is printed.
+- "points" lists the marking points for that question or subpart, when the document awards
+  marks point by point, for example "Analog Signals (1.25 Marks)" or "- full duplex [0.5]".
+  Each point is {"description": the point as written, without the mark, "marks": its mark
+  as a number, "note": null, "diagram": null}. Read every mark exactly as printed, including
+  decimals such as 0.25, 0.5, 1.25. Do not invent points or marks that are not printed; use
+  an empty list when the document gives no per point marks. Do not change maxMarks to match
+  the points; keep the printed mark, a human will check the arithmetic.
+- The text may contain lines like "[DIAGRAM for 3(i): ...]". These are descriptions of
+  drawings in the guide, made by a model that looked at the page. Attach each to the marking
+  point it illustrates by copying the description into that point's "diagram" and setting
+  its "note" to "DIAGRAM"; if no single point fits, put it on the first point of that
+  subpart, or add it to the model answer when there are no points.
 - Ignore headers, footers, page numbers, and instructions not part of a specific question.
 
 Respond with ONLY a JSON object of this exact shape, nothing else:
-{"title": "a short title for this guide, guessed from the document", "subject": "the subject or course name if mentioned, else null", "questions": [{"number": "1", "subLabel": null, "text": "...", "modelAnswer": "...", "keywords": "...", "maxMarks": 10, "isCalculationHeavy": false}]}`
+{"title": "a short title for this guide, guessed from the document", "subject": "the subject or course name if mentioned, else null", "questions": [{"number": "1", "subLabel": null, "text": "...", "modelAnswer": "...", "keywords": "...", "maxMarks": 10, "questionTotal": 20, "isCalculationHeavy": false, "points": [{"description": "...", "marks": 1.25, "note": null, "diagram": null}]}]}`
 
 // rawText: plain text extracted from an uploaded PDF or DOCX marking scheme.
 // Returns a structure the frontend can drop straight into the same editable
@@ -491,10 +651,12 @@ export async function parseMarkingSchemeDocument(rawText) {
   if (!content) throw new Error('Groq returned an empty response.')
 
   const parsed = JSON.parse(content)
+  const questions = Array.isArray(parsed.questions) ? parsed.questions : []
   return {
     title: parsed.title || '',
     subject: parsed.subject || '',
-    questions: Array.isArray(parsed.questions) ? parsed.questions : [],
+    // Points come back under "points" and are stored as steps.
+    questions: questions.map(({ points, ...q }) => ({ ...q, steps: cleanPoints(points) })),
   }
 }
 

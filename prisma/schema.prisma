@@ -166,8 +166,13 @@ model Question {
   text        String
   modelAnswer String
   keywords    String
-  maxMarks    Int
+  // Float, not Int: marking points often carry quarter marks, e.g. 1.25.
+  maxMarks    Float
   order       Int          @default(0)
+
+  // Total printed for the whole question (all its parts together), as read
+  // from the guide. Only used to check that the parts add up to it.
+  questionTotal Float?
 
   assignedMarkerId String?
   assignedMarker   User?   @relation("AssignedQuestions", fields: [assignedMarkerId], references: [id])
@@ -178,9 +183,11 @@ model Question {
   // see groq.js transcribeCalculationFromImage.
   isCalculationHeavy Boolean @default(false)
 
-  // Optional step by step marking rubric: an array of { description, marks }
-  // objects whose marks should sum to maxMarks. When present, the AI scores
-  // and awards marks per step instead of one flat holistic score.
+  // Marking points (shown as Marking Points in the app, stored as steps):
+  // an array of { description, marks, note } whose marks should sum to
+  // maxMarks. note is null, "DIAGRAM" (a drawing is accepted for this
+  // point) or "LABELS" (a drawing must be labelled). When present, the AI
+  // scores and awards marks per point instead of one holistic score.
   steps Json?
 
   scriptAnswers ScriptAnswer[]
@@ -303,10 +310,16 @@ model ScriptAnswer {
   // (WER and CER) of the text the AI scored, see wer.js.
   referenceText String?
 
-  // Populated only when the question has a steps rubric: an array of
-  // { description, marks, awarded, reasoning } mirroring Question.steps,
-  // for transparency during review.
+  // Populated only when the question has marking points: an array of
+  // { description, marks, note, awarded, result, reasoning, confirmed }
+  // mirroring Question.steps. awarded is the AI's mark for the point,
+  // confirmed the lecturer's (only once a lecturer marks point by point).
   stepBreakdown Json?
+
+  // The vision model's description of a drawing found for this answer
+  // (block diagram, circuit, graph...). Set means the answer contains a
+  // diagram: it is marked by concept and always goes to human review.
+  diagramDescription String?
 }
 
 // One page view or click, for the Analytics tab on the Admin page. No

@@ -70,3 +70,36 @@ test('photo of a paper goes straight to OCR', async () => {
 test('unsupported file type is refused', async () => {
   await assert.rejects(extractDocument(Buffer.from('x'), 'text/plain'), /PDF, Word/)
 })
+
+// Drawings in a guide: pages with shapes or pictures go to the vision model
+// (faked here) and its description is written into the text.
+test('guide figures: a page with a drawn block diagram is described', async () => {
+  const buf = await pdf((d) => {
+    d.text('1. Define a signal. Analog Signals (1.25 Marks)')
+    d.addPage().text('3 (i) Draw the block diagram of a communication system.')
+    ;['Source', 'Encoder', 'Channel', 'Decoder', 'Sink'].forEach((b, i) => {
+      d.rect(50 + i * 100, 150, 80, 40).stroke()
+      if (i < 4) d.moveTo(130 + i * 100, 170).lineTo(150 + i * 100, 170).stroke()
+    })
+  })
+  const seen = []
+  const describe = async (url, pageText) => {
+    seen.push(pageText)
+    assert.match(url, /^data:image\/jpeg;base64,/)
+    return [{ question: '3(i)', description: 'Five boxes, Source to Sink, arrows left to right.' }]
+  }
+  const out = await extractDocument(buf, 'application/pdf', { figures: true, describe, ocr: async () => '' })
+  assert.equal(seen.length, 1)
+  assert.match(seen[0], /block diagram/)
+  assert.equal(out.figures, 1)
+  assert.match(out.text, /\[DIAGRAM for 3\(i\): Five boxes, Source to Sink, arrows left to right\.\]/)
+})
+
+test('guide figures: off unless asked, and plain text pages are not sent', async () => {
+  const buf = await pdf((d) => d.text(QUESTION))
+  let calls = 0
+  const describe = async () => { calls++; return [] }
+  await extractDocument(buf, 'application/pdf', { describe })
+  await extractDocument(buf, 'application/pdf', { figures: true, describe })
+  assert.equal(calls, 0)
+})

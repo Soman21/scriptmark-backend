@@ -1,3 +1,4 @@
+import { pointAgreement } from './markingPoints.js'
 import prisma from './prisma.js'
 import { computeGrade } from './grading.js'
 import { errorRates, summariseRates } from './wer.js'
@@ -184,6 +185,9 @@ export function buildEvaluationReport(rows) {
     autoAcceptedExcluded: scored.length - human.length,
     overriddenAfterConfirm: rows.filter((r) => r.overridden).length,
     overall: agreementStats(human),
+    // Point by point: AI against lecturer on each marking point, only where
+    // a lecturer entered marks point by point (see markingPoints.js).
+    points: pointAgreement(rows),
     passFail: passFailMetrics(human),
     byConfidence,
     perQuestion,
@@ -222,6 +226,8 @@ export async function loadEvaluationRows(sessionId) {
     usedVision: !!a.visionTranscript,
     markedText: a.visionTranscript || a.extractedText,
     referenceText: a.referenceText,
+    stepBreakdown: a.stepBreakdown,
+    diagramDescription: a.diagramDescription,
   }))
 }
 
