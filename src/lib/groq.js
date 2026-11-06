@@ -4,7 +4,7 @@
 
 import { pickRegNumber } from './roster.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
-import { cleanPoints, roundQuarter, pointResult } from './markingPoints.js'
+import { cleanPoints, roundQuarter, pointResult, attemptMark } from './markingPoints.js'
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
@@ -31,8 +31,10 @@ Some questions include MARKING POINTS: a list of specific points, each with its 
 that together add up to the question's max marks. When a question has marking points, do
 not give one holistic score. Judge each point separately against what the student wrote:
 award the point's full marks if the student covers it, part of its marks if the student
-covers it only partly (in steps of 0.25), or 0 if it is missing or wrong. Give a short reason
-for each point. The question's suggestedScore is then the sum of the marks you awarded
+covers it only partly (in steps of 0.25), or 0 if it is missing or unrelated. When the
+student clearly attempts the point with something related but incorrect, set "attempt": true
+for that point (it earns a fixed attempt mark of about one fifth of the point; the system sets
+the number). Give a short reason for each point. The question's suggestedScore is then the sum of the marks you awarded
 across its points. This lets a student earn credit for each correct point even when
 another point is missing or wrong. Questions with no marking points are scored holistically.
 
@@ -57,7 +59,7 @@ incomplete, or the question and answer are hard to match up confidently.
 Respond with ONLY a JSON object of this exact shape, and nothing else. Omit "stepBreakdown"
 entirely for a question that has no marking points; include it, with one entry per point in
 the same order given, ONLY for a question that has them:
-{"results": [{"questionId": "the question's id", "suggestedScore": number, "answerText": "the relevant portion of the student's text for this question", "confidence": "high" | "medium" | "low", "reasoning": "a short, specific explanation", "stepBreakdown": [{"description": "the point as given", "marks": number, "awarded": number, "reasoning": "short reason for this point's award"}]}]}`
+{"results": [{"questionId": "the question's id", "suggestedScore": number, "answerText": "the relevant portion of the student's text for this question", "confidence": "high" | "medium" | "low", "reasoning": "a short, specific explanation", "stepBreakdown": [{"description": "the point as given", "marks": number, "awarded": number, "attempt": false, "reasoning": "short reason for this point's award"}]}]}`
 
 // questions: array of { id, number, subLabel, text, modelAnswer, keywords, maxMarks, steps? }
 // steps, when present, is the question's marking points: an array of
@@ -262,13 +264,17 @@ export function validateScoreResults(rawResults, questions) {
         }
         // Quarter marks only; never round a part award up to more than the point.
         awarded = Math.min(roundQuarter(awarded), stepMarks)
+        // Racle's rule: a related but incorrect attempt earns the attempt
+        // mark, the same number every time, not whatever the AI picked.
+        const attempt = s?.attempt === true && awarded <= attemptMark(stepMarks)
+        if (attempt) awarded = attemptMark(stepMarks)
         return {
           description: step?.description ?? s?.description ?? '',
           marks: stepMarks,
           note: step?.note ?? null,
           ...(step?.diagram ? { diagram: step.diagram } : {}),
           awarded,
-          result: pointResult(awarded, stepMarks),
+          result: attempt ? 'attempt' : pointResult(awarded, stepMarks),
           reasoning: typeof s?.reasoning === 'string' ? s.reasoning : '',
         }
       })

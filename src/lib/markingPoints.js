@@ -79,9 +79,9 @@ export function needsDiagramLook(question) {
   return DRAWING_WORDS.test(String(question?.text || ''))
 }
 
-// Racle's rule (6 Nov 2026): drawings need labels. A drawing with no
-// labels earns an attempt mark of about a fifth of the point, to the
-// nearest quarter (at least 0.25).
+// Racle's rules (6 Nov 2026): a related but incorrect attempt at a point,
+// and a drawing with no labels, each earn an attempt mark of about a fifth
+// of the point, to the nearest quarter (at least 0.25).
 export function attemptMark(marks) {
   if (!(marks > 0)) return 0
   return Math.min(marks, Math.max(0.25, roundQuarter(marks / 5)))
