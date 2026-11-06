@@ -103,3 +103,60 @@ test('guide figures: off unless asked, and plain text pages are not sent', async
   await extractDocument(buf, 'application/pdf', { figures: true, describe })
   assert.equal(calls, 0)
 })
+
+// A typed heading above a pasted photo of the answers: the page has text,
+// so it does not look scanned, but the picture must still be read.
+test('a page that is mostly a picture is read with OCR even with a typed heading', async () => {
+  const img = await pageImage('1b. Answers continue here')
+  const buf = await pdf((d) => {
+    d.text('538 Data Communication. Marking Guide. Second Semester Examination.', 50, 30)
+    d.image(img, 0, 80, { width: 595 })
+  })
+  let calls = 0
+  const out = await extractDocument(buf, 'application/pdf', {
+    ocr: async () => { calls++; return '538 Data Communication. Marking Guide. 2a. Simplex is one way. 2b. Half duplex takes turns.' },
+  })
+  assert.equal(calls, 1)
+  assert.equal(out.ocrPages, 1)
+  assert.match(out.text, /2b\. Half duplex/)
+})
+
+test('a typed page with a small picture keeps its typed text', async () => {
+  const img = await pageImage('logo')
+  const buf = await pdf((d) => {
+    d.image(img, 50, 30, { width: 60 })
+    d.text(QUESTION, 50, 120)
+  })
+  let calls = 0
+  const out = await extractDocument(buf, 'application/pdf', { ocr: async () => { calls++; return 'x' } })
+  assert.equal(calls, 0)
+  assert.match(out.text, /Ohm's law/)
+})
+
+// Smallest .docx with one paragraph, one picture, one more paragraph.
+async function docxWithPicture(before, png, after) {
+  const { default: JSZip } = await import('jszip')
+  const zip = new JSZip()
+  zip.file('[Content_Types].xml', `<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`)
+  zip.file('_rels/.rels', `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`)
+  zip.file('word/_rels/document.xml.rels', `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/></Relationships>`)
+  zip.file('word/media/image1.png', png)
+  zip.file('word/document.xml', `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>
+<w:p><w:r><w:t>${before}</w:t></w:r></w:p>
+<w:p><w:r><w:drawing><wp:inline><wp:extent cx="5000000" cy="3000000"/><wp:docPr id="1" name="Picture 1"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="1" name="image1.png"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdImg"/></pic:blipFill><pic:spPr/></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+<w:p><w:r><w:t>${after}</w:t></w:r></w:p>
+</w:body></w:document>`)
+  return zip.generateAsync({ type: 'nodebuffer' })
+}
+
+test('Word guide: a pasted picture of answers is read with OCR in place', async () => {
+  const png = await pageImage('answers')
+  const buf = await docxWithPicture('1a. Analog signals are continuous.', png, '3. Draw a block diagram.')
+  const out = await extractDocument(buf, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', {
+    figures: true,
+    describe: async () => [],
+    ocr: async () => '2a. Simplex is one way only. 2b. Half duplex takes turns.',
+  })
+  assert.equal(out.ocrPages, 1)
+  assert.match(out.text, /1a\. Analog[\s\S]*2b\. Half duplex[\s\S]*3\. Draw/)
+})

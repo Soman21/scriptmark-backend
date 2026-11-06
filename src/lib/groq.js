@@ -5,6 +5,7 @@
 import { pickRegNumber } from './roster.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
 import { cleanPoints, roundQuarter, pointResult, attemptMark } from './markingPoints.js'
+import { mapLimit } from './mapLimit.js'
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
@@ -625,42 +626,108 @@ Rules:
 Respond with ONLY a JSON object of this exact shape, nothing else:
 {"title": "a short title for this guide, guessed from the document", "subject": "the subject or course name if mentioned, else null", "questions": [{"number": "1", "subLabel": null, "text": "...", "modelAnswer": "...", "keywords": "...", "maxMarks": 10, "questionTotal": 20, "isCalculationHeavy": false, "points": [{"description": "...", "marks": 1.25, "note": null, "diagram": null}]}]}`
 
+// Most text sent to the parser in one call, per question.
+export const GUIDE_TEXT_LIMIT = 30000
+const PARSE_MAX_ATTEMPTS = 3
+const PARSE_CONCURRENCY = 2
+
+// A line that starts a whole question: "Question 2 (20 Marks)", "QUESTION
+// TWO", "Q3.", "Q 4". Subparts such as "(2a)" do not match.
+const QUESTION_HEADING = /^[ \t]*(?:question[ \t]*(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b|q\.?[ \t]*(\d+)\b)/gim
+const DIAGRAM_LINE = /^\[DIAGRAM for (\d+).*\][ \t]*$/gm
+const NUMBER_WORDS = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten']
+
+// Splits guide text into one piece per whole question, so each parser call
+// writes out a small answer. Text before the first question (title and
+// instructions) stays with the first piece. Diagram lines from the vision
+// model are added at the end of each page, which may be under a later
+// question, so each moves to the piece of the question it names.
+// Returns [text] when fewer than two question headings are found.
+export function splitGuideByQuestion(rawText) {
+  const text = String(rawText || '')
+  const diagrams = []
+  const body = text.replace(DIAGRAM_LINE, (line, number) => {
+    diagrams.push({ number, line })
+    return ''
+  })
+  const starts = [...body.matchAll(QUESTION_HEADING)]
+  if (starts.length < 2) return [text]
+
+  const pieces = starts.map((m, i) => ({
+    number: String(NUMBER_WORDS.indexOf(String(m[1] || m[2]).toLowerCase()) + 1 || Number(m[1] || m[2])),
+    text: body.slice(i === 0 ? 0 : m.index, i + 1 < starts.length ? starts[i + 1].index : body.length),
+  }))
+  for (const d of diagrams) {
+    const piece = pieces.find((p) => p.number === d.number) || pieces[pieces.length - 1]
+    piece.text = `${piece.text.trimEnd()}\n${d.line}`
+  }
+  return pieces.map((p) => p.text.replace(/\n{3,}/g, '\n\n').trim())
+}
+
+async function parseGuidePiece(text, sleep) {
+  let lastError = null
+  for (let attempt = 1; attempt <= PARSE_MAX_ATTEMPTS; attempt++) {
+    const res = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [
+          { role: 'system', content: PARSE_GUIDE_SYSTEM_PROMPT },
+          { role: 'user', content: text.slice(0, GUIDE_TEXT_LIMIT) }, // keep well within context limits
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.1,
+      }),
+    })
+
+    if (!res.ok) {
+      const errText = await res.text()
+      lastError = new Error(`Groq API error (${res.status}): ${errText}`)
+      if (res.status === 429 && /per day/i.test(errText)) throw lastError
+      if (!RETRYABLE_STATUSES.has(res.status) || attempt === PARSE_MAX_ATTEMPTS) throw lastError
+      await sleep(retryDelayMs(res, attempt))
+      continue
+    }
+
+    const data = await res.json()
+    const choice = data.choices?.[0]
+    // A reply cut off at the length limit may still close its JSON early and
+    // look complete, so treat it as a failure rather than a short guide.
+    if (choice?.finish_reason === 'length') {
+      throw new Error('A question in this document is too long to read in one go. Upload it in two parts.')
+    }
+    const content = choice?.message?.content
+    if (!content) throw new Error('Groq returned an empty response.')
+    return JSON.parse(content)
+  }
+  throw lastError
+}
+
 // rawText: plain text extracted from an uploaded PDF or DOCX marking scheme.
 // Returns a structure the frontend can drop straight into the same editable
 // question builder used for manual entry, so the lecturer reviews and can
 // change anything before it's actually saved.
-export async function parseMarkingSchemeDocument(rawText) {
-  const res = await fetch(GROQ_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: PARSE_GUIDE_SYSTEM_PROMPT },
-        { role: 'user', content: rawText.slice(0, 30000) }, // keep well within context limits
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.1,
-    }),
-  })
+//
+// A long guide is parsed one question at a time. Asked to write out a whole
+// ten page guide in one reply, with every point, the model can stop after
+// the first parts and still return valid JSON, so the rest goes missing
+// with no error. options.sleep is only overridden by tests.
+export async function parseMarkingSchemeDocument(rawText, options = {}) {
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  const pieces = splitGuideByQuestion(rawText)
+  const results = await mapLimit(pieces, PARSE_CONCURRENCY, (piece) => parseGuidePiece(piece, sleep))
 
-  if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(`Groq API error (${res.status}): ${errText}`)
-  }
-
-  const data = await res.json()
-  const content = data.choices?.[0]?.message?.content
-  if (!content) throw new Error('Groq returned an empty response.')
-
-  const parsed = JSON.parse(content)
-  const questions = Array.isArray(parsed.questions) ? parsed.questions : []
+  const questions = results.flatMap((parsed) => (Array.isArray(parsed?.questions) ? parsed.questions : []))
   return {
-    title: parsed.title || '',
-    subject: parsed.subject || '',
+    title: results.find((r) => r?.title)?.title || '',
+    subject: results.find((r) => r?.subject)?.subject || '',
+    // True when some text was longer than the parser reads, so questions
+    // may be missing.
+    cut: pieces.some((p) => p.length > GUIDE_TEXT_LIMIT),
     // Points come back under "points" and are stored as steps.
     questions: questions.map(({ points, ...q }) => ({ ...q, steps: cleanPoints(points) })),
   }
