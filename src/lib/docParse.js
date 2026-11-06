@@ -28,6 +28,11 @@ const MAX_FIGURES = 10
 // PDF are vector shapes, not pictures). Tables also have lines; the vision
 // model is told to ignore them.
 const MIN_FIGURE_PATHS = 6
+// A PDF page where pictures cover at least this share of the page is also
+// read with OCR, even when it has some typed text. A typed heading above a
+// pasted photo or screenshot of the answers would otherwise hide the
+// picture's text, because the page no longer looks scanned.
+const MIN_PICTURE_SHARE = 0.3
 
 const WORD_TYPES = [
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -61,7 +66,7 @@ export async function extractDocument(buffer, mimetype, { ocr = defaultOcr, figu
     return extractFromPdf(buffer, ocr, figures ? describe : null)
   }
   if (WORD_TYPES.includes(mimetype)) {
-    if (figures) return extractFromWordWithFigures(buffer, describe)
+    if (figures) return extractFromWordWithFigures(buffer, describe, ocr)
     const result = await mammoth.extractRawText({ buffer })
     return { text: result.value, ocrPages: 0, figures: 0, wordShapes: false }
   }
@@ -93,13 +98,23 @@ function readableChars(text) {
 }
 
 // Counts what a PDF page draws: vector shapes (paths) and pictures.
+// imageShare is the share of the page the pictures cover (0 to 1, overlaps
+// counted twice, so it is capped at 1).
 function pageDrawing(page) {
-  const counts = { paths: 0, images: 0 }
+  const counts = { paths: 0, images: 0, imageShare: 0 }
+  const [x0, y0, x1, y1] = page.getBounds()
+  const pageArea = Math.abs((x1 - x0) * (y1 - y0)) || 1
+  // A picture is drawn into the unit square mapped by ctm, so its area on
+  // the page is the determinant of the matrix.
+  const addImage = (ctm) => {
+    counts.images++
+    counts.imageShare = Math.min(1, counts.imageShare + Math.abs(ctm[0] * ctm[3] - ctm[1] * ctm[2]) / pageArea)
+  }
   const device = new mupdf.Device({
     fillPath() { counts.paths++ },
     strokePath() { counts.paths++ },
-    fillImage() { counts.images++ },
-    fillImageMask() { counts.images++ },
+    fillImage(_image, ctm) { addImage(ctm) },
+    fillImageMask(_image, ctm) { addImage(ctm) },
   })
   try {
     page.run(device, mupdf.Matrix.identity)
@@ -113,21 +128,24 @@ async function extractFromPdf(buffer, ocr, describe) {
   const doc = mupdf.Document.openDocument(buffer, 'application/pdf')
   const pageCount = doc.countPages()
   const pages = []
+  const drawing = []
   const scanned = []
   for (let i = 0; i < pageCount; i++) {
     const page = doc.loadPage(i)
     const text = page.toStructuredText('preserve-whitespace').asText()
     pages.push(text)
-    if (readableChars(text) < MIN_TEXT_CHARS) scanned.push(i)
+    drawing.push(pageDrawing(page))
+    if (readableChars(text) < MIN_TEXT_CHARS || drawing[i].imageShare >= MIN_PICTURE_SHARE) scanned.push(i)
   }
 
   if (scanned.length > MAX_OCR_PAGES) {
     throw new Error(`This file has ${scanned.length} scanned pages. Upload at most ${MAX_OCR_PAGES}.`)
   }
 
-  // Render each scanned page to an image and OCR it, a few at a time.
-  // Pages that already had a text layer keep it, so a typed paper with one
-  // scanned diagram page still reads correctly.
+  // Render each scanned or picture page to an image and OCR it, a few at a
+  // time. OCR sees the whole page, typed text included, so its text is kept
+  // only when it is longer than the text layer: a typed page with a small
+  // picture keeps its exact typed text.
   await mapLimit(scanned, OCR_CONCURRENCY, async (i) => {
     const pixmap = doc.loadPage(i).toPixmap(mupdf.Matrix.scale(RENDER_SCALE, RENDER_SCALE), mupdf.ColorSpace.DeviceRGB)
     const png = Buffer.from(pixmap.asPNG())
@@ -143,7 +161,7 @@ async function extractFromPdf(buffer, ocr, describe) {
     const candidates = []
     for (let i = 0; i < pageCount; i++) {
       if (scanned.includes(i)) { candidates.push(i); continue }
-      const d = pageDrawing(doc.loadPage(i))
+      const d = drawing[i]
       if (d.images > 0 || d.paths >= MIN_FIGURE_PATHS) candidates.push(i)
     }
     await mapLimit(candidates.slice(0, MAX_FIGURES), OCR_CONCURRENCY, async (i) => {
@@ -158,11 +176,12 @@ async function extractFromPdf(buffer, ocr, describe) {
   return { text: pages.join('\n\n'), ocrPages: scanned.length, figures, wordShapes: false }
 }
 
-// Word: pictures are pulled out in place with mammoth and each is described
-// by the vision model where it sits in the text. Diagrams drawn with Word's
+// Word: pictures are pulled out in place with mammoth. Each is read with
+// OCR (a pasted photo or screenshot of answers is text the guide needs) and
+// described by the vision model where it sits in the text. Diagrams drawn with Word's
 // own shapes, SmartArt or the drawing canvas are not pictures and cannot be
 // rendered here, so they are only detected and reported.
-async function extractFromWordWithFigures(buffer, describe) {
+async function extractFromWordWithFigures(buffer, describe, ocr) {
   const images = []
   const { value: html } = await mammoth.convertToHtml(
     { buffer },
@@ -186,6 +205,18 @@ async function extractFromWordWithFigures(buffer, describe) {
 
   let figures = 0
   const usable = images.map((img, n) => ({ ...img, n })).filter((img) => /^image\/(png|jpe?g|gif|webp)$/.test(img.contentType || ''))
+  if (usable.length > MAX_OCR_PAGES) {
+    throw new Error(`This file has ${usable.length} pictures. Upload at most ${MAX_OCR_PAGES}.`)
+  }
+  const pictureText = new Map()
+  let ocrPages = 0
+  await mapLimit(usable, OCR_CONCURRENCY, async (img) => {
+    const read = (await ocr(Buffer.from(img.base64, 'base64'))) || ''
+    if (readableChars(read) >= MIN_TEXT_CHARS) {
+      pictureText.set(img.n, read.trim())
+      ocrPages++
+    }
+  })
   const descriptions = new Map()
   await mapLimit(usable.slice(0, MAX_FIGURES), OCR_CONCURRENCY, async (img) => {
     // Text just before the picture tells the model which question it is under.
@@ -195,9 +226,11 @@ async function extractFromWordWithFigures(buffer, describe) {
     figures += found.length
     descriptions.set(img.n, found.map(figureLine).join('\n'))
   })
-  text = text.replace(/\[\[FIGURE (\d+)\]\]/g, (_, n) => descriptions.get(Number(n)) || '')
+  text = text.replace(/\[\[FIGURE (\d+)\]\]/g, (_, n) =>
+    [pictureText.get(Number(n)), descriptions.get(Number(n))].filter(Boolean).join('\n')
+  )
 
-  return { text: text.replace(/\n{3,}/g, '\n\n').trim(), ocrPages: 0, figures, wordShapes: await hasWordShapes(buffer) }
+  return { text: text.replace(/\n{3,}/g, '\n\n').trim(), ocrPages, figures, wordShapes: await hasWordShapes(buffer) }
 }
 
 // True when the document body contains Word shapes, SmartArt or a drawing
