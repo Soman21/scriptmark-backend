@@ -167,7 +167,7 @@ test('missing question gets a null score placeholder at low confidence', async (
 })
 
 test('keeps the attempt with the fewest problems', async () => {
-  const twoBad = [{ ...good[0], suggestedScore: -3 }, { ...good[1], suggestedScore: 'lots' }]
+  const twoBad = [{ ...good[0], suggestedScore: -3 }, { ...good[1], stepBreakdown: [good[1].stepBreakdown[0]] }]
   const oneBad = [{ ...good[0], suggestedScore: 11 }, good[1]]
   queue.push(twoBad, oneBad, twoBad)
   const results = await scoreScriptAgainstGuide('text', questions, noSleep)
@@ -216,4 +216,44 @@ test('validate: step awards are capped and the score follows the step total', ()
 test('validate: unrecognised confidence label becomes low', () => {
   const { results } = validateScoreResults([{ ...good[0], confidence: 'very sure' }, good[1]], questions)
   assert.equal(results[0].confidence, 'low')
+})
+
+test('validate: point awards round to the nearest quarter and get a result', () => {
+  const qs = [{ id: 'p', number: '3', subLabel: 'i', maxMarks: 2.5, steps: [
+    { description: 'Analog signals', marks: 1.25, note: null },
+    { description: 'Full duplex', marks: 1.25, note: "DIAGRAM" },
+  ] }]
+  const r = { questionId: 'p', suggestedScore: 9, confidence: 'high', reasoning: '', stepBreakdown: [
+    { awarded: 0.6, reasoning: 'partly' },
+    { awarded: 1.25, reasoning: 'ok' },
+  ] }
+  const { results, problems } = validateScoreResults([r], qs)
+  assert.deepEqual(results[0].stepBreakdown.map((s) => s.awarded), [0.5, 1.25])
+  assert.deepEqual(results[0].stepBreakdown.map((s) => s.result), ['partial', 'full'])
+  assert.equal(results[0].stepBreakdown[1].note, 'DIAGRAM')
+  assert.equal(results[0].suggestedScore, 1.75)
+  // A wrong total is fixed from the points without lowering confidence.
+  assert.equal(results[0].confidence, 'high')
+  assert.equal(problems.length, 0)
+})
+
+test('validate: a question with points but no point marks is low confidence', () => {
+  const r = { ...good[1], stepBreakdown: undefined }
+  const { results } = validateScoreResults([good[0], r], questions)
+  assert.equal(results[1].confidence, 'low')
+})
+
+test('validate: a related wrong attempt gets the fixed attempt mark', () => {
+  const qs = [{ id: 'p', number: '1', subLabel: 'ii', maxMarks: 2.5, steps: [
+    { description: 'Simplex', marks: 1 }, { description: 'Half duplex', marks: 1 }, { description: 'Full duplex', marks: 0.5 },
+  ] }]
+  const r = { questionId: 'p', confidence: 'high', reasoning: '', stepBreakdown: [
+    { awarded: 0, attempt: true, reasoning: 'Wrong direction' },
+    { awarded: 0.5, attempt: false, reasoning: 'Partly' },
+    { awarded: 0.1, attempt: true, reasoning: 'Related' },
+  ] }
+  const { results } = validateScoreResults([r], qs)
+  assert.deepEqual(results[0].stepBreakdown.map((s) => s.awarded), [0.25, 0.5, 0.25])
+  assert.deepEqual(results[0].stepBreakdown.map((s) => s.result), ['attempt', 'partial', 'attempt'])
+  assert.equal(results[0].suggestedScore, 1)
 })

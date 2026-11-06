@@ -11,7 +11,8 @@ import { extractTextFromDocument } from '../lib/docParse.js'
 import { withDuplicateFlags, findDuplicates } from '../lib/duplicates.js'
 import { resultRow, RESULT_COLUMNS } from '../lib/resultRows.js'
 import { writeResultsPdf } from '../lib/pdfExport.js'
-import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, parseClassList, AI_DAILY_LIMIT } from '../lib/groq.js'
+import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, describeDiagramFromImage, parseClassList, AI_DAILY_LIMIT } from '../lib/groq.js'
+import { checkGuideTotals, needsDiagramLook, capUnlabelledDrawing } from '../lib/markingPoints.js'
 import { mapLimit } from '../lib/mapLimit.js'
 import { matchRegNumber, mergeClassListEntries, normalizeRegNumber, findUnresolvedScripts } from '../lib/roster.js'
 import { computeSessionAnalytics } from '../lib/analytics.js'
@@ -1106,7 +1107,9 @@ router.post('/:id/mark', requireRole('LECTURER', 'ADMIN'), requireMembership, as
     // Tell a run already going to look again before it stops, in case it
     // has just checked and found nothing left.
     if (run) run.lookAgain = true
-    res.json({ started: true, queued, alreadyRunning })
+    // Guide arithmetic problems do not stop marking (the lecturer may have
+    // chosen them), but the Marking page shows them.
+    res.json({ started: true, queued, alreadyRunning, warnings: checkGuideTotals(guide.questions) })
 
     // Only one run per session. Every confirmed upload calls this route, and
     // each call used to start its own run over the same unmarked scripts, so
@@ -1155,16 +1158,39 @@ router.post('/:id/remark', requireRole('LECTURER', 'ADMIN'), requireMembership, 
   }
 })
 
+const NO_LABELS = 'No labels.'
+
+// The student's text with the vision model's description of their drawing.
+function withDiagram(text, description) {
+  return `${text || ''}\n\nDIAGRAM SEEN ON THE PAGE (described by a model that looked at the page image):\n${description}`
+}
+
+// A drawn answer is never auto accepted: confidence is capped at medium so
+// a lecturer always checks it. With labelled === false, points expecting a
+// labelled drawing are capped at the attempt mark (markingPoints.js).
+function reviewDrawnAnswer(r, labelled) {
+  const { breakdown, changed } = capUnlabelledDrawing(r.stepBreakdown, labelled)
+  const out = { ...r, confidence: r.confidence === 'high' ? 'medium' : r.confidence }
+  if (changed) {
+    out.stepBreakdown = breakdown
+    out.suggestedScore = breakdown.reduce((sum, p) => sum + p.awarded, 0)
+  }
+  return out
+}
+
 async function remarkAnswers(answers, questions, session) {
   const byId = new Map(questions.map((q) => [q.id, q]))
   const touchedScripts = new Set()
   for (const a of answers) {
     const q = byId.get(a.questionId)
-    const text = (q.isCalculationHeavy && a.visionTranscript) || a.script.ocrText
-    if (!text) continue
+    const base = (q.isCalculationHeavy && a.visionTranscript) || a.script.ocrText
+    if (!base) continue
+    // A drawing seen before is reused, so re marking needs no new vision call.
+    const text = a.diagramDescription ? withDiagram(base, a.diagramDescription) : base
     try {
-      const [r] = await scoreScriptAgainstGuide(text, [q])
-      if (!r) continue
+      const [scored] = await scoreScriptAgainstGuide(text, [q])
+      if (!scored) continue
+      const r = a.diagramDescription ? reviewDrawnAnswer(scored, !a.diagramDescription.startsWith(NO_LABELS)) : scored
       const autoAccept = session.autoAcceptHighConfidence && r.confidence === 'high'
       await prisma.scriptAnswer.update({
         where: { id: a.id },
@@ -1366,6 +1392,33 @@ async function markScript(script, guide, session) {
       }
     }
 
+    // Drawn answers (block diagrams, circuits, graphs): OCR cannot read a
+    // drawing, so for parts that may be answered with one, the vision model
+    // describes what is drawn and the part is marked again with that
+    // description added to the text. Drawn answers always go to a human
+    // (see reviewDrawnAnswer). A failure leaves the text based result.
+    for (const q of guide.questions.filter(needsDiagramLook)) {
+      try {
+        const seen = await describeDiagramFromImage(pageImageUrls, q)
+        if (!seen?.present) continue
+        const idx = results.findIndex((r) => r.questionId === q.id)
+        const baseText = results[idx]?.visionTranscript || ocrText
+        const [rescored] = await scoreScriptAgainstGuide(withDiagram(baseText, seen.description), [q])
+        if (!rescored) continue
+        const drawn = {
+          ...reviewDrawnAnswer(rescored, seen.labelled),
+          // Kept with the answer so re marking applies the same label rule.
+          diagramDescription: seen.labelled === false ? `${NO_LABELS} ${seen.description}` : seen.description,
+          ...(results[idx]?.visionTranscript ? { visionTranscript: results[idx].visionTranscript } : {}),
+        }
+        if (idx >= 0) results[idx] = drawn
+        else results.push(drawn)
+      } catch (err) {
+        if (err.code === AI_DAILY_LIMIT) throw err
+        console.error(`Diagram reading failed for question ${q.id}:`, err)
+      }
+    }
+
     let totalSuggested = 0
     let hasLowConfidence = false
 
@@ -1384,6 +1437,7 @@ async function markScript(script, guide, session) {
         confidence: r.confidence || null,
         extractedText: r.answerText || ocrText,
         visionTranscript: r.visionTranscript || null,
+        diagramDescription: r.diagramDescription || null,
         stepBreakdown: r.stepBreakdown || null,
         ...(autoAccept ? { confirmedScore: r.suggestedScore, confirmedAt: new Date(), autoAccepted: true } : {}),
       }
