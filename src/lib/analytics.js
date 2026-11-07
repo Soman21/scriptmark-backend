@@ -1,3 +1,4 @@
+import { studentMax } from './guideTotals.js'
 import prisma from './prisma.js'
 
 // Real cohort-level stats for a session, computed from actual
@@ -10,6 +11,8 @@ export async function computeSessionAnalytics(sessionId) {
     where: { sessionId },
     include: { answers: { include: { question: true } } },
   })
+  const session = await prisma.markingSession.findUnique({ where: { id: sessionId }, select: { guide: { select: { answerRule: true } } } })
+  const rule = session?.guide?.answerRule || null
 
   const scored = scripts.filter((s) => s.totalScore != null)
   const totalScripts = scripts.length
@@ -21,7 +24,8 @@ export async function computeSessionAnalytics(sessionId) {
 
   const buckets = [0, 0, 0, 0, 0]
   scored.forEach((s) => {
-    const maxPossible = s.answers.reduce((sum, a) => sum + (a.question?.maxMarks || 0), 0)
+    // Out of what one student can score under the answer rule.
+    const maxPossible = studentMax(s.answers.map((a) => a.question || {}), rule)
     if (!maxPossible) return
     const pct = (s.totalScore / maxPossible) * 100
     const bucketIndex = Math.min(4, Math.floor(pct / 20))

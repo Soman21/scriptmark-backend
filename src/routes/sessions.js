@@ -1,3 +1,4 @@
+import { scriptTotal } from '../lib/scriptTotal.js'
 import express from 'express'
 import multer from 'multer'
 import ExcelJS from 'exceljs'
@@ -734,10 +735,16 @@ router.post('/:id/inviteByEmail', async (req, res) => {
 router.get('/scripts/:scriptId', requireScriptMembership, async (req, res) => {
   const script = await prisma.script.findUnique({
     where: { id: req.params.scriptId },
-    include: { pages: { orderBy: { pageNumber: 'asc' } }, answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } } },
+    include: {
+      pages: { orderBy: { pageNumber: 'asc' } },
+      answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } },
+      session: { select: { guide: { select: { answerRule: true } } } },
+    },
   })
   if (!script) return res.status(404).json({ error: 'Script not found.' })
-  res.json(script)
+  // The guide's answer rule, so Results counts only the questions allowed.
+  const { session, ...rest } = script
+  res.json({ ...rest, answerRule: session?.guide?.answerRule || null })
 })
 
 router.put('/scripts/:scriptId/studentInfo', requireRole('LECTURER', 'ADMIN'), requireScriptMembership, async (req, res) => {
@@ -767,7 +774,9 @@ router.get('/:id/scripts', requireMembership, async (req, res) => {
     },
     orderBy: { uploadedAt: 'asc' },
   })
-  res.json(withDuplicateFlags(scripts))
+  const session = await prisma.markingSession.findUnique({ where: { id: req.params.id }, select: { guide: { select: { answerRule: true } } } })
+  const answerRule = session?.guide?.answerRule || null
+  res.json(withDuplicateFlags(scripts).map((s) => ({ ...s, answerRule })))
 })
 
 // POST /api/sessions/:id/scripts - upload a page of a script.
@@ -1217,7 +1226,7 @@ async function remarkAnswers(answers, questions, session) {
     await prisma.script.update({
       where: { id: scriptId },
       data: {
-        totalScore: all.reduce((sum, x) => sum + (x.confirmedScore ?? x.suggestedScore ?? 0), 0),
+        totalScore: await scriptTotal(scriptId),
         hasLowConfidenceScore: all.some((x) => x.confidence === 'low'),
         // Anything now waiting on a lecturer puts the script back in review.
         ...(all.some((x) => x.confirmedAt == null) ? { status: 'SCORED' } : {}),
@@ -1455,7 +1464,7 @@ async function markScript(script, guide, session) {
 
     await prisma.script.update({
       where: { id: script.id },
-      data: { totalScore: totalSuggested, hasLowConfidenceScore: hasLowConfidence, status: 'SCORED' },
+      data: { totalScore: await scriptTotal(script.id), hasLowConfidenceScore: hasLowConfidence, status: 'SCORED' },
     })
     return 'done'
   } catch (err) {
@@ -1771,13 +1780,13 @@ router.put('/:id/classList/:entryId', requireMembership, async (req, res) => {
 
 router.get('/:id/export', requireMembership, async (req, res) => {
   try {
-    const session = await prisma.markingSession.findUnique({ where: { id: req.params.id } })
+    const session = await prisma.markingSession.findUnique({ where: { id: req.params.id }, include: { guide: { select: { answerRule: true } } } })
     if (!session) return res.status(404).json({ error: 'Session not found.' })
 
     const scripts = await prisma.script.findMany({
       where: { sessionId: req.params.id },
       orderBy: { studentName: 'asc' },
-      include: { answers: { select: { confirmedAt: true, confirmedScore: true } } },
+      include: { answers: { select: { confirmedAt: true, confirmedScore: true, question: { select: { number: true } } } } },
     })
 
     // A script matched to a roster entry that's still flagged (conflicting
@@ -1796,7 +1805,7 @@ router.get('/:id/export', requireMembership, async (req, res) => {
     // scores=exam gives exam scores only; anything else adds CA and grades.
     const scores = req.query.scores === 'exam' ? 'exam' : 'total'
     const columns = RESULT_COLUMNS[scores]
-    const rows = scripts.map((s) => resultRow(s, scores))
+    const rows = scripts.map((s) => resultRow(s, scores, session.guide?.answerRule))
     const safeName = session.title.replace(/[^a-z0-9]/gi, '_')
     await logActivity({ type: 'RESULTS_EXPORTED', actor: req.user, sessionId: session.id, text: `${req.user.name} exported results for ${session.title}` })
 

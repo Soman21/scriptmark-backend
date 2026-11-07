@@ -72,3 +72,20 @@ test('fix all: the AI shares a gap, and a bad AI answer falls back to the larges
   assert.deepEqual(bad.questions.map((q) => q.maxMarks), [4, 4, 5.5, 4])
   assert.deepEqual(bad.warnings, [])
 })
+
+test('extra answers: Q1 and the best three others count', async () => {
+  const { ruleScore, countedNumbers } = await import('../src/lib/guideTotals.js')
+  const { resultRow } = await import('../src/lib/resultRows.js')
+  const rule = { compulsory: ['1'], any: 3 }
+  const answers = [
+    { number: '1', score: 5 }, { number: '1', score: 4 },
+    { number: '2', score: 10 }, { number: '3', score: 3 }, { number: '4', score: 12 }, { number: '5', score: 8 }, { number: '6', score: 0 },
+  ]
+  assert.equal(ruleScore(answers, rule), 9 + 12 + 10 + 8)
+  assert.equal(ruleScore(answers, null), 42)
+  assert.deepEqual([...countedNumbers(new Map([['1', 2], ['2', 5], ['3', 5]]), { compulsory: [], any: 1 })], ['2'])
+  const script = { studentName: 'Ada', caScore: 20, answers: answers.map((a) => ({ confirmedAt: new Date(), confirmedScore: a.score, question: { number: a.number } })) }
+  assert.equal(resultRow(script, 'total', rule).exam, 39)
+  assert.equal(resultRow(script, 'total', rule).total, 59)
+  assert.equal(resultRow(script, 'total').exam, 42)
+})
