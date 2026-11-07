@@ -12,7 +12,7 @@ import { withDuplicateFlags, findDuplicates } from '../lib/duplicates.js'
 import { resultRow, RESULT_COLUMNS } from '../lib/resultRows.js'
 import { writeResultsPdf } from '../lib/pdfExport.js'
 import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, describeDiagramFromImage, parseClassList, AI_DAILY_LIMIT } from '../lib/groq.js'
-import { checkGuideTotals, needsDiagramLook, capUnlabelledDrawing } from '../lib/markingPoints.js'
+import { checkGuideTotals, needsDiagramLook, capUnlabelledDrawing, bestTotal } from '../lib/markingPoints.js'
 import { mapLimit } from '../lib/mapLimit.js'
 import { matchRegNumber, mergeClassListEntries, normalizeRegNumber, findUnresolvedScripts } from '../lib/roster.js'
 import { computeSessionAnalytics } from '../lib/analytics.js'
@@ -1170,12 +1170,12 @@ function withDiagram(text, description) {
 // A drawn answer is never auto accepted: confidence is capped at medium so
 // a lecturer always checks it. With labelled === false, points expecting a
 // labelled drawing are capped at the attempt mark (markingPoints.js).
-function reviewDrawnAnswer(r, labelled) {
+function reviewDrawnAnswer(r, labelled, countBest = null) {
   const { breakdown, changed } = capUnlabelledDrawing(r.stepBreakdown, labelled)
   const out = { ...r, confidence: r.confidence === 'high' ? 'medium' : r.confidence }
   if (changed) {
     out.stepBreakdown = breakdown
-    out.suggestedScore = breakdown.reduce((sum, p) => sum + p.awarded, 0)
+    out.suggestedScore = bestTotal(breakdown.map((p) => p.awarded), countBest)
   }
   return out
 }
@@ -1192,7 +1192,7 @@ async function remarkAnswers(answers, questions, session) {
     try {
       const [scored] = await scoreScriptAgainstGuide(text, [q])
       if (!scored) continue
-      const r = a.diagramDescription ? reviewDrawnAnswer(scored, !a.diagramDescription.startsWith(NO_LABELS)) : scored
+      const r = a.diagramDescription ? reviewDrawnAnswer(scored, !a.diagramDescription.startsWith(NO_LABELS), q.countBest) : scored
       const autoAccept = session.autoAcceptHighConfidence && r.confidence === 'high'
       await prisma.scriptAnswer.update({
         where: { id: a.id },
@@ -1409,7 +1409,7 @@ async function markScript(script, guide, session) {
         const [rescored] = await scoreScriptAgainstGuide(withDiagram(baseText, seen.description), [q])
         if (!rescored) continue
         const drawn = {
-          ...reviewDrawnAnswer(rescored, seen.labelled),
+          ...reviewDrawnAnswer(rescored, seen.labelled, q.countBest),
           // Kept with the answer so re marking applies the same label rule.
           diagramDescription: seen.labelled === false ? `${NO_LABELS} ${seen.description}` : seen.description,
           ...(results[idx]?.visionTranscript ? { visionTranscript: results[idx].visionTranscript } : {}),

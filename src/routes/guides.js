@@ -8,7 +8,7 @@ import { extractDocument } from '../lib/docParse.js'
 import { parseMarkingSchemeDocument, generateModelAnswers } from '../lib/groq.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { accessibleGuidesWhere, canAccessSession, canEditGuide } from '../lib/access.js'
-import { cleanPoints, checkGuideTotals } from '../lib/markingPoints.js'
+import { cleanPoints, checkGuideTotals, cleanCountBest } from '../lib/markingPoints.js'
 import { cleanSourceFiles, withoutText } from '../lib/sourceFiles.js'
 
 const upload = multer({
@@ -266,6 +266,7 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
             order: i,
             isCalculationHeavy: !!q.isCalculationHeavy,
             steps: cleanPoints(q.steps).length > 0 ? cleanPoints(q.steps) : undefined,
+            countBest: cleanCountBest(q.countBest, cleanPoints(q.steps).length),
           })),
         },
       },
@@ -302,6 +303,8 @@ const questionData = (q, i) => ({
   order: i,
   isCalculationHeavy: !!q.isCalculationHeavy,
   steps: cleanPoints(q.steps).length > 0 ? cleanPoints(q.steps) : Prisma.DbNull,
+  // "Any five" questions: only the best countBest points count.
+  countBest: cleanCountBest(q.countBest, cleanPoints(q.steps).length),
 })
 
 router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
@@ -330,7 +333,7 @@ router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
     const byKey = new Map(existing.questions.map((q) => [questionKey(q), q]))
     // Questions scripts were already marked against whose marking content
     // changed: the frontend offers to re mark them with the new version.
-    const markingFields = ['text', 'modelAnswer', 'keywords', 'maxMarks', 'isCalculationHeavy']
+    const markingFields = ['text', 'modelAnswer', 'keywords', 'maxMarks', 'isCalculationHeavy', 'countBest']
     const changedMarked = incoming
       .map((data) => ({ data, match: byKey.get(questionKey(data)) }))
       .filter(

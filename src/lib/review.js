@@ -8,7 +8,7 @@ const MAX_TEXT = 4000
 export function buildReviewContext(script) {
   const blocks = script.answers.map((a) => {
     const q = a.question
-    const steps = Array.isArray(q.steps) && q.steps.length ? `\nStep rubric:\n${q.steps.map((s, i) => `  ${i + 1}. ${s.description} (${s.marks} marks)`).join('\n')}` : ''
+    const steps = Array.isArray(q.steps) && q.steps.length ? `\nStep rubric:\n${q.steps.map((s, i) => `  ${i + 1}. ${s.description} (${s.marks} marks)`).join('\n')}${q.countBest ? `\nOnly the best ${q.countBest} of these ${q.steps.length} points count.` : ''}` : ''
     const confirmed = a.confirmedAt
       ? `${a.confirmedScore} (${a.autoAccepted ? 'auto accepted because the AI was highly confident' : 'confirmed by a lecturer'})`
       : 'not confirmed yet'

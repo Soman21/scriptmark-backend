@@ -4,7 +4,7 @@
 
 import { pickRegNumber } from './roster.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
-import { cleanPoints, roundQuarter, pointResult, attemptMark } from './markingPoints.js'
+import { cleanPoints, roundQuarter, pointResult, attemptMark, bestTotal, countBestFrom } from './markingPoints.js'
 import { mapLimit } from './mapLimit.js'
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
@@ -37,7 +37,9 @@ student clearly attempts the point with something related but incorrect, set "at
 for that point (it earns a fixed attempt mark of about one fifth of the point; the system sets
 the number). Give a short reason for each point. The question's suggestedScore is then the sum of the marks you awarded
 across its points. This lets a student earn credit for each correct point even when
-another point is missing or wrong. Questions with no marking points are scored holistically. When a model answer gives mark
+another point is missing or wrong. When a question says "Only the best N of these points count", the guide lists more
+accepted answers than the student needs to give (an "any five" question): judge every point
+the same way; the system counts only the student's best N. Questions with no marking points are scored holistically. When a model answer gives mark
 bands (for example "Excellent (13-15 marks)", "Good (10-12 marks)"), first decide which band
 the student's answer fits by the band's description, then give a score inside that band.
 A model answer may contain a table in Markdown ("|" between cells): each row is one item of
@@ -92,7 +94,9 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
       const label = q.subLabel ? `Question ${q.number}${q.subLabel}` : `Question ${q.number}`
       const stepsBlock =
         Array.isArray(q.steps) && q.steps.length > 0
-          ? `\nMarking Points:\n${q.steps.map((s, i) => `  ${i + 1}. ${s.description} (${s.marks} marks)${NOTE_TEXT[s.note] || ''}${s.diagram ? `\n     Expected drawing: ${s.diagram}` : ''}`).join('\n')}`
+          ? `\nMarking Points:\n${q.steps.map((s, i) => `  ${i + 1}. ${s.description} (${s.marks} marks)${NOTE_TEXT[s.note] || ''}${s.diagram ? `\n     Expected drawing: ${s.diagram}` : ''}`).join('\n')}${
+              q.countBest ? `\nOnly the best ${q.countBest} of these ${q.steps.length} points count.` : ''
+            }`
           : ''
       return `Question ID: ${q.id}\n${label}: ${q.text}\nModel Answer: ${q.modelAnswer}\nKeywords: ${q.keywords}\nMax Marks: ${q.maxMarks}${stepsBlock}`
     })
@@ -288,9 +292,10 @@ export function validateScoreResults(rawResults, questions) {
           reasoning: typeof s?.reasoning === 'string' ? s.reasoning : '',
         }
       })
-      // The points are the source of truth: the score is their sum. A total
-      // that did not match was the AI's arithmetic, not a judgement call.
-      score = clamp(stepBreakdown.reduce((sum, s) => sum + s.awarded, 0), 0, maxMarks)
+      // The points are the source of truth: the score is their sum (of the
+      // best countBest points on an "any five" question). A total that did
+      // not match was the AI's arithmetic, not a judgement call.
+      score = clamp(bestTotal(stepBreakdown.map((s) => s.awarded), q.countBest), 0, maxMarks)
     }
 
     let confidence = typeof r.confidence === 'string' ? r.confidence.toLowerCase().trim() : ''
@@ -800,7 +805,11 @@ export async function parseMarkingSchemeDocument(rawText, options = {}) {
     // may be missing.
     cut: pieces.some((p) => p.length > GUIDE_TEXT_LIMIT),
     // Points come back under "points" and are stored as steps.
-    questions: questions.map(({ points, ...q }) => ({ ...q, steps: cleanPoints(points) })),
+    // "Any five" questions: only the best five of the listed points count.
+    questions: questions.map(({ points, ...q }) => {
+      const steps = cleanPoints(points)
+      return { ...q, steps, countBest: countBestFrom(q.text, steps.length) }
+    }),
   }
 }
 

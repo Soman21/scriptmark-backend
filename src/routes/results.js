@@ -82,17 +82,20 @@ router.put('/:answerId/confirm', async (req, res) => {
     const { extractedText, reason, pointScores } = req.body
     let { confirmedScore } = req.body
 
-    const existing = await prisma.scriptAnswer.findUnique({ where: { id: req.params.answerId } })
+    const existing = await prisma.scriptAnswer.findUnique({
+      where: { id: req.params.answerId },
+      include: { question: { select: { countBest: true } } },
+    })
     if (!existing) return res.status(404).json({ error: 'Answer not found.' })
     if (!(await canAccessScript(prisma, req.user, existing.scriptId)).session) {
       return res.status(403).json({ error: 'You do not have permission to confirm this score.' })
     }
 
     // Marked point by point: the score is the sum of the lecturer's point
-    // marks, and each is kept beside the AI's for point level agreement.
+    // marks (only the best ones on an "any five" question), and each is kept beside the AI's for point level agreement.
     let pointBreakdown
     if (pointScores !== undefined) {
-      const applied = applyPointScores(existing.stepBreakdown, pointScores)
+      const applied = applyPointScores(existing.stepBreakdown, pointScores, existing.question?.countBest)
       if (applied.error) return res.status(400).json({ error: applied.error })
       pointBreakdown = applied.breakdown
       confirmedScore = applied.total

@@ -37,6 +37,46 @@ export function cleanPoints(points) {
     .filter((p) => p.description)
 }
 
+// "Any five" questions: the guide lists every accepted answer (say 7
+// points) and only the student's best five count. Question.countBest holds
+// that number; null means every point counts.
+const COUNT_WORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 }
+
+// A count only makes sense when it is fewer than the points listed.
+export function cleanCountBest(value, pointCount) {
+  const n = toNum(value)
+  if (n == null || !Number.isInteger(n) || n < 1 || n >= pointCount) return null
+  return n
+}
+
+// Reads "any five", "any 3", "any two (2)" from a question's text. Returns
+// the number when the guide lists more points than that, else null.
+export function countBestFrom(text, pointCount) {
+  const m = String(text || '').match(/\bany\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/i)
+  if (!m) return null
+  const word = m[1].toLowerCase()
+  return cleanCountBest(COUNT_WORDS[word] ?? Number(word), pointCount)
+}
+
+// Positions of the points that count: the countBest highest values (ties
+// go to the earlier point), or all of them when countBest is null.
+export function countedPoints(values, countBest) {
+  const nums = (values || []).map((v) => toNum(v) ?? 0)
+  const all = nums.map((_, i) => i)
+  const n = cleanCountBest(countBest, nums.length)
+  if (n == null) return all
+  return all
+    .sort((a, b) => nums[b] - nums[a] || a - b)
+    .slice(0, n)
+    .sort((a, b) => a - b)
+}
+
+// Total of the points that count.
+export function bestTotal(values, countBest) {
+  const nums = (values || []).map((v) => toNum(v) ?? 0)
+  return roundTo(countedPoints(nums, countBest).reduce((sum, i) => sum + nums[i], 0))
+}
+
 // Checks a guide's arithmetic before any marking happens. questions are
 // flat Question rows ({ number, subLabel, maxMarks, questionTotal, steps }).
 // Returns a list of { label, kind, expected, actual }:
@@ -49,7 +89,8 @@ export function checkGuideTotals(questions) {
     const points = Array.isArray(q.steps) ? q.steps : []
     const max = toNum(q.maxMarks) ?? 0
     if (points.length) {
-      const sum = points.reduce((s, p) => s + (toNum(p.marks) ?? 0), 0)
+      // With "best 5 of 7" the part is out of the 5 highest point marks.
+      const sum = bestTotal(points.map((p) => p.marks), q.countBest)
       if (!near(sum, max)) warnings.push({ label: `Q${q.number}${q.subLabel || ''}`, kind: 'POINTS', expected: max, actual: roundTo(sum) })
     }
     const key = String(q.number)
@@ -117,8 +158,8 @@ export function pointResult(awarded, marks) {
 
 // Lecturer marks entered point by point. points: the answer's stored
 // breakdown; scores: one number per point. Returns { breakdown, total } or
-// { error }.
-export function applyPointScores(points, scores) {
+// { error }. countBest: only that many of the best points count.
+export function applyPointScores(points, scores, countBest = null) {
   if (!Array.isArray(points) || !points.length) return { error: 'This answer has no marking points.' }
   if (!Array.isArray(scores) || scores.length !== points.length) return { error: 'Enter a mark for every point.' }
   const breakdown = []
@@ -128,7 +169,7 @@ export function applyPointScores(points, scores) {
     if (s == null || s < 0 || s > marks + 1e-9) return { error: `Point ${i + 1} must be between 0 and ${marks}.` }
     breakdown.push({ ...points[i], confirmed: s })
   }
-  return { breakdown, total: roundTo(breakdown.reduce((sum, p) => sum + p.confirmed, 0)) }
+  return { breakdown, total: bestTotal(breakdown.map((p) => p.confirmed), countBest) }
 }
 
 // Point level agreement between the AI and a lecturer, for the evaluation

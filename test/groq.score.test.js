@@ -213,6 +213,17 @@ test('validate: step awards are capped and the score follows the step total', ()
   assert.equal(results[1].confidence, 'low')
 })
 
+test('validate: an "any five" question scores the best five points only', () => {
+  const q = { id: 'any', number: '1', subLabel: 'b', maxMarks: 5, countBest: 5, steps: Array.from({ length: 7 }, (_, i) => ({ description: `c${i + 1}`, marks: 1 })) }
+  const r = {
+    questionId: 'any', suggestedScore: 6, answerText: '', confidence: 'high', reasoning: '',
+    stepBreakdown: [1, 1, 0, 1, 1, 1, 1].map((awarded, i) => ({ description: `c${i + 1}`, marks: 1, awarded, reasoning: '' })),
+  }
+  const { results } = validateScoreResults([r], [q])
+  assert.equal(results[0].suggestedScore, 5)
+  assert.equal(results[0].confidence, 'high')
+})
+
 test('validate: unrecognised confidence label becomes low', () => {
   const { results } = validateScoreResults([{ ...good[0], confidence: 'very sure' }, good[1]], questions)
   assert.equal(results[0].confidence, 'low')

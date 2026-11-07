@@ -66,6 +66,18 @@ test('every question of a long guide comes back, one call per question', async (
   assert.equal(out.cut, false)
 })
 
+test('an "any five" question with more points listed gets countBest', async () => {
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ questions: [
+      { number: '1', subLabel: 'b', text: 'State and explain any five characteristics', maxMarks: 5, points: Array.from({ length: 7 }, (_, i) => ({ description: `c${i + 1}`, marks: 1 })) },
+      { number: '1', subLabel: 'c', text: 'Define data', maxMarks: 2, points: [{ description: 'd', marks: 2 }] },
+    ] }) } }] }),
+  })
+  const out = await parseMarkingSchemeDocument('Question 1\n(1b) any five', noSleep)
+  assert.deepEqual(out.questions.map((q) => q.countBest), [5, null])
+})
+
 test('a busy reply is retried', async () => {
   const sent = fakeGroq({ statuses: [429] })
   const out = await parseMarkingSchemeDocument('Question 1\n(a)', noSleep)
