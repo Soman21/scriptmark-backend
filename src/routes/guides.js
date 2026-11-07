@@ -5,7 +5,8 @@ import multer from 'multer'
 import prisma from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { extractDocument } from '../lib/docParse.js'
-import { parseMarkingSchemeDocument, generateModelAnswers } from '../lib/groq.js'
+import { parseMarkingSchemeDocument, generateModelAnswers, shareQuestionMarks } from '../lib/groq.js'
+import { readExamRules, cleanExamTotal, cleanAnswerRule, fixGuideTotals } from '../lib/guideTotals.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { accessibleGuidesWhere, canAccessSession, canEditGuide } from '../lib/access.js'
 import { cleanPoints, checkGuideTotals, cleanCountBest } from '../lib/markingPoints.js'
@@ -85,6 +86,8 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
 
     res.json({
       ...parsed,
+      // "Total Marks: 70" and "Answer Question 1 and any three others".
+      ...readExamRules(rawText),
       previewText: rawText.slice(0, 8000),
       // The whole text and the file's name, kept on the guide when it is
       // saved, so the file stays with the session.
@@ -102,6 +105,25 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not parse this document: ' + err.message })
+  }
+})
+
+// POST /api/guides/fixTotals - Fix all for the guide editor. body: {
+// questions } as the editor holds them (flat, with steps). Returns the
+// suggested questions and the list of changes; nothing is saved, the
+// lecturer applies and saves. The AI is only asked about questions whose
+// parts cannot be made to add up from the guide's own numbers.
+router.post('/fixTotals', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
+  try {
+    const questions = Array.isArray(req.body?.questions) ? req.body.questions : []
+    const result = await fixGuideTotals(
+      questions.map((q) => ({ ...q, steps: cleanPoints(q.steps), countBest: cleanCountBest(q.countBest, cleanPoints(q.steps).length) })),
+      (parts, target) => shareQuestionMarks(parts, target)
+    )
+    res.json(result)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not work out the fixes: ' + err.message })
   }
 })
 
@@ -236,7 +258,7 @@ router.put('/:id/questions/:questionId/claim', requireRole('LECTURER', 'ADMIN'),
 
 router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
-    const { title, subject, questions, isDraft, questionPaperUrl, questionPaperMimeType, sourceFiles } = req.body
+    const { title, subject, questions, isDraft, questionPaperUrl, questionPaperMimeType, sourceFiles, examTotal, answerRule } = req.body
 
     if (!title) {
       return res.status(400).json({ error: 'A title is required, even for a draft.' })
@@ -254,6 +276,8 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         questionPaperUrl: questionPaperUrl || null,
         questionPaperMimeType: questionPaperMimeType || null,
         sourceFiles: cleanSourceFiles(sourceFiles) ?? Prisma.DbNull,
+        examTotal: cleanExamTotal(examTotal),
+        answerRule: cleanAnswerRule(answerRule) ?? Prisma.DbNull,
         questions: {
           create: (questions || []).map((q, i) => ({
             number: q.number || '1',
@@ -309,7 +333,7 @@ const questionData = (q, i) => ({
 
 router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
-    const { title, subject, isDraft, questions, questionPaperUrl, questionPaperMimeType, sourceFiles } = req.body
+    const { title, subject, isDraft, questions, questionPaperUrl, questionPaperMimeType, sourceFiles, examTotal, answerRule } = req.body
 
     const existing = await prisma.markingGuide.findUnique({
       where: { id: req.params.id },
@@ -360,6 +384,8 @@ router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
           ...(questionPaperUrl !== undefined ? { questionPaperUrl } : {}),
           ...(questionPaperMimeType !== undefined ? { questionPaperMimeType } : {}),
           ...(sourceFiles !== undefined ? { sourceFiles: cleanSourceFiles(sourceFiles, existing.sourceFiles) ?? Prisma.DbNull } : {}),
+          ...(examTotal !== undefined ? { examTotal: cleanExamTotal(examTotal) } : {}),
+          ...(answerRule !== undefined ? { answerRule: cleanAnswerRule(answerRule) ?? Prisma.DbNull } : {}),
         },
         include: { questions: { orderBy: { order: 'asc' } } },
       })

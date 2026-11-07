@@ -1166,3 +1166,55 @@ export async function pageAssistantChat(systemPrompt, context, messages) {
   if (!content) throw new Error('Groq returned an empty response.')
   return JSON.parse(content)
 }
+
+const SHARE_MARKS_SYSTEM_PROMPT = `You are an experienced examiner checking a marking guide. One question's
+parts do not add up to the question's printed total. Decide new marks for the parts so they add up to
+the total EXACTLY.
+
+Rules:
+- Change as few parts as possible, by as little as possible. Keep marks that already look right.
+- Give more marks to the part that asks for more work: a drawing or diagram, a design, a calculation,
+  or more points to explain. Give less to short definitions or lists.
+- Marks may be any number, but prefer steps of 0.25 or 0.5.
+- "reason" is 2 to 5 words, for example "Diagram, most work" or "Short definition".
+
+Respond with ONLY a JSON object: {"parts": [{"subLabel": "a", "marks": 4.5, "reason": "..."}]}
+with one entry for every part listed, in the same order.`
+
+// Fix all: asks the AI to share a question's total over its parts by how
+// much work each part asks for. parts: [{ subLabel, text, maxMarks, steps }].
+// Returns [{ subLabel, marks, reason }] or null; the caller checks the sum.
+export async function shareQuestionMarks(parts, target, options = {}) {
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  const lines = parts.map((p) => {
+    const points = (p.steps || []).map((s) => `    - ${s.description} (${s.marks})`).join('\n')
+    return `Part ${p.subLabel || '(single)'}: ${String(p.text || '').slice(0, 400)}\n  Now: ${p.maxMarks} marks${points ? `\n  Points:\n${points}` : ''}`
+  }).join('\n\n')
+  const user = `Question ${parts[0]?.number ?? ''}, printed total ${target} marks.\n\n${lines}`
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [{ role: 'system', content: SHARE_MARKS_SYSTEM_PROMPT }, { role: 'user', content: user }],
+        response_format: { type: 'json_object' },
+        temperature: 0.1,
+      }),
+    })
+    if (!res.ok) {
+      const errText = await res.text()
+      if (res.status === 429 && attempt < 3 && !/per day/i.test(errText)) {
+        await sleep(groqWaitMs(errText) ?? 5000)
+        continue
+      }
+      return null
+    }
+    const data = await res.json()
+    const content = data.choices?.[0]?.message?.content
+    if (!content) return null
+    const parsed = JSON.parse(content)
+    return Array.isArray(parsed?.parts) ? parsed.parts : null
+  }
+  return null
+}
