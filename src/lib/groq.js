@@ -4,7 +4,7 @@
 
 import { pickRegNumber } from './roster.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
-import { cleanPoints, roundQuarter, pointResult, attemptMark, bestTotal, countBestFrom } from './markingPoints.js'
+import { cleanPoints, roundQuarter, pointResult, attemptMark, bestTotal, countBestFrom, applyPrintedMarks } from './markingPoints.js'
 import { mapLimit } from './mapLimit.js'
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
@@ -647,7 +647,11 @@ Rules:
   contain, based on the model answer. If modelAnswer is blank, leave keywords blank too.
 - "maxMarks" is the mark allocated to that question or subpart, as a number. If subparts
   don't state individual marks but the parent question does, split the total evenly across
-  subparts unless the document implies otherwise. Marks are usually printed even on a bare
+  subparts unless the document implies otherwise. When a subpart heading prints its own
+  mark, such as "(1c) Identify the relationships. (4 Marks)", use exactly that mark, even
+  when it is a decimal such as 2.5 or 5.5; never replace it with an even split. Notes in
+  square brackets such as "[printed 4 Marks changed to 5 Marks]" explain a correction; the
+  mark in the heading is the one to use. Marks are usually printed even on a bare
   question paper, so still fill this in even when modelAnswer is blank.
 - "isCalculationHeavy" is true if answering the question mainly involves numeric
   calculation or mathematical working, such as solving an equation, evaluating a formula,
@@ -806,7 +810,8 @@ export async function parseMarkingSchemeDocument(rawText, options = {}) {
     cut: pieces.some((p) => p.length > GUIDE_TEXT_LIMIT),
     // Points come back under "points" and are stored as steps.
     // "Any five" questions: only the best five of the listed points count.
-    questions: questions.map(({ points, ...q }) => {
+    // Marks printed in the headings win over what the parser read.
+    questions: applyPrintedMarks(questions, rawText).map(({ points, ...q }) => {
       const steps = cleanPoints(points)
       return { ...q, steps, countBest: countBestFrom(q.text, steps.length) }
     }),

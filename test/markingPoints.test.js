@@ -127,3 +127,28 @@ test('count best: lecturer point marks total the best points', () => {
   assert.equal(total, 5)
   assert.equal(applyPointScores(points, [1, 0, 0, 0, 0, 0, 1], 5).total, 2)
 })
+
+test('printed heading marks are read exactly, decimals included', async () => {
+  const { printedMarks, applyPrintedMarks } = await import('../src/lib/markingPoints.js')
+  const text = `Question 1 (17.5 Marks)
+[Printed 15 Marks. Parts: 4 + 4 + 4 + 5.5 = 17.5.]
+(1c) Identify the relationships among the entities. (4 Marks)
+• 1 mark for identifying the relationship (Belongs to).
+(1d) Draw a complete E-R Diagram for the scenario. (5.5 Marks)
+[Printed 4 Marks, changed to 5 by hand.]
+\fQuestion 4 (17.5 Marks)
+(4b) Assess the impact of poor data integrity on clinical decision-making, patient safety, legal
+compliance, and organizational performance, and propose strategies to prevent data integrity
+violations. (12.5 Marks)
+(4c) No mark on the heading
+• Point (2 marks)`
+  const r = printedMarks(text)
+  assert.deepEqual(r.parts, { '1c': 4, '1d': 5.5, '4b': 12.5 })
+  assert.deepEqual(r.totals, { 1: 17.5, 4: 17.5 })
+  const qs = applyPrintedMarks([
+    { number: '1', subLabel: 'c', maxMarks: 4.38, questionTotal: null },
+    { number: '1', subLabel: 'd', maxMarks: 4.38 },
+    { number: '4', subLabel: 'c', maxMarks: 3 },
+  ], text)
+  assert.deepEqual(qs.map((q) => [q.maxMarks, q.questionTotal]), [[4, 17.5], [5.5, 17.5], [3, 17.5]])
+})

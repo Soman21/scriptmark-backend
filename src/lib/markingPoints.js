@@ -194,3 +194,46 @@ export function pointAgreement(answers) {
   }
   return { ...summarise(pairs), diagram: summarise(pairs.filter((p) => p.drawn)) }
 }
+
+// Marks printed in the guide's own headings, read straight from the text so
+// the AI parser cannot drop or average them. The parser has been seen to
+// split a question's total evenly over its parts (17.5 / 4 = 4.38) even when
+// each part heading printed its own mark, and any mark is allowed, not just
+// quarters (2.5, 5.5, 17.5, 4.38 all work).
+//   parts   { "1c": 4, "6b": 3 }   from part headings such as
+//           "(1c) Identify the relationships. (4 Marks)", "1c) ... [4 marks]"
+//   totals  { "1": 17.5 }          from "Question 1 (17.5 Marks)"
+// A part heading may wrap onto up to three more lines; the mark must be on the
+// heading itself, before any bullet or [bracketed note] line.
+const MARK = String.raw`[(\[]\s*(\d+(?:\.\d+)?)\s*marks?\s*[)\]]`
+const NEXT_LINE = String.raw`\n(?![ \t\f]*(?:[•o▪\-*\[]|\(?\d+[ \t]*\(?[a-z]\)|question\b))[^\n]*?`
+const PART_HEADING = new RegExp(String.raw`^[ \t\f]*\(?(\d+)[ \t]*\(?([a-z])\)[^\n]*?(?:${NEXT_LINE}){0,3}?${MARK}`, 'gim')
+const QUESTION_TOTAL = new RegExp(String.raw`^[ \t\f]*question[ \t]+(\d+)\b[^\n]*?${MARK}`, 'gim')
+
+export function printedMarks(rawText) {
+  const text = String(rawText || '')
+  const parts = {}
+  const totals = {}
+  for (const m of text.matchAll(PART_HEADING)) {
+    const key = `${m[1]}${m[2].toLowerCase()}`
+    if (!(key in parts)) parts[key] = Number(m[3])
+  }
+  for (const m of text.matchAll(QUESTION_TOTAL)) {
+    if (!(m[1] in totals)) totals[m[1]] = Number(m[2])
+  }
+  return { parts, totals }
+}
+
+// Puts the printed heading marks onto the parsed questions. Questions the
+// headings do not name keep what the parser read.
+export function applyPrintedMarks(questions, rawText) {
+  const { parts, totals } = printedMarks(rawText)
+  return (questions || []).map((q) => {
+    const number = String(q.number ?? '').trim()
+    const key = `${number}${String(q.subLabel ?? '').trim().toLowerCase()}`
+    const out = { ...q }
+    if (q.subLabel && key in parts) out.maxMarks = parts[key]
+    if (number in totals) out.questionTotal = totals[number]
+    return out
+  })
+}

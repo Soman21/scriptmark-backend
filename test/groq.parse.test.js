@@ -186,3 +186,15 @@ test('a student\'s table is copied cell by cell and never capped for labels', as
   reply({ present: false, labelled: false, description: '', table: '' })
   assert.equal((await describeDiagramFromImage(['data:x'], { text: 'x' })).present, false)
 })
+
+test('part marks printed in headings replace an even split from the parser', async () => {
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ questions: [
+      { number: '6', subLabel: 'a', maxMarks: 2.92, questionTotal: 17.5, points: [] },
+      { number: '6', subLabel: 'b', maxMarks: 2.92, questionTotal: 17.5, points: [] },
+    ] }) } }] }),
+  })
+  const out = await parseMarkingSchemeDocument('Question 6 (17.5 Marks)\n(6a) Identification of Entities. (2.5 Marks)\n[printed 4 Marks changed to 2.5 Marks.]\n(6b) Attributes for each entity. (3 Marks)', noSleep)
+  assert.deepEqual(out.questions.map((q) => q.maxMarks), [2.5, 3])
+})
