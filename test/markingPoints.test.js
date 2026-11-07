@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   cleanPoints, checkGuideTotals, needsDiagramLook, attemptMark, capUnlabelledDrawing,
   applyPointScores, pointAgreement, roundQuarter,
+  countBestFrom, cleanCountBest, countedPoints, bestTotal,
 } from '../src/lib/markingPoints.js'
 
 const q3 = [
@@ -83,4 +84,46 @@ test('parts that may be answered with a table also get a look at the page', () =
   assert.equal(needsDiagramLook({ text: 'Differentiate between FDM and TDM', steps: [] }), true)
   assert.equal(needsDiagramLook({ text: 'Explain the term', modelAnswer: '| Criteria | LAN |\n| --- | --- |\n| Cost | Low |', steps: [] }), true)
   assert.equal(needsDiagramLook({ text: 'State Ohm\'s law', modelAnswer: 'V = IR', steps: [] }), false)
+})
+
+// "Any five" questions (Racle, 7 Nov 2026): the 538 guide lists seven
+// characteristics for "State and explain any five", one mark each.
+const seven = Array.from({ length: 7 }, (_, i) => ({ description: `c${i + 1}`, marks: 1 }))
+
+test('count best: read from "any five" in the question text', () => {
+  assert.equal(countBestFrom('State and explain any five characteristics of effective data communication.', 7), 5)
+  assert.equal(countBestFrom('List ANY 3 types', 5), 3)
+  assert.equal(countBestFrom('Draw any three network topologies', 3), null) // no extra points listed
+  assert.equal(countBestFrom('State five characteristics', 7), null)
+  assert.equal(countBestFrom('', 7), null)
+})
+
+test('count best: only a whole number below the point count is kept', () => {
+  assert.equal(cleanCountBest('5', 7), 5)
+  assert.equal(cleanCountBest(7, 7), null)
+  assert.equal(cleanCountBest(2.5, 7), null)
+  assert.equal(cleanCountBest(0, 7), null)
+  assert.equal(cleanCountBest(null, 7), null)
+})
+
+test('count best: the highest scores count, ties to the earlier point', () => {
+  assert.deepEqual(countedPoints([1, 1, 0, 1, 1, 1, 1], 5), [0, 1, 3, 4, 5])
+  assert.equal(bestTotal([1, 1, 0, 1, 1, 1, 1], 5), 5)
+  assert.equal(bestTotal([0.5, 1, 0.25], 2), 1.5)
+  assert.equal(bestTotal([1, 1, 1], null), 3)
+  assert.deepEqual(countedPoints([1, 2], null), [0, 1])
+})
+
+test('count best: guide totals check uses the best points only', () => {
+  assert.deepEqual(checkGuideTotals([{ number: '1', subLabel: 'b', maxMarks: 5, countBest: 5, steps: seven }]), [])
+  assert.deepEqual(checkGuideTotals([{ number: '1', subLabel: 'b', maxMarks: 5, steps: seven }]), [
+    { label: 'Q1b', kind: 'POINTS', expected: 5, actual: 7 },
+  ])
+})
+
+test('count best: lecturer point marks total the best points', () => {
+  const points = seven.map((p) => ({ ...p, awarded: 1 }))
+  const { total } = applyPointScores(points, [1, 1, 0, 1, 1, 1, 1], 5)
+  assert.equal(total, 5)
+  assert.equal(applyPointScores(points, [1, 0, 0, 0, 0, 0, 1], 5).total, 2)
 })

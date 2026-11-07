@@ -193,6 +193,10 @@ model Question {
   // scores and awards marks per point instead of one holistic score.
   steps Json?
 
+  // "Any five" questions: the guide lists every accepted point and only the
+  // student's best countBest of them count. Null means every point counts.
+  countBest Int?
+
   scriptAnswers ScriptAnswer[]
 }
 
