@@ -155,6 +155,12 @@ model MarkingGuide {
   // The question paper and marking guide files with the text read from
   // each, so they stay with the session (see src/lib/sourceFiles.js).
   sourceFiles           Json?
+  // What the exam is out of (e.g. 70), and which questions a student
+  // answers: { compulsory: ["1"], any: 3 } is Question 1 and any three
+  // others. Read from the paper's instructions; the lecturer can change
+  // both. See src/lib/guideTotals.js.
+  examTotal             Float?
+  answerRule            Json?
 
   questions Question[]
   sessions  MarkingSession[]
