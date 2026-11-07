@@ -9,6 +9,7 @@ import { parseMarkingSchemeDocument, generateModelAnswers } from '../lib/groq.js
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { accessibleGuidesWhere, canAccessSession, canEditGuide } from '../lib/access.js'
 import { cleanPoints, checkGuideTotals } from '../lib/markingPoints.js'
+import { cleanSourceFiles, withoutText } from '../lib/sourceFiles.js'
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -32,7 +33,7 @@ router.get('/', async (req, res) => {
     },
     orderBy: { updatedAt: 'desc' },
   })
-  res.json(guides.map((g) => ({ ...g, warnings: checkGuideTotals(g.questions) })))
+  res.json(guides.map((g) => ({ ...g, sourceFiles: withoutText(g.sourceFiles), warnings: checkGuideTotals(g.questions) })))
 })
 
 router.get('/:id', async (req, res) => {
@@ -85,6 +86,10 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
     res.json({
       ...parsed,
       previewText: rawText.slice(0, 8000),
+      // The whole text and the file's name, kept on the guide when it is
+      // saved, so the file stays with the session.
+      text: rawText,
+      fileName: req.file.originalname,
       documentUrl,
       documentMimeType: req.file.mimetype,
       ocrPages,
@@ -229,7 +234,7 @@ router.put('/:id/questions/:questionId/claim', requireRole('LECTURER', 'ADMIN'),
 
 router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
-    const { title, subject, questions, isDraft, questionPaperUrl, questionPaperMimeType } = req.body
+    const { title, subject, questions, isDraft, questionPaperUrl, questionPaperMimeType, sourceFiles } = req.body
 
     if (!title) {
       return res.status(400).json({ error: 'A title is required, even for a draft.' })
@@ -246,6 +251,7 @@ router.post('/', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
         createdById: req.user.id,
         questionPaperUrl: questionPaperUrl || null,
         questionPaperMimeType: questionPaperMimeType || null,
+        sourceFiles: cleanSourceFiles(sourceFiles) ?? Prisma.DbNull,
         questions: {
           create: (questions || []).map((q, i) => ({
             number: q.number || '1',
@@ -298,7 +304,7 @@ const questionData = (q, i) => ({
 
 router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
   try {
-    const { title, subject, isDraft, questions, questionPaperUrl, questionPaperMimeType } = req.body
+    const { title, subject, isDraft, questions, questionPaperUrl, questionPaperMimeType, sourceFiles } = req.body
 
     const existing = await prisma.markingGuide.findUnique({
       where: { id: req.params.id },
@@ -348,6 +354,7 @@ router.put('/:id', requireRole('LECTURER', 'ADMIN'), async (req, res) => {
           isDraft: !!isDraft,
           ...(questionPaperUrl !== undefined ? { questionPaperUrl } : {}),
           ...(questionPaperMimeType !== undefined ? { questionPaperMimeType } : {}),
+          ...(sourceFiles !== undefined ? { sourceFiles: cleanSourceFiles(sourceFiles, existing.sourceFiles) ?? Prisma.DbNull } : {}),
         },
         include: { questions: { orderBy: { order: 'asc' } } },
       })
