@@ -628,8 +628,11 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
 
 // Most text sent to the parser in one call, per question.
 export const GUIDE_TEXT_LIMIT = 30000
-const PARSE_MAX_ATTEMPTS = 3
-const PARSE_CONCURRENCY = 2
+// Groq's free tier allows 8,000 tokens a minute and one question of a guide
+// costs about 4,000, so questions are read one after another, and a busy
+// reply waits as long as Groq asks before trying again.
+const PARSE_MAX_ATTEMPTS = 6
+const PARSE_CONCURRENCY = 1
 
 // A line that starts a whole question: "Question 2 (20 Marks)", "QUESTION
 // TWO", "Q3.", "Q 4". Subparts such as "(2a)" do not match.
@@ -664,6 +667,16 @@ export function splitGuideByQuestion(rawText) {
   return pieces.map((p) => p.text.replace(/\n{3,}/g, '\n\n').trim())
 }
 
+// Groq's 429 message says how long to wait, e.g. "Please try again in
+// 10.9125s" or "in 1m2.5s". Returns that in ms plus a little margin, at most
+// a minute, or null when the message has no wait.
+export function groqWaitMs(errText) {
+  const m = /try again in (?:(\d+)m)?([\d.]+)s/i.exec(String(errText || ''))
+  if (!m) return null
+  const seconds = Number(m[1] || 0) * 60 + Number(m[2])
+  return Number.isFinite(seconds) ? Math.min(Math.ceil(seconds * 1000) + 500, 60000) : null
+}
+
 async function parseGuidePiece(text, sleep) {
   let lastError = null
   for (let attempt = 1; attempt <= PARSE_MAX_ATTEMPTS; attempt++) {
@@ -689,7 +702,7 @@ async function parseGuidePiece(text, sleep) {
       lastError = new Error(`Groq API error (${res.status}): ${errText}`)
       if (res.status === 429 && /per day/i.test(errText)) throw lastError
       if (!RETRYABLE_STATUSES.has(res.status) || attempt === PARSE_MAX_ATTEMPTS) throw lastError
-      await sleep(retryDelayMs(res, attempt))
+      await sleep(groqWaitMs(errText) ?? retryDelayMs(res, attempt))
       continue
     }
 

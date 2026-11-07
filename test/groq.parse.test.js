@@ -83,3 +83,34 @@ test('cut says whether some text was longer than the parser reads', async () => 
   assert.equal((await parseMarkingSchemeDocument('Question 1\nshort', noSleep)).cut, false)
   assert.equal((await parseMarkingSchemeDocument('x'.repeat(GUIDE_TEXT_LIMIT + 1), noSleep)).cut, true)
 })
+
+test('the wait Groq asks for is read from its message', async () => {
+  const { groqWaitMs } = await import('../src/lib/groq.js')
+  assert.equal(groqWaitMs('Rate limit reached ... Please try again in 10.9125s. Need more tokens?'), 11413)
+  assert.equal(groqWaitMs('Please try again in 1m2.5s'), 60000)
+  assert.equal(groqWaitMs('busy'), null)
+})
+
+test('the free tier per minute limit is waited out, one question at a time', async () => {
+  const waits = []
+  let inFlight = 0
+  let most = 0
+  let calls = 0
+  globalThis.fetch = async (_url, req) => {
+    inFlight++
+    most = Math.max(most, inFlight)
+    await new Promise((r) => setTimeout(r, 1))
+    inFlight--
+    calls++
+    if (calls <= 4) {
+      return { ok: false, status: 429, headers: { get: () => null }, text: async () => 'tokens per minute (TPM): Limit 8000. Please try again in 10.9125s.' }
+    }
+    const text = JSON.parse(req.body).messages[1].content
+    const n = /Question (\d+)/i.exec(text)[1]
+    return { ok: true, json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ questions: [{ number: n }] }) } }] }) }
+  }
+  const out = await parseMarkingSchemeDocument(GUIDE, { sleep: async (ms) => waits.push(ms) })
+  assert.equal(most, 1)
+  assert.deepEqual(out.questions.map((q) => q.number), ['1', '2', '7'])
+  assert.deepEqual(waits, [11413, 11413, 11413, 11413])
+})
