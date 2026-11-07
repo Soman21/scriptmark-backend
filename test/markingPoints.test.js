@@ -77,3 +77,10 @@ test('point agreement counts only points a lecturer marked', () => {
   assert.equal(r.diagram.n, 1)
   assert.equal(roundQuarter(0.6), 0.5)
 })
+
+test('parts that may be answered with a table also get a look at the page', () => {
+  assert.equal(needsDiagramLook({ text: 'Critically compare LAN, MAN and WAN', steps: [] }), true)
+  assert.equal(needsDiagramLook({ text: 'Differentiate between FDM and TDM', steps: [] }), true)
+  assert.equal(needsDiagramLook({ text: 'Explain the term', modelAnswer: '| Criteria | LAN |\n| --- | --- |\n| Cost | Low |', steps: [] }), true)
+  assert.equal(needsDiagramLook({ text: 'State Ohm\'s law', modelAnswer: 'V = IR', steps: [] }), false)
+})

@@ -160,3 +160,30 @@ test('Word guide: a pasted picture of answers is read with OCR in place', async 
   assert.equal(out.ocrPages, 1)
   assert.match(out.text, /1a\. Analog[\s\S]*2b\. Half duplex[\s\S]*3\. Draw/)
 })
+
+// Tables: OCR reads a scanned table across the page, mixing columns. The
+// vision model's row by row copy is added as a [TABLE] block.
+test('guide tables: a scanned table page gets the vision model\'s row by row copy', async () => {
+  const img = await pageImage('Criteria LAN MAN WAN')
+  const buf = await pdf((d) => d.image(img, 0, 0, { width: 595 }))
+  const table = '| Criteria | LAN (3 Marks) | MAN (3 Marks) | WAN (3 Marks) |\n| --- | --- | --- | --- |\n| Scalability | Highly scalable | Moderately scalable | Limited scalability |'
+  const out = await extractDocument(buf, 'application/pdf', {
+    figures: true,
+    ocr: async () => '(5a) LAN, MAN and WAN Critical Comparison (15 Marks)\nCriteria LAN (3 Marks) MAN (3 Marks) Scalability Limited Highly Moderately',
+    describe: async () => ({ figures: [], tables: [{ question: '5a', markdown: table }], ok: true }),
+  })
+  assert.equal(out.tables, 1)
+  assert.equal(out.unchecked, 0)
+  assert.ok(out.text.includes(`[TABLE for 5a]\n${table}\n[END TABLE]`))
+})
+
+test('guide tables: a page the vision model could not look at is counted, not hidden', async () => {
+  const img = await pageImage(QUESTION)
+  const buf = await pdf((d) => { d.image(img, 0, 0, { width: 595 }); d.addPage().image(img, 0, 0, { width: 595 }) })
+  const out = await extractDocument(buf, 'application/pdf', {
+    figures: true,
+    ocr: async () => QUESTION,
+    describe: async (_u, _t) => ({ figures: [], tables: [], ok: false }),
+  })
+  assert.equal(out.unchecked, 2)
+})
