@@ -1,3 +1,4 @@
+import { studentMax } from '../lib/guideTotals.js'
 import express from 'express'
 import prisma from '../lib/prisma.js'
 import { requireAuth } from '../middleware/auth.js'
@@ -342,9 +343,11 @@ async function loadPageData(page, session, user) {
   })
   if (page === 'results') return { scripts: withDuplicateFlags(scripts) }
   const analytics = await computeSessionAnalytics(session.id)
+  const guide = session.guideId ? await prisma.markingGuide.findUnique({ where: { id: session.guideId }, select: { answerRule: true } }) : null
+  const rule = guide?.answerRule || null
   const students = scripts.map((s) => {
-    const row = resultRow(s, 'total')
-    return { ...row, exam: row.exam ?? s.totalScore, studentName: s.studentName, examMax: s.answers.reduce((sum, a) => sum + (a.question?.maxMarks || 0), 0) }
+    const row = resultRow(s, 'total', rule)
+    return { ...row, exam: row.exam ?? s.totalScore, studentName: s.studentName, examMax: studentMax(s.answers.map((a) => a.question || {}), rule) }
   })
   return { analytics, students }
 }

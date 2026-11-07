@@ -1,3 +1,4 @@
+import { scriptTotal } from '../lib/scriptTotal.js'
 import express from 'express'
 import prisma from '../lib/prisma.js'
 import { notifyIfSessionConfirmed } from '../lib/notifications.js'
@@ -59,7 +60,7 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
       savedAnswers.push(answer)
     }
 
-    const totalSuggested = savedAnswers.reduce((sum, a) => sum + (a.suggestedScore || 0), 0)
+    const totalSuggested = await scriptTotal(script.id)
     const hasLowConfidence = savedAnswers.some((a) => a.confidence === 'low')
     const updatedScript = await prisma.script.update({
       where: { id: script.id },
@@ -127,10 +128,7 @@ router.put('/:answerId/confirm', async (req, res) => {
       },
     })
 
-    const allAnswers = await prisma.scriptAnswer.findMany({
-      where: { scriptId: answer.scriptId },
-    })
-    const total = allAnswers.reduce((sum, a) => sum + (a.confirmedScore ?? a.suggestedScore ?? 0), 0)
+    const total = await scriptTotal(answer.scriptId)
 
     const script = await prisma.script.update({
       where: { id: answer.scriptId },

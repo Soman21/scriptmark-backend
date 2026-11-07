@@ -188,3 +188,32 @@ export async function fixGuideTotals(questions, chooseParts) {
 
   return { questions: out, changes, warnings: checkGuideTotals(out) }
 }
+
+// Which questions count on one script under the answer rule. scores: Map
+// of question number to that script's score for the question. The
+// compulsory questions always count; of the rest, the `any` highest count
+// (ties go to the lower question number). Students who answer extra
+// questions are marked on all of them and the best ones count. With no
+// rule, every question counts.
+export function countedNumbers(scores, rule) {
+  const numbers = [...scores.keys()]
+  const clean = cleanAnswerRule(rule)
+  if (!clean) return new Set(numbers)
+  const others = numbers
+    .filter((n) => !clean.compulsory.includes(n))
+    .sort((a, b) => (scores.get(b) ?? 0) - (scores.get(a) ?? 0) || a.localeCompare(b, undefined, { numeric: true }))
+    .slice(0, clean.any)
+  return new Set([...numbers.filter((n) => clean.compulsory.includes(n)), ...others])
+}
+
+// A script's score: the questions that count, each the sum of its parts.
+// answers: [{ score, number }].
+export function ruleScore(answers, rule) {
+  const scores = new Map()
+  for (const a of answers || []) {
+    const key = String(a.number ?? '').trim()
+    scores.set(key, (scores.get(key) || 0) + (Number(a.score) || 0))
+  }
+  const counted = countedNumbers(scores, rule)
+  return round2([...counted].reduce((sum, n) => sum + scores.get(n), 0))
+}

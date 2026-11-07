@@ -1,3 +1,4 @@
+import { studentMax } from '../lib/guideTotals.js'
 import express from 'express'
 import ExcelJS from 'exceljs'
 import prisma from '../lib/prisma.js'
@@ -39,7 +40,7 @@ async function courseSessions(user, key, select = SESSION_FIELDS) {
 async function loadSheet(user, key) {
   const sessions = await courseSessions(user, key, {
     ...SESSION_FIELDS,
-    guide: { select: { questions: { select: { maxMarks: true } } } },
+    guide: { select: { examTotal: true, answerRule: true, questions: { select: { number: true, maxMarks: true } } } },
     scripts: {
       select: {
         id: true,
@@ -47,12 +48,14 @@ async function loadSheet(user, key) {
         regNumber: true,
         studentIdentifier: true,
         caScore: true,
-        answers: { select: { confirmedAt: true, confirmedScore: true } },
+        answers: { select: { confirmedAt: true, confirmedScore: true, question: { select: { number: true } } } },
       },
     },
   })
   if (!sessions.length) return null
-  const withMax = sessions.map((s) => ({ ...s, maxMarks: (s.guide?.questions || []).reduce((sum, q) => sum + q.maxMarks, 0) }))
+  // Out of what a student can score ("Question 1 and any three others"),
+  // not every question added up.
+  const withMax = sessions.map((s) => ({ ...s, answerRule: s.guide?.answerRule || null, maxMarks: studentMax(s.guide?.questions || [], s.guide?.answerRule) }))
   const canEdit = (await Promise.all(sessions.map((s) => canManageSession(prisma, s, user)))).every(Boolean)
   const first = sessions[0]
   return {

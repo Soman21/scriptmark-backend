@@ -88,6 +88,7 @@ export function buildCourseSheet(sessions) {
     kind: isCA(s) ? 'CA' : 'EXAM',
     weight: weights[s.id],
     maxMarks: s.maxMarks || null,
+    answerRule: s.answerRule || null,
   }))
 
   // Exam scripts go first so a student's name and reg number come from the
@@ -115,7 +116,7 @@ export function buildCourseSheet(sessions) {
         absent.push(a.type)
         continue
       }
-      const raw = examScoreOf(script)
+      const raw = examScoreOf(script, a.answerRule)
       if (raw == null) {
         cells[a.sessionId] = { status: 'PENDING', score: null, scriptId: script.id }
         pending = true
