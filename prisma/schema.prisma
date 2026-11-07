@@ -152,6 +152,9 @@ model MarkingGuide {
   // in its original layout later, not just the AI-extracted text.
   questionPaperUrl      String?
   questionPaperMimeType String?
+  // The question paper and marking guide files with the text read from
+  // each, so they stay with the session (see src/lib/sourceFiles.js).
+  sourceFiles           Json?
 
   questions Question[]
   sessions  MarkingSession[]
