@@ -114,3 +114,63 @@ test('the free tier per minute limit is waited out, one question at a time', asy
   assert.deepEqual(out.questions.map((q) => q.number), ['1', '2', '7'])
   assert.deepEqual(waits, [11413, 11413, 11413, 11413])
 })
+
+test('table blocks move to the question they name, whole', () => {
+  const text = 'Question 4\n(4d) Classful\nQuestion 5\n(5a) Compare LAN, MAN, WAN\n\nQuestion 6\n(6a) Switching\n[TABLE for 5a]\n| Criteria | LAN (3 Marks) |\n| --- | --- |\n| Cost | Low |\n[END TABLE]'
+  const pieces = splitGuideByQuestion(text)
+  assert.equal(pieces.length, 3)
+  assert.match(pieces[1], /\(5a\)[\s\S]*\[TABLE for 5a\]\n\| Criteria \| LAN \(3 Marks\) \|\n\| --- \| --- \|\n\| Cost \| Low \|\n\[END TABLE\]$/)
+  assert.doesNotMatch(pieces[2], /TABLE/)
+})
+
+test('the guide reader is told to trust table blocks and keep heading marks and bands as printed', async () => {
+  let system = ''
+  globalThis.fetch = async (_url, req) => {
+    system = JSON.parse(req.body).messages[0].content
+    return { ok: true, json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: '{"questions":[{"number":"5"}]}' } }] }) }
+  }
+  await parseMarkingSchemeDocument('Question 5\n(5a)', noSleep)
+  assert.match(system, /trust the TABLE block/)
+  assert.match(system, /Do not copy them onto every row/)
+  assert.match(system, /do not\s+turn bands into marking points/)
+})
+
+test('a page is read for drawings and tables, waiting out a busy reply', async () => {
+  const { describeGuideFigures } = await import('../src/lib/groq.js')
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    if (calls === 1) return { ok: false, status: 429, headers: { get: () => null }, text: async () => 'Please try again in 2s' }
+    const content = JSON.stringify({ figures: [], tables: [{ question: '5a', markdown: '| a | b |\n| c | d |' }, { question: null, markdown: 'not a table' }] })
+    return { ok: true, json: async () => ({ choices: [{ message: { content } }] }) }
+  }
+  const waits = []
+  const out = await describeGuideFigures('data:image/jpeg;base64,x', 'text', { sleep: async (ms) => waits.push(ms) })
+  assert.equal(calls, 2)
+  assert.deepEqual(waits, [2500])
+  assert.equal(out.ok, true)
+  assert.deepEqual(out.tables, [{ question: '5a', markdown: '| a | b |\n| c | d |' }])
+})
+
+test('a page the vision model cannot reach comes back as not checked', async () => {
+  const { describeGuideFigures } = await import('../src/lib/groq.js')
+  globalThis.fetch = async () => ({ ok: false, status: 400, headers: { get: () => null }, text: async () => 'bad' })
+  const out = await describeGuideFigures('data:image/jpeg;base64,x', 'text', noSleep)
+  assert.deepEqual(out, { figures: [], tables: [], ok: false })
+})
+
+test('a student\'s table is copied cell by cell and never capped for labels', async () => {
+  const { describeDiagramFromImage } = await import('../src/lib/groq.js')
+  const reply = (o) => { globalThis.fetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(o) } }] }) }) }
+  reply({ present: false, labelled: false, description: '', table: '| | LAN | WAN |\n| Cost | Low | High |' })
+  const onlyTable = await describeDiagramFromImage(['data:x'], { text: 'Compare LAN and WAN' })
+  assert.equal(onlyTable.present, true)
+  assert.equal(onlyTable.labelled, true)
+  assert.match(onlyTable.description, /^Table written by the student \(copied cell by cell\):\n\| \| LAN \| WAN \|\n\| Cost \| Low \| High \|$/)
+  reply({ present: true, labelled: false, description: 'Star topology, no labels', table: '' })
+  const drawing = await describeDiagramFromImage(['data:x'], { text: 'Draw a star topology' })
+  assert.equal(drawing.labelled, false)
+  assert.equal(drawing.description, 'Star topology, no labels')
+  reply({ present: false, labelled: false, description: '', table: '' })
+  assert.equal((await describeDiagramFromImage(['data:x'], { text: 'x' })).present, false)
+})

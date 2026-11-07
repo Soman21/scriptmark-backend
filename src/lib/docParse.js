@@ -21,8 +21,8 @@ const OCR_CONCURRENCY = 4
 const RENDER_SCALE = 2
 
 // Upper bound on pages or pictures sent to the vision model to describe
-// drawings, per upload. One call each; a guide rarely has more.
-const MAX_FIGURES = 10
+// drawings and copy tables, per upload. One call each.
+const MAX_FIGURES = 20
 // A PDF page with at least this many drawn lines or shapes is treated as
 // possibly holding a diagram drawn with shapes (Word drawings exported to
 // PDF are vector shapes, not pictures). Tables also have lines; the vision
@@ -52,7 +52,10 @@ async function defaultDescribe(imageUrl, pageText) {
   return describeGuideFigures(imageUrl, pageText)
 }
 
-// Returns { text, ocrPages, figures, wordShapes }. ocrPages is how many
+// Returns { text, ocrPages, figures, tables, unchecked, wordShapes }.
+// tables is how many tables the vision model copied out row by row;
+// unchecked is how many pages or pictures it could not look at (busy or
+// over the page cap), so the lecturer can be told. ocrPages is how many
 // pages were read by OCR, 0 for a typed document.
 //
 // With options.figures (used for marking guides), drawings in the document
@@ -73,18 +76,42 @@ export async function extractDocument(buffer, mimetype, { ocr = defaultOcr, figu
   if (mimetype && mimetype.startsWith('image/')) {
     let text = (await ocr(buffer)) || ''
     let count = 0
+    let tables = 0
+    let unchecked = 0
     if (figures) {
-      const found = await describe(`data:${mimetype};base64,${buffer.toString('base64')}`, text)
-      count = found.length
-      if (found.length) text += '\n' + found.map(figureLine).join('\n')
+      const f = pageFindings(await describe(`data:${mimetype};base64,${buffer.toString('base64')}`, text))
+      count = f.figures
+      tables = f.tables
+      if (!f.ok) unchecked = 1
+      if (f.lines.length) text += '\n' + f.lines.join('\n')
     }
-    return { text, ocrPages: 1, figures: count, wordShapes: false }
+    return { text, ocrPages: 1, figures: count, tables, unchecked, wordShapes: false }
   }
   throw new Error('Please upload a PDF, Word (.docx) or image file.')
 }
 
 export function figureLine(f) {
   return `[DIAGRAM${f.question ? ` for ${f.question}` : ''}: ${f.description.replace(/\s+/g, ' ')}]`
+}
+
+// A table copied by the vision model, kept as a block the guide parser can
+// tell apart from the OCR text: "[TABLE for 5a]", the Markdown rows, "[END TABLE]".
+export function tableBlock(t) {
+  return `[TABLE${t.question ? ` for ${t.question}` : ''}]\n${t.markdown}\n[END TABLE]`
+}
+
+// What the vision model found on one page or picture, as lines to add to
+// its text. Older callers (and tests) return a plain list of drawings.
+function pageFindings(found) {
+  const result = Array.isArray(found) ? { figures: found, tables: [], ok: true } : found || { figures: [], tables: [], ok: false }
+  const figures = result.figures || []
+  const tables = result.tables || []
+  return {
+    lines: [...tables.map(tableBlock), ...figures.map(figureLine)],
+    figures: figures.length,
+    tables: tables.length,
+    ok: result.ok !== false,
+  }
 }
 
 // Kept for existing callers (class list upload) that only want the text.
@@ -157,6 +184,8 @@ async function extractFromPdf(buffer, ocr, describe) {
   // include a hand drawn diagram), pages with pictures, and pages with
   // enough drawn shapes. Each goes to the vision model once.
   let figures = 0
+  let tables = 0
+  let unchecked = 0
   if (describe) {
     const candidates = []
     for (let i = 0; i < pageCount; i++) {
@@ -164,16 +193,21 @@ async function extractFromPdf(buffer, ocr, describe) {
       const d = drawing[i]
       if (d.images > 0 || d.paths >= MIN_FIGURE_PATHS) candidates.push(i)
     }
-    await mapLimit(candidates.slice(0, MAX_FIGURES), OCR_CONCURRENCY, async (i) => {
+    unchecked += Math.max(0, candidates.length - MAX_FIGURES)
+    // Two at a time: each call carries a page image, and the vision model
+    // has its own per minute limit.
+    await mapLimit(candidates.slice(0, MAX_FIGURES), 2, async (i) => {
       const pixmap = doc.loadPage(i).toPixmap(mupdf.Matrix.scale(RENDER_SCALE, RENDER_SCALE), mupdf.ColorSpace.DeviceRGB)
       const jpeg = Buffer.from(pixmap.asJPEG(85))
-      const found = await describe(`data:image/jpeg;base64,${jpeg.toString('base64')}`, pages[i])
-      figures += found.length
-      if (found.length) pages[i] += '\n' + found.map(figureLine).join('\n')
+      const f = pageFindings(await describe(`data:image/jpeg;base64,${jpeg.toString('base64')}`, pages[i]))
+      figures += f.figures
+      tables += f.tables
+      if (!f.ok) unchecked++
+      if (f.lines.length) pages[i] += '\n' + f.lines.join('\n')
     })
   }
 
-  return { text: pages.join('\n\n'), ocrPages: scanned.length, figures, wordShapes: false }
+  return { text: pages.join('\n\n'), ocrPages: scanned.length, figures, tables, unchecked, wordShapes: false }
 }
 
 // Word: pictures are pulled out in place with mammoth. Each is read with
@@ -204,6 +238,8 @@ async function extractFromWordWithFigures(buffer, describe, ocr) {
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
 
   let figures = 0
+  let tables = 0
+  let unchecked = 0
   const usable = images.map((img, n) => ({ ...img, n })).filter((img) => /^image\/(png|jpe?g|gif|webp)$/.test(img.contentType || ''))
   if (usable.length > MAX_OCR_PAGES) {
     throw new Error(`This file has ${usable.length} pictures. Upload at most ${MAX_OCR_PAGES}.`)
@@ -218,19 +254,22 @@ async function extractFromWordWithFigures(buffer, describe, ocr) {
     }
   })
   const descriptions = new Map()
-  await mapLimit(usable.slice(0, MAX_FIGURES), OCR_CONCURRENCY, async (img) => {
+  unchecked += Math.max(0, usable.length - MAX_FIGURES)
+  await mapLimit(usable.slice(0, MAX_FIGURES), 2, async (img) => {
     // Text just before the picture tells the model which question it is under.
     const at = text.indexOf(`[[FIGURE ${img.n}]]`)
     const context = text.slice(Math.max(0, at - 1500), at)
-    const found = await describe(`data:${img.contentType};base64,${img.base64}`, context)
-    figures += found.length
-    descriptions.set(img.n, found.map(figureLine).join('\n'))
+    const f = pageFindings(await describe(`data:${img.contentType};base64,${img.base64}`, context))
+    figures += f.figures
+    tables += f.tables
+    if (!f.ok) unchecked++
+    descriptions.set(img.n, f.lines.join('\n'))
   })
   text = text.replace(/\[\[FIGURE (\d+)\]\]/g, (_, n) =>
     [pictureText.get(Number(n)), descriptions.get(Number(n))].filter(Boolean).join('\n')
   )
 
-  return { text: text.replace(/\n{3,}/g, '\n\n').trim(), ocrPages, figures, wordShapes: await hasWordShapes(buffer) }
+  return { text: text.replace(/\n{3,}/g, '\n\n').trim(), ocrPages, figures, tables, unchecked, wordShapes: await hasWordShapes(buffer) }
 }
 
 // True when the document body contains Word shapes, SmartArt or a drawing

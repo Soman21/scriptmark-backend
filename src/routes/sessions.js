@@ -1161,6 +1161,8 @@ router.post('/:id/remark', requireRole('LECTURER', 'ADMIN'), requireMembership, 
 const NO_LABELS = 'No labels.'
 
 // The student's text with the vision model's description of their drawing.
+// The description may also hold a table the student wrote, copied cell by
+// cell, because OCR mixes a table's columns.
 function withDiagram(text, description) {
   return `${text || ''}\n\nDIAGRAM SEEN ON THE PAGE (described by a model that looked at the page image):\n${description}`
 }
@@ -1392,10 +1394,11 @@ async function markScript(script, guide, session) {
       }
     }
 
-    // Drawn answers (block diagrams, circuits, graphs): OCR cannot read a
-    // drawing, so for parts that may be answered with one, the vision model
-    // describes what is drawn and the part is marked again with that
-    // description added to the text. Drawn answers always go to a human
+    // Drawn answers (block diagrams, circuits, graphs) and tables: OCR cannot
+    // read a drawing and mixes a table's columns, so for parts that may be
+    // answered with one, the vision model describes what is drawn and copies
+    // any table cell by cell, and the part is marked again with that added
+    // to the text. Drawn answers always go to a human
     // (see reviewDrawnAnswer). A failure leaves the text based result.
     for (const q of guide.questions.filter(needsDiagramLook)) {
       try {

@@ -69,14 +69,19 @@ function roundTo(n) {
   return Math.round(n * 100) / 100
 }
 
-// Whether a part may be answered with a drawing, so the page images get a
-// look from the vision model. True when any point accepts a diagram, or
-// the question itself asks for one.
+// Whether a part may be answered with a drawing or a table, so the page
+// images get a look from the vision model (OCR cannot read a drawing, and
+// reads a table across the page, mixing its columns). True when any point
+// accepts a diagram, the question asks for a drawing or a comparison that
+// students usually set out as a table, or the guide's answer is a table.
 const DRAWING_WORDS = /\b(draw|sketch|diagram|illustrate|label(?:led)?|block diagram|circuit|graph|plot)\b/i
+const TABLE_WORDS = /\b(table|tabulate|tabular|compare|comparison|differentiate|distinguish|contrast)\b/i
+const MARKDOWN_TABLE = /^\s*\|.*\|\s*$/m
 export function needsDiagramLook(question) {
   const points = Array.isArray(question?.steps) ? question.steps : []
   if (points.some((p) => POINT_NOTES.includes(p?.note))) return true
-  return DRAWING_WORDS.test(String(question?.text || ''))
+  const text = String(question?.text || '')
+  return DRAWING_WORDS.test(text) || TABLE_WORDS.test(text) || MARKDOWN_TABLE.test(String(question?.modelAnswer || ''))
 }
 
 // Racle's rules (6 Nov 2026): a related but incorrect attempt at a point,

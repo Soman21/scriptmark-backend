@@ -65,7 +65,7 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
 
     // figures: drawings in the guide are described by the vision model and
     // attached to their marking points (see docParse.js).
-    const { text: rawText, ocrPages, figures, wordShapes } = await extractDocument(req.file.buffer, req.file.mimetype, { figures: true })
+    const { text: rawText, ocrPages, figures, tables, unchecked, wordShapes } = await extractDocument(req.file.buffer, req.file.mimetype, { figures: true })
     if (!rawText || !rawText.trim()) {
       return res.status(400).json({
         error: ocrPages
@@ -94,6 +94,8 @@ router.post('/parse', requireRole('LECTURER', 'ADMIN'), upload.single('document'
       documentMimeType: req.file.mimetype,
       ocrPages,
       figures,
+      tables,
+      unchecked,
       wordShapes,
       warnings: checkGuideTotals(parsed.questions),
     })

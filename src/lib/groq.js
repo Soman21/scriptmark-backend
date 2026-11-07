@@ -37,7 +37,11 @@ student clearly attempts the point with something related but incorrect, set "at
 for that point (it earns a fixed attempt mark of about one fifth of the point; the system sets
 the number). Give a short reason for each point. The question's suggestedScore is then the sum of the marks you awarded
 across its points. This lets a student earn credit for each correct point even when
-another point is missing or wrong. Questions with no marking points are scored holistically.
+another point is missing or wrong. Questions with no marking points are scored holistically. When a model answer gives mark
+bands (for example "Excellent (13-15 marks)", "Good (10-12 marks)"), first decide which band
+the student's answer fits by the band's description, then give a score inside that band.
+A model answer may contain a table in Markdown ("|" between cells): each row is one item of
+the expected answer, and a student may give the same items as a table or in sentences.
 
 DRAWINGS: some answers are drawings (block diagrams, circuits, graphs, sketches). Mark a
 drawing by the concept it shows, not its format: a correct concept shown as a drawing earns
@@ -48,6 +52,11 @@ parts are not labelled earns only an attempt mark of about one fifth of the poin
 the drawing in the marking guide; compare the student's drawing with it by concept. When the
 text includes a section "DIAGRAM SEEN ON THE PAGE", that is a description of the student's
 drawing made by a model that looked at the page image; use it as part of the student's answer.
+That section may also hold "Table written by the student", a table copied cell by cell from
+the page; the OCR text may show the same table with its columns mixed up, so trust the copied
+table for which cell belongs to which row. Mark its content by meaning against the marking
+points or model answer, as you would prose: students may name rows differently, order them
+differently, or mix a table with sentences.
 
 For each question, also copy out the specific portion of the student's text that answers
 THAT question (not the whole script) — this lets a human reviewer see exactly what you
@@ -383,8 +392,13 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
 // Sends one request to the vision model and returns its parsed JSON reply,
 // or null on any failure. Callers treat null as "the model could not see
 // anything usable" and carry on with what they had.
-async function visionJson(systemPrompt, userContent) {
+// options.retries: how many times a busy reply (per minute limit) is waited
+// out and tried again; options.sleep is only overridden by tests.
+async function visionJson(systemPrompt, userContent, options = {}) {
+  const retries = options.retries || 0
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
   try {
+    for (let attempt = 0; ; attempt++) {
     const res = await fetch(GROQ_API_URL, {
       method: 'POST',
       headers: {
@@ -408,12 +422,17 @@ async function visionJson(systemPrompt, userContent) {
         err.code = AI_DAILY_LIMIT
         throw err
       }
+      if (attempt < retries && RETRYABLE_STATUSES.has(res.status)) {
+        await sleep(groqWaitMs(errText) ?? retryDelayMs(res, attempt + 1))
+        continue
+      }
       console.error(`Groq vision API error (${res.status}):`, errText)
       return null
     }
     const data = await res.json()
     const content = data.choices?.[0]?.message?.content
     return content ? JSON.parse(content) : null
+    }
   } catch (err) {
     if (err.code === AI_DAILY_LIMIT) throw err
     console.error('Vision request failed:', err)
@@ -431,20 +450,26 @@ export async function describeDiagramFromImage(imageUrls, question) {
   if (!Array.isArray(imageUrls) || imageUrls.length === 0) return null
 
   const systemPrompt = `You are given page image(s) from a handwritten exam script. Find the student's
-drawing (diagram, block diagram, circuit, graph, sketch or table drawn as a figure) that
-answers the question below, if there is one.
+drawing (diagram, block diagram, circuit, graph or sketch) and any table the student wrote
+that answers the question below, if there is one.
 
 Describe the drawing in plain words so that someone who cannot see it can mark it: what kind
 of drawing it is, every part or block shown, the text of every label exactly as written, how
 the parts are connected (arrows and their direction), and any axes, values or units. Describe
 only what is drawn; do not correct it, judge it, or add anything the student did not draw.
-Ignore drawings that belong to other questions.
+Ignore drawings and tables that belong to other questions.
 
 "labelled" is true if the parts of the drawing carry written labels, false if the drawing
 has no labels or almost none.
 
+TABLES: OCR reads a handwritten table across the page line by line and mixes up its columns.
+If the student answered in a table (rows and columns, ruled or not), copy it as a Markdown
+table in "table": the header row first, then one line per row, "|" between cells, every cell
+kept in its own row and column, words exactly as the student wrote them, spelling mistakes
+included. Do not correct, complete or reorder anything. Use "" when there is no table.
+
 Respond with ONLY a JSON object of this exact shape, nothing else:
-{"present": true or false, "labelled": true or false, "description": "the description, or empty string if no drawing"}`
+{"present": true or false, "labelled": true or false, "description": "the description, or empty string if no drawing", "table": "| ... |\\n| ... |" or ""}`
 
   const points = Array.isArray(question?.steps) ? question.steps : []
   const pointLines = points.length ? `\nMarking points:\n${points.map((p, i) => `  ${i + 1}. ${p.description}`).join('\n')}` : ''
@@ -453,41 +478,60 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
     ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
   ])
   if (!parsed) return null
-  const description = typeof parsed.description === 'string' ? parsed.description.trim() : ''
-  if (!parsed.present || !description) return { present: false, labelled: null, description: '' }
-  return { present: true, labelled: parsed.labelled === false ? false : true, description }
+  const drawing = parsed.present && typeof parsed.description === 'string' ? parsed.description.trim() : ''
+  const table = typeof parsed.table === 'string' && (parsed.table.match(/\|/g) || []).length >= 2 ? parsed.table.trim() : ''
+  if (!drawing && !table) return { present: false, labelled: null, description: '', table: '' }
+  const description = [drawing, table && `Table written by the student (copied cell by cell):\n${table}`].filter(Boolean).join('\n\n')
+  // Labels are a rule for drawings only; an answer that is only a table is
+  // never capped for missing labels.
+  return { present: true, labelled: drawing ? parsed.labelled !== false : true, description, table }
 }
 
-// Describes the drawings on one page of an uploaded marking guide or
-// question paper, so diagrams in the guide itself become text the parser
-// can attach to the right marking point. imageUrl may be a data: URL.
-// pageText is the page's text, to help place each drawing. Returns
-// [{ question, description }] (empty when the page has no drawings).
-export async function describeGuideFigures(imageUrl, pageText) {
-  const systemPrompt = `You are given one page of an exam marking guide or question paper. Find every
-drawing on the page (diagram, block diagram, circuit, graph, sketch, labelled figure). Ignore
-logos, crests, signatures, stamps, plain tables of text and decorative lines.
+// Reads one page of a guide or question paper with the vision model: every
+// drawing described in words, and every table copied out row by row. OCR
+// reads a table across the page line by line, so cells from different
+// columns end up side by side; the vision model sees the grid and keeps each
+// cell in its row and column. Returns { figures, tables, ok }; ok is false
+// when the model could not be reached, so the caller can say the page was
+// not checked instead of quietly leaving its tables out.
+export async function describeGuideFigures(imageUrl, pageText, options = {}) {
+  const systemPrompt = `You are given one page of an exam marking guide or question paper.
 
-For each drawing, describe it in plain words so that someone who cannot see it could check a
-student's drawing against it: what kind of drawing it is, every part or block, the text of
-every label exactly as written, how parts are connected (arrows and their direction), and any
-axes, values or units. Also say which question it belongs to, as written on the page, for
-example "3(i)" or "2b", using the nearest question number above it; use null if unclear.
+1. DRAWINGS. Find every drawing on the page (diagram, block diagram, circuit, graph, sketch,
+labelled figure). Ignore logos, crests, signatures, stamps and decorative lines. Describe each
+in plain words so that someone who cannot see it could check a student's drawing against it:
+what kind of drawing it is, every part or block, the text of every label exactly as written,
+how parts are connected (arrows and their direction), and any axes, values or units.
+
+2. TABLES. Find every table on the page (text laid out in rows and columns, with or without
+ruled lines). Copy each one as a Markdown table: the header row first, then one line per row,
+"|" between cells, every cell kept in its own row and column. Copy the text of every cell
+exactly as written, including marks printed in headings such as "LAN (3 Marks)". Do not add,
+merge, reorder or summarise cells. If a cell is empty, leave it empty. If a table continues
+from the previous page and has no header row here, copy the rows that are here.
+
+For each drawing and table, say which question it belongs to, as written on the page, for
+example "3(i)" or "5a", using the nearest question or part number above it; use null if unclear.
 
 Respond with ONLY a JSON object of this exact shape, nothing else:
-{"figures": [{"question": "3(i)" or null, "description": "..."}]}`
+{"figures": [{"question": "3(i)" or null, "description": "..."}], "tables": [{"question": "5a" or null, "markdown": "| ... |\\n| ... |"}]}`
 
-  const parsed = await visionJson(systemPrompt, [
-    { type: 'text', text: `Text on this page:\n${String(pageText || '').slice(0, 4000)}` },
-    { type: 'image_url', image_url: { url: imageUrl } },
-  ])
-  const figures = Array.isArray(parsed?.figures) ? parsed.figures : []
-  return figures
-    .map((f) => ({
-      question: typeof f?.question === 'string' && f.question.trim() ? f.question.trim() : null,
-      description: typeof f?.description === 'string' ? f.description.trim() : '',
-    }))
+  const parsed = await visionJson(
+    systemPrompt,
+    [
+      { type: 'text', text: `Text on this page (read by OCR, tables may be out of order):\n${String(pageText || '').slice(0, 4000)}` },
+      { type: 'image_url', image_url: { url: imageUrl } },
+    ],
+    { retries: 4, sleep: options.sleep }
+  )
+  const label = (q) => (typeof q === 'string' && q.trim() ? q.trim() : null)
+  const figures = (Array.isArray(parsed?.figures) ? parsed.figures : [])
+    .map((f) => ({ question: label(f?.question), description: typeof f?.description === 'string' ? f.description.trim() : '' }))
     .filter((f) => f.description)
+  const tables = (Array.isArray(parsed?.tables) ? parsed.tables : [])
+    .map((t) => ({ question: label(t?.question), markdown: typeof t?.markdown === 'string' ? t.markdown.trim() : '' }))
+    .filter((t) => (t.markdown.match(/\|/g) || []).length >= 2)
+  return { figures, tables, ok: parsed != null }
 }
 
 // Reads the front page of a script and tries to pick out the student's reg
@@ -621,6 +665,18 @@ Rules:
   point it illustrates by copying the description into that point's "diagram" and setting
   its "note" to "DIAGRAM"; if no single point fits, put it on the first point of that
   subpart, or add it to the model answer when there are no points.
+- The text may contain blocks that start with "[TABLE for 5a]" (or "[TABLE]") and end with
+  "[END TABLE]". Each is an exact copy of a table on the page, made by a model that looked at
+  the page, with every cell in its right row and column. The plain text nearby may hold the
+  same table read out of order by OCR; where they differ, trust the TABLE block. Put the
+  table into the model answer of the question it belongs to as the Markdown table itself,
+  keeping its rows and columns, not as a list.
+- Marks printed in a table's column or row heading, such as "LAN (3 Marks)", belong to that
+  heading only. Do not copy them onto every row, and do not invent marks for rows that have
+  none printed.
+- Some questions are marked by bands instead of points, for example "Excellent (13-15
+  marks)", "Good (10-12 marks)". Keep the bands in the model answer word for word, and do not
+  turn bands into marking points.
 - Ignore headers, footers, page numbers, and instructions not part of a specific question.
 
 Respond with ONLY a JSON object of this exact shape, nothing else:
@@ -638,6 +694,7 @@ const PARSE_CONCURRENCY = 1
 // TWO", "Q3.", "Q 4". Subparts such as "(2a)" do not match.
 const QUESTION_HEADING = /^[ \t]*(?:question[ \t]*(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b|q\.?[ \t]*(\d+)\b)/gim
 const DIAGRAM_LINE = /^\[DIAGRAM for (\d+).*\][ \t]*$/gm
+const TABLE_BLOCK = /^\[TABLE for (\d+)[^\n]*\]\n[\s\S]*?\n\[END TABLE\][ \t]*$/gm
 const NUMBER_WORDS = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten']
 
 // Splits guide text into one piece per whole question, so each parser call
@@ -649,10 +706,11 @@ const NUMBER_WORDS = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'ei
 export function splitGuideByQuestion(rawText) {
   const text = String(rawText || '')
   const diagrams = []
-  const body = text.replace(DIAGRAM_LINE, (line, number) => {
+  const pull = (line, number) => {
     diagrams.push({ number, line })
     return ''
-  })
+  }
+  const body = text.replace(TABLE_BLOCK, pull).replace(DIAGRAM_LINE, pull)
   const starts = [...body.matchAll(QUESTION_HEADING)]
   if (starts.length < 2) return [text]
 
