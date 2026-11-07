@@ -85,9 +85,21 @@ export function scalePoints(points, target, countBest) {
   const quarters = [...list.map((p) => p.marks), target].every((m) => near(m * 4, Math.round(m * 4)))
   const step = quarters ? 4 : 100
   const scaled = list.map((p) => ({ ...p, marks: Math.round((p.marks * target / now) * step) / step }))
+  // Spread what rounding left over one step at a time, largest points
+  // first, so no single point takes it all; anything still left (a point
+  // would go below 0) goes on the largest point.
+  const unit = 1 / step
+  const order = scaled.map((_, i) => i).sort((a, b) => scaled[b].marks - scaled[a].marks || a - b)
+  for (let i = 0, guard = 0; guard < 1000; guard++, i = (i + 1) % order.length) {
+    const left = round2(target - bestTotal(scaled.map((p) => p.marks), n))
+    if (near(left, 0)) break
+    const k = order[i]
+    const next = round2(scaled[k].marks + Math.sign(left) * unit)
+    if (next >= 0) scaled[k] = { ...scaled[k], marks: next }
+  }
   const left = round2(target - bestTotal(scaled.map((p) => p.marks), n))
   if (!near(left, 0)) {
-    const big = scaled.reduce((best, p, i) => (p.marks > scaled[best].marks ? i : best), 0)
+    const big = order[0]
     scaled[big] = { ...scaled[big], marks: round2(Math.max(0, scaled[big].marks + left)) }
   }
   return scaled
