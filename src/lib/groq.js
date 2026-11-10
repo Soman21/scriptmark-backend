@@ -223,6 +223,12 @@ async function scoreOnce(ocrText, questions, options = {}) {
   const done = new Map() // questionId -> clean result
   let best = null // { results, problems } for the questions still open
   let lastError = null
+  // Groq's JSON mode refuses a reply that is not valid JSON with a 400
+  // (json_validate_failed), and often keeps nothing of it. The model
+  // usually manages on another try; if it fails twice, the next tries ask
+  // without JSON mode and the JSON is picked out of the plain reply.
+  let jsonMode = true
+  let jsonFailures = 0
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const isLast = attempt === maxAttempts
@@ -240,7 +246,7 @@ async function scoreOnce(ocrText, questions, options = {}) {
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: userPromptFor(ocrText, pending) },
         ],
-        response_format: { type: 'json_object' },
+        ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
         temperature: 0.2,
       }),
     })
@@ -271,6 +277,13 @@ async function scoreOnce(ocrText, questions, options = {}) {
         lastError.tokensRequested = Number(/Requested (\d+)/.exec(errText)?.[1]) || null
         throw lastError
       }
+      if (res.status === 400 && /json_validate_failed/.test(errText)) {
+        jsonFailures++
+        if (jsonFailures >= 2) jsonMode = false
+        console.warn(`Scoring attempt ${attempt} (${model}): Groq rejected the reply as invalid JSON`)
+        if (!isLast) await sleep(retryDelayMs(null, attempt))
+        continue
+      }
       // Bad key, bad request etc. will not fix themselves, so fail straight away.
       if (!RETRYABLE_STATUSES.has(res.status)) throw lastError
       if (!isLast) await sleep((res.status === 429 && groqWaitMs(errText)) || retryDelayMs(res, attempt))
@@ -282,7 +295,7 @@ async function scoreOnce(ocrText, questions, options = {}) {
       const data = await res.json()
       const content = data.choices?.[0]?.message?.content
       if (!content) throw new Error('Groq returned an empty response.')
-      const parsed = JSON.parse(content)
+      const parsed = JSON.parse(jsonMode ? content : jsonFrom(content))
       if (!Array.isArray(parsed.results)) throw new Error('Groq response has no "results" array.')
       rawResults = parsed.results
     } catch (err) {
@@ -318,6 +331,14 @@ async function scoreOnce(ocrText, questions, options = {}) {
 }
 
 const SCORE_MAX_ATTEMPTS = 3
+
+// The JSON object in a plain text reply: from the first { to the last }.
+export function jsonFrom(text) {
+  const t = String(text || '')
+  const a = t.indexOf('{')
+  const b = t.lastIndexOf('}')
+  return a >= 0 && b > a ? t.slice(a, b + 1) : t
+}
 
 const NOTE_TEXT = { DIAGRAM: ' [Labelled diagram]', LABELS_OPTIONAL: ' [Labelled diagram] [Labels optional]' }
 
