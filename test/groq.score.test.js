@@ -347,3 +347,17 @@ test('reads long waits from Groq', async () => {
   assert.equal(groqWaitFullMs('try again in 7.5s'), 7500)
   assert.equal(groqWaitFullMs('nothing'), null)
 })
+
+test('a reply Groq rejects as invalid JSON is tried again, then without JSON mode', async () => {
+  const formats = []
+  const fake = globalThis.fetch
+  globalThis.fetch = async (url, opts) => {
+    formats.push(JSON.parse(opts.body).response_format?.type || 'none')
+    return fake(url, opts)
+  }
+  const bad = { status: 400, body: '{"error":{"message":"Failed to validate JSON.","code":"json_validate_failed","failed_generation":""}}' }
+  queue.push(bad, bad, `Here you go: ${JSON.stringify({ results: good })} done`)
+  const results = await scoreScriptAgainstGuide('text', questions, noSleep)
+  assert.deepEqual(formats, ['json_object', 'json_object', 'none'])
+  assert.deepEqual(results.map((r) => r.suggestedScore), [8, 5])
+})
