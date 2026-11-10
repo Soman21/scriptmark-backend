@@ -124,11 +124,11 @@ async function requireSessionAccess(req, res, next) {
 
 const upload = fileUpload(10)
 
-// A multi page PDF is bigger than a single page image. 50 MB is about 14
-// scripts of 8 pages or 7 of 16 pages from a phone scanner. Splitting now
-// renders one page at a time, so a 46 MB PDF peaked at about 350 MB of
-// memory, inside the 512 MB of Render's free server.
-const uploadPdf = fileUpload(50)
+// A multi page PDF is bigger than a single page image. 60 MB is about 18
+// scripts of 8 pages from a phone scanner. Splitting renders one page at a
+// time, so a 60 MB, 144 page PDF peaked at about 340 MB of memory, inside
+// the 512 MB of Render's free server.
+const uploadPdf = fileUpload(60)
 
 // Batch upload keeps 25 MB a file: up to 10 files arrive in one request and
 // all sit in memory together, so 50 MB each could pass Render's 512 MB.
