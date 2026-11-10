@@ -10,7 +10,7 @@ import * as mupdf from 'mupdf'
 export const THUMB_W = 24
 export const THUMB_H = 32
 
-// grey: Uint8Array of w*h luminance values. Returns a portrait THUMB_W x
+// grey: w*h values (luminance, or the ink map below). Returns a portrait THUMB_W x
 // THUMB_H Float32Array, normalised to mean 0 and spread 1, so lighting and
 // paper colour matter less than layout.
 export function thumbnail(grey, w, h, rotation = 0) {
@@ -23,8 +23,8 @@ export function thumbnail(grey, w, h, rotation = 0) {
       const x0 = Math.floor((tx * rw) / THUMB_W), x1 = Math.max(x0 + 1, Math.floor(((tx + 1) * rw) / THUMB_W))
       const y0 = Math.floor((ty * rh) / THUMB_H), y1 = Math.max(y0 + 1, Math.floor(((ty + 1) * rh) / THUMB_H))
       let sum = 0, n = 0
-      for (let y = y0; y < y1; y += 2) {
-        for (let x = x0; x < x1; x += 2) {
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
           let sx, sy
           if (rotation === 0) { sx = x; sy = y }
           else if (rotation === 90) { sx = y; sy = h - 1 - x }
@@ -57,8 +57,43 @@ export function coverSimilarity(reference, page) {
   return Math.max(...page.map((t) => correlation(reference, t)))
 }
 
+// Scripts are often photographed rather than scanned, so one side of a page
+// can be much darker than the other, and every inside page carries the same
+// printed header and crest as the cover. Compared as raw greys, the shading
+// outweighs the layout and inside pages look as much like a cover as real
+// covers do. inkMap takes the shading out first: each pixel is compared with
+// the average of its neighbourhood (the local paper colour), so only marks
+// darker than the paper around them are left, whatever the lighting.
+export const PAPER_RADIUS = 8
+
+export function inkMap(grey, w, h, r = PAPER_RADIUS) {
+  // Summed area table, so each neighbourhood average costs four lookups.
+  const W = w + 1
+  const sat = new Float64Array(W * (h + 1))
+  for (let y = 0; y < h; y++) {
+    let row = 0
+    for (let x = 0; x < w; x++) {
+      row += grey[y * w + x]
+      sat[(y + 1) * W + x + 1] = sat[y * W + x + 1] + row
+    }
+  }
+  const out = new Float32Array(w * h)
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1)
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1)
+      const sum = sat[y1 * W + x1] - sat[y0 * W + x1] - sat[y1 * W + x0] + sat[y0 * W + x0]
+      const paper = sum / ((y1 - y0) * (x1 - x0))
+      const v = grey[y * w + x]
+      out[y * w + x] = v < paper ? (paper - v) / (paper + 1) : 0
+    }
+  }
+  return out
+}
+
 export function pageThumbnails(grey, w, h) {
-  return [0, 90, 180, 270].map((r) => thumbnail(grey, w, h, r))
+  const ink = inkMap(grey, w, h)
+  return [0, 90, 180, 270].map((r) => thumbnail(ink, w, h, r))
 }
 
 // pages: [{ grey, w, h }]. coverIndex: a page the lecturer knows is a cover
@@ -92,9 +127,16 @@ export function greyPages(pdfBuffer, scale = 0.25) {
   const doc = mupdf.Document.openDocument(pdfBuffer, 'application/pdf')
   const pages = []
   for (let i = 0; i < doc.countPages(); i++) {
-    const pix = doc.loadPage(i).toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceGray)
-    pages.push({ grey: pix.getPixels(), w: pix.getWidth(), h: pix.getHeight(), stride: pix.getStride() })
+    const page = doc.loadPage(i)
+    const pix = page.toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceGray)
+    // getPixels() is only a window onto mupdf's own memory. That memory is
+    // reused or moved as later pages are drawn, after which the window reads
+    // as empty or as another page. Copy the pixels out before moving on.
+    pages.push({ grey: new Uint8Array(pix.getPixels()), w: pix.getWidth(), h: pix.getHeight(), stride: pix.getStride() })
+    pix.destroy()
+    page.destroy()
   }
+  doc.destroy()
   return pages.map((p) => (p.stride === p.w ? p : { ...p, grey: unstride(p) }))
 }
 
