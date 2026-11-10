@@ -10,6 +10,35 @@ import { mapLimit } from './mapLimit.js'
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
 
+// Backup for scoring only. Groq gives every model its own free daily
+// allowance, so when MODEL's runs out for the day, scoring carries on with
+// this smaller model of the same family instead of pausing. Its answers are
+// labelled in the reasoning, so the lecturer, and the evaluation, can tell
+// them apart. Set GROQ_FALLBACK_MODEL to an empty value to turn it off.
+const FALLBACK_MODEL = process.env.GROQ_FALLBACK_MODEL ?? 'openai/gpt-oss-20b'
+export const BACKUP_NOTE = 'Marked by backup AI model.'
+
+// When MODEL's daily allowance is expected back (ms since epoch). Until
+// then scoring goes straight to the backup instead of asking MODEL first.
+let primaryBackAt = 0
+
+function scoringModel() {
+  return FALLBACK_MODEL && Date.now() < primaryBackAt ? FALLBACK_MODEL : MODEL
+}
+
+// Only for tests.
+export function resetScoringModel() {
+  primaryBackAt = 0
+}
+
+// "Please try again in 1h18m59.04s" in ms, with no upper cap.
+export function groqWaitFullMs(errText) {
+  const m = /try again in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s/i.exec(String(errText || ''))
+  if (!m) return null
+  const seconds = Number(m[1] || 0) * 3600 + Number(m[2] || 0) * 60 + Number(m[3])
+  return Number.isFinite(seconds) ? Math.ceil(seconds * 1000) : null
+}
+
 // Vision capable model, used ONLY for calculation heavy questions (see
 // transcribeCalculationFromImage below). Standard OCR (Google Vision) is
 // unreliable on mathematical notation, fractions, exponents, and multi step
@@ -198,6 +227,7 @@ async function scoreOnce(ocrText, questions, options = {}) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const isLast = attempt === maxAttempts
     const pending = questions.filter((q) => !done.has(q.id))
+    const model = scoringModel()
     const res = await fetch(GROQ_API_URL, {
       method: 'POST',
       headers: {
@@ -205,7 +235,7 @@ async function scoreOnce(ocrText, questions, options = {}) {
         Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
       },
       body: JSON.stringify({
-        model: MODEL,
+        model,
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: userPromptFor(ocrText, pending) },
@@ -221,6 +251,14 @@ async function scoreOnce(ocrText, questions, options = {}) {
       // Out of the day's allowance: retrying within seconds cannot help, so
       // say so straight away and let the marking run pause.
       if (res.status === 429 && /per day/i.test(errText)) {
+        // The main model is out for today: switch to the backup and send
+        // this same request again, without using up an attempt.
+        if (model === MODEL && FALLBACK_MODEL) {
+          primaryBackAt = Date.now() + Math.max(groqWaitFullMs(errText) ?? 60 * 60 * 1000, 60 * 1000)
+          console.warn(`Daily limit reached on ${MODEL}; scoring with ${FALLBACK_MODEL} until ${new Date(primaryBackAt).toISOString()}`)
+          attempt--
+          continue
+        }
         lastError.code = AI_DAILY_LIMIT
         throw lastError
       }
@@ -255,6 +293,9 @@ async function scoreOnce(ocrText, questions, options = {}) {
     }
 
     const checked = validateScoreResults(rawResults, pending)
+    if (model !== MODEL) {
+      for (const r of checked.results) r.reasoning = `${r.reasoning || ''} (${BACKUP_NOTE})`.trim()
+    }
     // Problems name the question they belong to; a question none of them
     // names came back clean and is kept.
     pending.forEach((q, i) => {
@@ -705,7 +746,7 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
         Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
       },
       body: JSON.stringify({
-        model: MODEL,
+        model: scoringModel(), // the backup while the main model is out for the day
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: pageText },
