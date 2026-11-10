@@ -10,6 +10,35 @@ import { mapLimit } from './mapLimit.js'
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
 
+// Backup for scoring only. Groq gives every model its own free daily
+// allowance, so when MODEL's runs out for the day, scoring carries on with
+// this smaller model of the same family instead of pausing. Its answers are
+// labelled in the reasoning, so the lecturer, and the evaluation, can tell
+// them apart. Set GROQ_FALLBACK_MODEL to an empty value to turn it off.
+const FALLBACK_MODEL = process.env.GROQ_FALLBACK_MODEL ?? 'openai/gpt-oss-20b'
+export const BACKUP_NOTE = 'Marked by backup AI model.'
+
+// When MODEL's daily allowance is expected back (ms since epoch). Until
+// then scoring goes straight to the backup instead of asking MODEL first.
+let primaryBackAt = 0
+
+function scoringModel() {
+  return FALLBACK_MODEL && Date.now() < primaryBackAt ? FALLBACK_MODEL : MODEL
+}
+
+// Only for tests.
+export function resetScoringModel() {
+  primaryBackAt = 0
+}
+
+// "Please try again in 1h18m59.04s" in ms, with no upper cap.
+export function groqWaitFullMs(errText) {
+  const m = /try again in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s/i.exec(String(errText || ''))
+  if (!m) return null
+  const seconds = Number(m[1] || 0) * 3600 + Number(m[2] || 0) * 60 + Number(m[3])
+  return Number.isFinite(seconds) ? Math.ceil(seconds * 1000) : null
+}
+
 // Vision capable model, used ONLY for calculation heavy questions (see
 // transcribeCalculationFromImage below). Standard OCR (Google Vision) is
 // unreliable on mathematical notation, fractions, exponents, and multi step
@@ -107,7 +136,11 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
     return await scoreOnce(ocrText, questions, options)
   } catch (err) {
     if (!err.tooLarge || questions.length < 2) throw err
-    let groups = groupByQuestion(questions)
+    // Every request carries the whole script, so the fewer requests the
+    // fewer tokens: whole questions are packed into as few requests as fit
+    // under the limit Groq gave, using Groq's own count of this request to
+    // turn characters into tokens.
+    let groups = packQuestions(ocrText, questions, err.tokenLimit, err.tokensRequested)
     if (groups.length === 1) groups = questions.map((q) => [q])
     const results = []
     for (const group of groups) {
@@ -115,6 +148,35 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
     }
     return results
   }
+}
+
+// Groups whole questions (all their parts together, in guide order) so that
+// each request stays under limit tokens. tokensRequested is Groq's count for
+// the request with every question in it, which sets how many tokens a
+// character is worth for this script. Without those numbers, one question
+// per request, as before.
+export function packQuestions(ocrText, questions, limit, tokensRequested) {
+  const byQuestion = groupByQuestion(questions)
+  if (!limit || !tokensRequested) return byQuestion
+  const fullChars = SYSTEM_PROMPT.length + userPromptFor(ocrText, questions).length
+  const perChar = tokensRequested / fullChars
+  const budget = limit * 0.9
+  const fixed = (SYSTEM_PROMPT.length + userPromptFor(ocrText, []).length) * perChar
+  const groups = []
+  let current = []
+  let size = fixed
+  for (const group of byQuestion) {
+    const cost = (questionsBlockFor(group).length + 2) * perChar
+    if (current.length && size + cost > budget) {
+      groups.push(current)
+      current = []
+      size = fixed
+    }
+    current.push(...group)
+    size += cost
+  }
+  if (current.length) groups.push(current)
+  return groups
 }
 
 // Parts of the same question stay together, in guide order.
@@ -132,10 +194,9 @@ export function groupByQuestion(questions) {
 // sent one after another.
 const SPLIT_MAX_ATTEMPTS = 6
 
-async function scoreOnce(ocrText, questions, options = {}) {
-  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
-  const maxAttempts = options.attempts || SCORE_MAX_ATTEMPTS
-  const questionsBlock = questions
+// The guide part of the scoring prompt for these questions.
+function questionsBlockFor(questions) {
+  return questions
     .map((q) => {
       const label = q.subLabel ? `Question ${q.number}${q.subLabel}` : `Question ${q.number}`
       const stepsBlock =
@@ -147,14 +208,26 @@ async function scoreOnce(ocrText, questions, options = {}) {
       return `Question ID: ${q.id}\n${label}: ${q.text}\nModel Answer: ${q.modelAnswer}\nKeywords: ${q.keywords}\nMax Marks: ${q.maxMarks}${stepsBlock}`
     })
     .join('\n\n')
+}
 
-  const userPrompt = `MARKING GUIDE:\n${questionsBlock}\n\nSTUDENT'S EXTRACTED SCRIPT TEXT (from OCR):\n${ocrText}`
+function userPromptFor(ocrText, questions) {
+  return `MARKING GUIDE:\n${questionsBlockFor(questions)}\n\nSTUDENT'S EXTRACTED SCRIPT TEXT (from OCR):\n${ocrText}`
+}
 
-  let best = null // { results, problems } with the fewest problems so far
+async function scoreOnce(ocrText, questions, options = {}) {
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  const maxAttempts = options.attempts || SCORE_MAX_ATTEMPTS
+  // Questions an earlier attempt already scored cleanly are not sent again:
+  // a retry asks only for the ones that came back missing or wrong, so it
+  // costs a fraction of the tokens of sending the whole guide again.
+  const done = new Map() // questionId -> clean result
+  let best = null // { results, problems } for the questions still open
   let lastError = null
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const isLast = attempt === maxAttempts
+    const pending = questions.filter((q) => !done.has(q.id))
+    const model = scoringModel()
     const res = await fetch(GROQ_API_URL, {
       method: 'POST',
       headers: {
@@ -162,10 +235,10 @@ async function scoreOnce(ocrText, questions, options = {}) {
         Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
       },
       body: JSON.stringify({
-        model: MODEL,
+        model,
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userPrompt },
+          { role: 'user', content: userPromptFor(ocrText, pending) },
         ],
         response_format: { type: 'json_object' },
         temperature: 0.2,
@@ -178,13 +251,24 @@ async function scoreOnce(ocrText, questions, options = {}) {
       // Out of the day's allowance: retrying within seconds cannot help, so
       // say so straight away and let the marking run pause.
       if (res.status === 429 && /per day/i.test(errText)) {
+        // The main model is out for today: switch to the backup and send
+        // this same request again, without using up an attempt.
+        if (model === MODEL && FALLBACK_MODEL) {
+          primaryBackAt = Date.now() + Math.max(groqWaitFullMs(errText) ?? 60 * 60 * 1000, 60 * 1000)
+          console.warn(`Daily limit reached on ${MODEL}; scoring with ${FALLBACK_MODEL} until ${new Date(primaryBackAt).toISOString()}`)
+          attempt--
+          continue
+        }
         lastError.code = AI_DAILY_LIMIT
         throw lastError
       }
       // One request over the per minute limit: waiting cannot help, but
       // sending fewer questions at a time can (see scoreScriptAgainstGuide).
+      // Groq says the limit and how many tokens this request came to.
       if (res.status === 413) {
         lastError.tooLarge = true
+        lastError.tokenLimit = Number(/Limit (\d+)/.exec(errText)?.[1]) || null
+        lastError.tokensRequested = Number(/Requested (\d+)/.exec(errText)?.[1]) || null
         throw lastError
       }
       // Bad key, bad request etc. will not fix themselves, so fail straight away.
@@ -208,15 +292,29 @@ async function scoreOnce(ocrText, questions, options = {}) {
       continue
     }
 
-    const checked = validateScoreResults(rawResults, questions)
-    if (checked.problems.length === 0) return checked.results
+    const checked = validateScoreResults(rawResults, pending)
+    if (model !== MODEL) {
+      for (const r of checked.results) r.reasoning = `${r.reasoning || ''} (${BACKUP_NOTE})`.trim()
+    }
+    // Problems name the question they belong to; a question none of them
+    // names came back clean and is kept.
+    pending.forEach((q, i) => {
+      if (!checked.problems.some((p) => p.includes(q.id))) done.set(q.id, checked.results[i])
+    })
+    if (done.size === questions.length) return questions.map((q) => done.get(q.id))
     console.warn(`Scoring attempt ${attempt} failed validation: ${checked.problems.join('; ')}`)
-    if (!best || checked.problems.length < best.problems.length) best = checked
+    const open = pending.filter((q) => !done.has(q.id))
+    const openResults = open.map((q) => checked.results[pending.indexOf(q)])
+    const openProblems = checked.problems.filter((p) => open.some((q) => p.includes(q.id)))
+    if (!best || openProblems.length < best.problems.length) best = { results: openResults, problems: openProblems }
     if (!isLast) await sleep(retryDelayMs(null, attempt))
   }
 
-  if (!best) throw lastError || new Error('Groq scoring failed.')
-  return best.results
+  if (done.size === 0 && !best) throw lastError || new Error('Groq scoring failed.')
+  // What is still open keeps its best attempt (forced to low confidence by
+  // validateScoreResults), or a blank "mark it manually" result.
+  const fallback = validateScoreResults([], questions).results
+  return questions.map((q, i) => done.get(q.id) || best?.results.find((r) => r.questionId === q.id) || fallback[i])
 }
 
 const SCORE_MAX_ATTEMPTS = 3
@@ -648,7 +746,7 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
         Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
       },
       body: JSON.stringify({
-        model: MODEL,
+        model: scoringModel(), // the backup while the main model is out for the day
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: pageText },

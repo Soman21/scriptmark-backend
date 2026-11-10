@@ -2,7 +2,7 @@
 // fetch so no real Groq requests are made. Run with: npm test
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { scoreScriptAgainstGuide, validateScoreResults, AI_DAILY_LIMIT } from '../src/lib/groq.js'
+import { scoreScriptAgainstGuide, validateScoreResults, AI_DAILY_LIMIT, resetScoringModel } from '../src/lib/groq.js'
 
 const questions = [
   { id: 'q1', number: '1', subLabel: null, text: 'Define OCR', modelAnswer: 'Optical character recognition', keywords: 'OCR', maxMarks: 10 },
@@ -64,6 +64,7 @@ function reply(item) {
 }
 
 beforeEach(() => {
+  resetScoringModel()
   queue = []
   calls = 0
   sleeps = []
@@ -104,9 +105,10 @@ test('retries on 503 with backoff, then succeeds', async () => {
 
 test('stops at once when the daily allowance is used up, with a code the queue can pause on', async () => {
   const body = 'Rate limit reached for model `openai/gpt-oss-120b` on tokens per day (TPD): Limit 200000, Used 199655'
-  queue.push({ status: 429, headers: { 'retry-after': '71' }, body }, good)
+  // Main model, then the backup model: both out for the day.
+  queue.push({ status: 429, headers: { 'retry-after': '71' }, body }, { status: 429, body }, good)
   await assert.rejects(scoreScriptAgainstGuide('text', questions, noSleep), (err) => err.code === AI_DAILY_LIMIT)
-  assert.equal(calls, 1)
+  assert.equal(calls, 2)
   assert.deepEqual(sleeps, [])
 })
 
@@ -281,4 +283,67 @@ test('too large for one request: scores one question at a time and waits as Groq
 test('a single question still too large fails with the reason', async () => {
   queue.push({ status: 413, body: 'Request too large' })
   await assert.rejects(scoreScriptAgainstGuide('text', [questions[0]], noSleep), /413/)
+})
+
+test('a retry asks only for the questions that came back missing', async () => {
+  const bodies = []
+  const fake = globalThis.fetch
+  globalThis.fetch = async (url, opts) => {
+    bodies.push(JSON.parse(opts.body).messages[1].content)
+    return fake(url, opts)
+  }
+  queue.push([good[0]], [good[1]])
+  const results = await scoreScriptAgainstGuide('text', questions, noSleep)
+  assert.deepEqual(results.map((r) => r.suggestedScore), [8, 5])
+  assert.ok(bodies[0].includes('Question ID: q1') && bodies[0].includes('Question ID: q2'))
+  assert.ok(!bodies[1].includes('Question ID: q1') && bodies[1].includes('Question ID: q2'))
+})
+
+test('too large: whole questions are packed into as few requests as fit', async () => {
+  const { packQuestions } = await import('../src/lib/groq.js')
+  const qs = ['1', '2', '3', '4'].flatMap((n) => [
+    { id: `${n}a`, number: n, subLabel: 'a', text: 'x'.repeat(400), modelAnswer: 'y'.repeat(400), keywords: '', maxMarks: 5 },
+    { id: `${n}b`, number: n, subLabel: 'b', text: 'x'.repeat(400), modelAnswer: 'y'.repeat(400), keywords: '', maxMarks: 5 },
+  ])
+  // Groq counted the full request a little over the limit, so two
+  // requests are needed, not one per question.
+  const groups = packQuestions('s'.repeat(100), qs, 8000, 9000)
+  assert.ok(groups.length >= 2 && groups.length < 4, `groups: ${groups.length}`)
+  for (const g of groups) assert.equal(new Set(g.map((q) => q.number)).size * 2, g.length)
+  assert.deepEqual(groups.flat().map((q) => q.id), qs.map((q) => q.id))
+})
+
+test('main model out for the day: scoring carries on with the backup model, labelled', async () => {
+  const { resetScoringModel, BACKUP_NOTE } = await import('../src/lib/groq.js')
+  resetScoringModel()
+  const models = []
+  const fake = globalThis.fetch
+  globalThis.fetch = async (url, opts) => {
+    models.push(JSON.parse(opts.body).model)
+    return fake(url, opts)
+  }
+  queue.push({ status: 429, body: 'tokens per day (TPD): Limit 200000, Used 199000. Please try again in 1h18m59.04s.' }, good, good)
+  const first = await scoreScriptAgainstGuide('text', questions, noSleep)
+  assert.deepEqual(models, ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'])
+  assert.ok(first.every((r) => r.reasoning.endsWith(`(${BACKUP_NOTE})`)))
+  // The next script goes straight to the backup.
+  await scoreScriptAgainstGuide('text', questions, noSleep)
+  assert.equal(models[2], 'openai/gpt-oss-20b')
+  resetScoringModel()
+})
+
+test('both models out for the day: marking pauses', async () => {
+  const { resetScoringModel } = await import('../src/lib/groq.js')
+  resetScoringModel()
+  const perDay = { status: 429, body: 'tokens per day (TPD). Please try again in 10m0s.' }
+  queue.push(perDay, perDay)
+  await assert.rejects(scoreScriptAgainstGuide('text', questions, noSleep), (err) => err.code === AI_DAILY_LIMIT)
+  resetScoringModel()
+})
+
+test('reads long waits from Groq', async () => {
+  const { groqWaitFullMs } = await import('../src/lib/groq.js')
+  assert.equal(groqWaitFullMs('Please try again in 1h18m59.04s.'), 4739040)
+  assert.equal(groqWaitFullMs('try again in 7.5s'), 7500)
+  assert.equal(groqWaitFullMs('nothing'), null)
 })
