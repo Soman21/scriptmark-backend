@@ -21,6 +21,7 @@ import { courseDetailsToFill } from '../lib/frontPage.js'
 import { loadEvaluationRows, buildEvaluationReport, evaluationCsv } from '../lib/evaluation.js'
 import { loadCohortReport, loadSessionComparison } from '../lib/cohort.js'
 import { accessibleSessionsWhere, canManageSession } from '../lib/access.js'
+import { teamCheck } from '../lib/teamCheck.js'
 import { pageImages, PAGE_MIME_TYPE } from '../lib/pdfSplit.js'
 import { greyPages, scoreAgainstCover, coverThreshold, groupsFromScores } from '../lib/coverDetect.js'
 import { sendEmail } from '../lib/email.js'
@@ -1591,6 +1592,78 @@ router.get('/:id/overview', requireMembership, async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not load the session overview: ' + err.message })
+  }
+})
+
+// GET /api/sessions/:id/teamCheck - asked by the frontend when the
+// coordinator presses Start Marking: are they marking alone with questions
+// nobody holds? If so it offers Add lecturers or Skip for now.
+router.get('/:id/teamCheck', requireMembership, async (req, res) => {
+  try {
+    const session = req.markingSession
+    if (!(await canManageMarkers(session, req.user.id, req.user.role))) {
+      return res.json({ otherLecturers: 0, unclaimed: 0, askToAddLecturers: false })
+    }
+    const [markers, questions] = await Promise.all([
+      prisma.sessionMarker.findMany({ where: { sessionId: session.id, status: 'APPROVED' }, select: { userId: true } }),
+      session.guideId
+        ? prisma.question.findMany({ where: { guideId: session.guideId }, select: { assignedMarkerId: true } })
+        : [],
+    ])
+    res.json(teamCheck({ markers, questions, userId: req.user.id }))
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not check lecturers: ' + err.message })
+  }
+})
+
+// POST /api/sessions/:id/assignUnclaimed - gives every question nobody holds
+// to the person asking. Used by Skip for now (body { onlyIfAlone: true }) and
+// by Assign all to me on Coordinator Overview.
+// The WHERE assignedMarkerId IS NULL is what keeps this safe: a question
+// someone claimed a moment ago is never taken from them, because the
+// database only updates rows that are still empty at the time of writing.
+router.post('/:id/assignUnclaimed', requireRole('LECTURER', 'ADMIN'), requireMembership, async (req, res) => {
+  try {
+    const session = req.markingSession
+    if (!(await canManageMarkers(session, req.user.id, req.user.role))) {
+      return res.status(403).json({ error: 'Only the coordinator of this session can assign questions.' })
+    }
+    if (!session.guideId) return res.status(400).json({ error: 'Attach a marking guide first.' })
+
+    const me = await prisma.sessionMarker.findUnique({
+      where: { sessionId_userId: { sessionId: session.id, userId: req.user.id } },
+    })
+    if (!me || me.status !== 'APPROVED') {
+      return res.status(400).json({ error: 'Join this session as a marker first.' })
+    }
+
+    // Skip for now only applies while they are still alone. If a colleague
+    // joined between the prompt opening and the click, leave the questions
+    // for them to claim.
+    if (req.body?.onlyIfAlone) {
+      const others = await prisma.sessionMarker.count({
+        where: { sessionId: session.id, status: 'APPROVED', userId: { not: req.user.id } },
+      })
+      if (others > 0) return res.json({ assigned: 0, otherLecturers: others })
+    }
+
+    const { count } = await prisma.question.updateMany({
+      where: { guideId: session.guideId, assignedMarkerId: null },
+      data: { assignedMarkerId: req.user.id },
+    })
+    if (count > 0) {
+      await logActivity({
+        type: 'QUESTIONS_ASSIGNED',
+        actor: req.user,
+        sessionId: session.id,
+        text: `${req.user.name} took ${count} unclaimed question${count === 1 ? '' : 's'} in ${session.title}`,
+      })
+    }
+    res.json({ assigned: count, otherLecturers: 0 })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Could not assign questions: ' + err.message })
   }
 })
 
