@@ -268,3 +268,17 @@ test('validate: a related wrong attempt gets the fixed attempt mark', () => {
   assert.deepEqual(results[0].stepBreakdown.map((s) => s.result), ['attempt', 'partial', 'attempt'])
   assert.equal(results[0].suggestedScore, 1)
 })
+
+test('too large for one request: scores one question at a time and waits as Groq says', async () => {
+  const tooLarge = { status: 413, body: 'Request too large for model on tokens per minute (TPM): Limit 8000, Requested 9880' }
+  queue.push(tooLarge, [good[0]], { status: 429, body: 'Rate limit reached. Please try again in 41.2s' }, [good[1]])
+  const results = await scoreScriptAgainstGuide('text', questions, noSleep)
+  assert.equal(calls, 4)
+  assert.deepEqual(results.map((r) => r.questionId), ['q1', 'q2'])
+  assert.deepEqual(sleeps, [41700])
+})
+
+test('a single question still too large fails with the reason', async () => {
+  queue.push({ status: 413, body: 'Request too large' })
+  await assert.rejects(scoreScriptAgainstGuide('text', [questions[0]], noSleep), /413/)
+})
