@@ -68,6 +68,12 @@ Also rate your own confidence in the suggested score as "high", "medium", or "lo
 Use "low" whenever the student's answer is ambiguous, the OCR text looks garbled or
 incomplete, or the question and answer are hard to match up confidently.
 
+Return exactly one result for EVERY question given, including questions the student did not
+answer (students often answer only some questions, e.g. "answer any three"). For a question
+with no answer in the script, give suggestedScore 0, answerText "", confidence "medium" and
+reasoning "Not answered". For a question with marking points, give one stepBreakdown entry for
+EVERY point, in order, including points the student missed (awarded 0).
+
 Respond with ONLY a JSON object of this exact shape, and nothing else. Omit "stepBreakdown"
 entirely for a question that has no marking points; include it, with one entry per point in
 the same order given, ONLY for a question that has them:
