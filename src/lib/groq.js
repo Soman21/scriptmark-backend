@@ -87,8 +87,48 @@ the same order given, ONLY for a question that has them:
 // best attempt is cleaned up and every affected question is forced to "low"
 // confidence, so it can never be auto accepted and a human always looks at it.
 // options.sleep is only overridden by tests, to skip the real waits.
+//
+// Too large for one request: Groq's free plan takes at most 8,000 tokens a
+// minute, and one request over that is refused outright (413), however long
+// we wait. A 15 page script with the whole ECE 542 guide came to about
+// 10,000. So when Groq says the request is too large, the guide is sent in
+// parts, one question (with all its parts) at a time, each with the whole
+// script, and the results are put back together. A question still too
+// large is split into its parts. Between parts Groq may ask us to wait for
+// the minute's allowance (429), and we wait as long as it says.
 export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) {
+  try {
+    return await scoreOnce(ocrText, questions, options)
+  } catch (err) {
+    if (!err.tooLarge || questions.length < 2) throw err
+    let groups = groupByQuestion(questions)
+    if (groups.length === 1) groups = questions.map((q) => [q])
+    const results = []
+    for (const group of groups) {
+      results.push(...(await scoreScriptAgainstGuide(ocrText, group, { ...options, attempts: SPLIT_MAX_ATTEMPTS })))
+    }
+    return results
+  }
+}
+
+// Parts of the same question stay together, in guide order.
+export function groupByQuestion(questions) {
+  const groups = new Map()
+  for (const q of questions) {
+    const key = String(q.number)
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(q)
+  }
+  return [...groups.values()]
+}
+
+// Waiting out the minute's allowance can take a few tries when parts are
+// sent one after another.
+const SPLIT_MAX_ATTEMPTS = 6
+
+async function scoreOnce(ocrText, questions, options = {}) {
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  const maxAttempts = options.attempts || SCORE_MAX_ATTEMPTS
   const questionsBlock = questions
     .map((q) => {
       const label = q.subLabel ? `Question ${q.number}${q.subLabel}` : `Question ${q.number}`
@@ -107,8 +147,8 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
   let best = null // { results, problems } with the fewest problems so far
   let lastError = null
 
-  for (let attempt = 1; attempt <= SCORE_MAX_ATTEMPTS; attempt++) {
-    const isLast = attempt === SCORE_MAX_ATTEMPTS
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const isLast = attempt === maxAttempts
     const res = await fetch(GROQ_API_URL, {
       method: 'POST',
       headers: {
@@ -135,9 +175,15 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
         lastError.code = AI_DAILY_LIMIT
         throw lastError
       }
+      // One request over the per minute limit: waiting cannot help, but
+      // sending fewer questions at a time can (see scoreScriptAgainstGuide).
+      if (res.status === 413) {
+        lastError.tooLarge = true
+        throw lastError
+      }
       // Bad key, bad request etc. will not fix themselves, so fail straight away.
       if (!RETRYABLE_STATUSES.has(res.status)) throw lastError
-      if (!isLast) await sleep(retryDelayMs(res, attempt))
+      if (!isLast) await sleep((res.status === 429 && groqWaitMs(errText)) || retryDelayMs(res, attempt))
       continue
     }
 

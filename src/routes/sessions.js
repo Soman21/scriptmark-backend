@@ -22,6 +22,7 @@ import { loadEvaluationRows, buildEvaluationReport, evaluationCsv } from '../lib
 import { loadCohortReport, loadSessionComparison } from '../lib/cohort.js'
 import { accessibleSessionsWhere, canManageSession } from '../lib/access.js'
 import { pageImages, PAGE_MIME_TYPE } from '../lib/pdfSplit.js'
+import { markFailures, recordFailure } from '../lib/markFailure.js'
 import { greyPages, scoreAgainstCover, coverThreshold, groupsFromScores } from '../lib/coverDetect.js'
 import { sendEmail } from '../lib/email.js'
 import jwt from 'jsonwebtoken'
@@ -1463,6 +1464,7 @@ async function markScript(script, guide, session) {
       where: { id: script.id },
       data: { totalScore: await scriptTotal(script.id), hasLowConfidenceScore: hasLowConfidence, status: 'SCORED' },
     })
+    markFailures.delete(script.id)
     return 'done'
   } catch (err) {
     if (err.code === AI_DAILY_LIMIT) {
@@ -1473,6 +1475,7 @@ async function markScript(script, guide, session) {
       return 'paused'
     }
     console.error(`Marking failed for script ${script.id}:`, err)
+    recordFailure(script.id, err)
     await prisma.script.update({ where: { id: script.id }, data: { status: 'FLAGGED' } }).catch(() => {})
     return 'failed'
   }
@@ -1495,6 +1498,7 @@ router.get('/:id/markingStatus', requireMembership, async (req, res) => {
         totalScore: true,
         hasLowConfidenceScore: true,
         updatedAt: true,
+        _count: { select: { answers: true } },
       },
     })
     const total = scripts.length
@@ -1504,7 +1508,14 @@ router.get('/:id/markingStatus', requireMembership, async (req, res) => {
       markedCount,
       running: markingRuns.has(req.params.id),
       paused: markingPaused.get(req.params.id) || null,
-      scripts: withDuplicateFlags(scripts),
+      // answerCount: Results lists only scripts with answers, so the page
+      // knows whether Edit can open this one. failReason: why marking
+      // failed, when this server process saw it fail.
+      scripts: withDuplicateFlags(scripts).map(({ _count, ...s }) => ({
+        ...s,
+        answerCount: _count.answers,
+        failReason: s.status === 'FLAGGED' ? markFailures.get(s.id)?.reason || null : null,
+      })),
     })
   } catch (err) {
     console.error(err)

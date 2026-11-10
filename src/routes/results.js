@@ -4,6 +4,7 @@ import prisma from '../lib/prisma.js'
 import { notifyIfSessionConfirmed } from '../lib/notifications.js'
 import { requireAuth } from '../middleware/auth.js'
 import { scoreScriptAgainstGuide } from '../lib/groq.js'
+import { markFailures, recordFailure } from '../lib/markFailure.js'
 import { applyPointScores } from '../lib/markingPoints.js'
 import { accessibleGuidesWhere, canAccessScript, canAccessSession } from '../lib/access.js'
 
@@ -36,7 +37,13 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
       return res.status(400).json({ error: 'This marking guide has no questions to score against.' })
     }
 
-    const results = await scoreScriptAgainstGuide(script.ocrText, guide.questions)
+    let results
+    try {
+      results = await scoreScriptAgainstGuide(script.ocrText, guide.questions)
+    } catch (err) {
+      recordFailure(script.id, err)
+      throw err
+    }
 
     const savedAnswers = []
     for (const r of results) {
@@ -64,8 +71,15 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
     const hasLowConfidence = savedAnswers.some((a) => a.confidence === 'low')
     const updatedScript = await prisma.script.update({
       where: { id: script.id },
-      data: { totalScore: totalSuggested, hasLowConfidenceScore: hasLowConfidence },
+      // A script that failed earlier is marked now. Before this it kept
+      // saying Needs attention after a successful Remark.
+      data: {
+        totalScore: totalSuggested,
+        hasLowConfidenceScore: hasLowConfidence,
+        ...(script.status === 'FLAGGED' || script.status === 'PENDING' || script.status === 'DIGITIZED' ? { status: 'SCORED' } : {}),
+      },
     })
+    markFailures.delete(script.id)
 
     res.json({ script: updatedScript, answers: savedAnswers, questions: guide.questions })
   } catch (err) {
