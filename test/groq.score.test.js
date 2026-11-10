@@ -282,3 +282,31 @@ test('a single question still too large fails with the reason', async () => {
   queue.push({ status: 413, body: 'Request too large' })
   await assert.rejects(scoreScriptAgainstGuide('text', [questions[0]], noSleep), /413/)
 })
+
+test('a retry asks only for the questions that came back missing', async () => {
+  const bodies = []
+  const fake = globalThis.fetch
+  globalThis.fetch = async (url, opts) => {
+    bodies.push(JSON.parse(opts.body).messages[1].content)
+    return fake(url, opts)
+  }
+  queue.push([good[0]], [good[1]])
+  const results = await scoreScriptAgainstGuide('text', questions, noSleep)
+  assert.deepEqual(results.map((r) => r.suggestedScore), [8, 5])
+  assert.ok(bodies[0].includes('Question ID: q1') && bodies[0].includes('Question ID: q2'))
+  assert.ok(!bodies[1].includes('Question ID: q1') && bodies[1].includes('Question ID: q2'))
+})
+
+test('too large: whole questions are packed into as few requests as fit', async () => {
+  const { packQuestions } = await import('../src/lib/groq.js')
+  const qs = ['1', '2', '3', '4'].flatMap((n) => [
+    { id: `${n}a`, number: n, subLabel: 'a', text: 'x'.repeat(400), modelAnswer: 'y'.repeat(400), keywords: '', maxMarks: 5 },
+    { id: `${n}b`, number: n, subLabel: 'b', text: 'x'.repeat(400), modelAnswer: 'y'.repeat(400), keywords: '', maxMarks: 5 },
+  ])
+  // Groq counted the full request a little over the limit, so two
+  // requests are needed, not one per question.
+  const groups = packQuestions('s'.repeat(100), qs, 8000, 9000)
+  assert.ok(groups.length >= 2 && groups.length < 4, `groups: ${groups.length}`)
+  for (const g of groups) assert.equal(new Set(g.map((q) => q.number)).size * 2, g.length)
+  assert.deepEqual(groups.flat().map((q) => q.id), qs.map((q) => q.id))
+})
