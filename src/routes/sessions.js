@@ -1,6 +1,6 @@
 import { scriptTotal } from '../lib/scriptTotal.js'
 import express from 'express'
-import multer from 'multer'
+import { fileUpload } from '../lib/upload.js'
 import ExcelJS from 'exceljs'
 import prisma from '../lib/prisma.js'
 import { notify, sessionManagerIds } from '../lib/notifications.js'
@@ -122,20 +122,17 @@ async function requireSessionAccess(req, res, next) {
   next()
 }
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 },
-})
+const upload = fileUpload(10)
 
-const uploadPdf = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // a multi-page PDF is bigger than a single page image
-})
+// A multi page PDF is bigger than a single page image. 50 MB is about 14
+// scripts of 8 pages or 7 of 16 pages from a phone scanner. Splitting now
+// renders one page at a time, so a 46 MB PDF peaked at about 350 MB of
+// memory, inside the 512 MB of Render's free server.
+const uploadPdf = fileUpload(50)
 
-const uploadBatch = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
-})
+// Batch upload keeps 25 MB a file: up to 10 files arrive in one request and
+// all sit in memory together, so 50 MB each could pass Render's 512 MB.
+const uploadBatch = fileUpload(25)
 
 // GET /api/sessions/lecturers - list Lecturer/Admin users, for the marker
 // selection dropdowns when creating a session or assigning questions. Must

@@ -1,7 +1,7 @@
 import express from 'express'
 import { logActivity } from '../lib/activity.js'
 import { Prisma } from '@prisma/client'
-import multer from 'multer'
+import { fileUpload } from '../lib/upload.js'
 import prisma from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { extractDocument } from '../lib/docParse.js'
@@ -12,10 +12,7 @@ import { accessibleGuidesWhere, canAccessSession, canEditGuide } from '../lib/ac
 import { cleanPoints, checkGuideTotals, cleanCountBest } from '../lib/markingPoints.js'
 import { cleanSourceFiles, withoutText } from '../lib/sourceFiles.js'
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 },
-})
+const upload = fileUpload(15)
 
 const router = express.Router()
 router.use(requireAuth)
