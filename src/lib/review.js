@@ -16,8 +16,9 @@ export function buildReviewContext(script) {
     // A question the student did not answer (common with "answer any
     // three") needs no guide text: one line keeps the request small enough
     // for the free AI plans.
-    if (!student.trim()) {
-      return `Question ID: ${q.id}\nQuestion ${q.number}${q.subLabel || ''} (${q.maxMarks} marks): not answered by the student. Current score: ${confirmed}`
+    const notAnswered = !student.trim() || (Number(a.suggestedScore) === 0 && /^not answered/i.test(String(a.reasoning || '').trim()))
+    if (notAnswered) {
+      return `Question ID: ${q.id}\nQuestion ${q.number}${q.subLabel || ''} (${q.maxMarks} marks): not answered by the student. Write it only as "Q${q.number}${q.subLabel || ''}, 0/${q.maxMarks}". Current score: ${confirmed}`
     }
     return [
       `Question ID: ${q.id}`,
@@ -36,8 +37,25 @@ export function buildReviewContext(script) {
 
 // Keeps only a usable reply, and a proposal only for a question on this
 // script with a score inside its marks.
+// The model is told to write plain prose, but it sometimes slips back into
+// lists. This takes off list markers, bold stars and long dashes so the
+// panel always reads as plain sentences.
+export function plainReply(text) {
+  return String(text)
+    .split('\n')
+    .map((line) => line
+      .replace(/^\s*(?:[•●▪◦*\-–—]|\d+[.)])(?:\s+|$)/, '')
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/^#+\s*/, '')
+      .replace(/\s*[–—]\s*/g, ', ')
+      .trim())
+    .filter((line, i, all) => line || (i > 0 && all[i - 1]))
+    .join('\n')
+    .trim()
+}
+
 export function cleanReviewReply(raw, answers) {
-  const reply = typeof raw?.reply === 'string' && raw.reply.trim() ? raw.reply.trim() : null
+  const reply = typeof raw?.reply === 'string' && raw.reply.trim() ? plainReply(raw.reply) || null : null
   let proposal = null
   const p = raw?.proposal
   if (p && typeof p === 'object') {
