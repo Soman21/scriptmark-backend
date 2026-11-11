@@ -136,17 +136,22 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
     return await scoreOnce(ocrText, questions, options)
   } catch (err) {
     if (!err.tooLarge || questions.length < 2) throw err
+    // Questions already scored cleanly before the request was given up
+    // are kept; only the rest are sent again, in smaller requests.
+    const done = err.done || new Map()
+    const rest = questions.filter((q) => !done.has(q.id))
     // Every request carries the whole script, so the fewer requests the
     // fewer tokens: whole questions are packed into as few requests as fit
     // under the limit Groq gave, using Groq's own count of this request to
-    // turn characters into tokens.
-    let groups = packQuestions(ocrText, questions, err.tokenLimit, err.tokensRequested)
-    if (groups.length === 1) groups = questions.map((q) => [q])
-    const results = []
+    // turn characters into tokens. Without Groq's numbers (the reply was
+    // cut off or came back short), the questions are split in two.
+    let groups = err.tokenLimit ? packQuestions(ocrText, rest, err.tokenLimit, err.tokensRequested) : halves(rest)
+    if (groups.length === 1) groups = halves(rest)
     for (const group of groups) {
-      results.push(...(await scoreScriptAgainstGuide(ocrText, group, { ...options, attempts: SPLIT_MAX_ATTEMPTS })))
+      const results = await scoreScriptAgainstGuide(ocrText, group, { ...options, attempts: SPLIT_MAX_ATTEMPTS })
+      results.forEach((r) => done.set(r.questionId, r))
     }
-    return results
+    return questions.map((q) => done.get(q.id))
   }
 }
 
@@ -155,6 +160,13 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
 // the request with every question in it, which sets how many tokens a
 // character is worth for this script. Without those numbers, one question
 // per request, as before.
+const MAX_PARTS_PER_REQUEST = 5
+
+// Rough size of the reply for one part, in tokens.
+function replyTokens(q) {
+  return 250 + 60 * (Array.isArray(q.steps) ? q.steps.length : 0)
+}
+
 export function packQuestions(ocrText, questions, limit, tokensRequested) {
   const byQuestion = groupByQuestion(questions)
   if (!limit || !tokensRequested) return byQuestion
@@ -166,8 +178,12 @@ export function packQuestions(ocrText, questions, limit, tokensRequested) {
   let current = []
   let size = fixed
   for (const group of byQuestion) {
-    const cost = (questionsBlockFor(group).length + 2) * perChar
-    if (current.length && size + cost > budget) {
+    // The reply counts against the same per minute limit, and it is long:
+    // each part gets a copy of the student's answer, a reason and a line
+    // per marking point. Too many parts in one request and the reply is
+    // cut off before it ends, so the space it needs is kept free too.
+    const cost = (questionsBlockFor(group).length + 2) * perChar + group.reduce((n, q) => n + replyTokens(q), 0)
+    if (current.length && (size + cost > budget || current.length + group.length > MAX_PARTS_PER_REQUEST)) {
       groups.push(current)
       current = []
       size = fixed
@@ -177,6 +193,19 @@ export function packQuestions(ocrText, questions, limit, tokensRequested) {
   }
   if (current.length) groups.push(current)
   return groups
+}
+
+// Two requests instead of one: whole questions split down the middle, or
+// the parts of a single question when there is only one.
+export function halves(questions) {
+  const byQuestion = groupByQuestion(questions)
+  if (byQuestion.length > 1) {
+    const mid = Math.ceil(byQuestion.length / 2)
+    return [byQuestion.slice(0, mid).flat(), byQuestion.slice(mid).flat()]
+  }
+  if (questions.length < 2) return [questions]
+  const mid = Math.ceil(questions.length / 2)
+  return [questions.slice(0, mid), questions.slice(mid)]
 }
 
 // Parts of the same question stay together, in guide order.
@@ -278,6 +307,9 @@ async function scoreOnce(ocrText, questions, options = {}) {
         throw lastError
       }
       if (res.status === 400 && /json_validate_failed/.test(errText)) {
+        // With several questions in one request this is usually a reply
+        // cut off before it ended, so smaller requests are the fix.
+        if (pending.length > 1) throw splitError(lastError, done)
         jsonFailures++
         if (jsonFailures >= 2) jsonMode = false
         console.warn(`Scoring attempt ${attempt} (${model}): Groq rejected the reply as invalid JSON`)
@@ -293,12 +325,16 @@ async function scoreOnce(ocrText, questions, options = {}) {
     let rawResults
     try {
       const data = await res.json()
+      if (data.choices?.[0]?.finish_reason === 'length' && pending.length > 1) {
+        throw splitError(new Error('Groq cut the reply off before it ended.'), done)
+      }
       const content = data.choices?.[0]?.message?.content
       if (!content) throw new Error('Groq returned an empty response.')
       const parsed = JSON.parse(jsonMode ? content : jsonFrom(content))
       if (!Array.isArray(parsed.results)) throw new Error('Groq response has no "results" array.')
       rawResults = parsed.results
     } catch (err) {
+      if (err.tooLarge) throw err
       lastError = err
       console.warn(`Scoring attempt ${attempt} returned an unusable reply: ${err.message}`)
       if (!isLast) await sleep(retryDelayMs(null, attempt))
@@ -323,6 +359,11 @@ async function scoreOnce(ocrText, questions, options = {}) {
     if (!isLast) await sleep(retryDelayMs(null, attempt))
   }
 
+  // Several questions still missing after every try: the model is leaving
+  // them out of a long reply, so ask for them again in smaller requests.
+  if ((best || done.size) && questions.filter((q) => !done.has(q.id)).length > 1) {
+    throw splitError(lastError || new Error('Groq left questions out of its reply.'), done)
+  }
   if (done.size === 0 && !best) throw lastError || new Error('Groq scoring failed.')
   // What is still open keeps its best attempt (forced to low confidence by
   // validateScoreResults), or a blank "mark it manually" result.
@@ -331,6 +372,14 @@ async function scoreOnce(ocrText, questions, options = {}) {
 }
 
 const SCORE_MAX_ATTEMPTS = 3
+
+// An error that means "send these questions in smaller requests", keeping
+// the questions already scored cleanly.
+function splitError(err, done) {
+  err.tooLarge = true
+  err.done = new Map(done)
+  return err
+}
 
 // The JSON object in a plain text reply: from the first { to the last }.
 export function jsonFrom(text) {
