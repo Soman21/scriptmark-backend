@@ -748,7 +748,17 @@ router.get('/scripts/:scriptId', requireScriptMembership, async (req, res) => {
 
 router.put('/scripts/:scriptId/studentInfo', requireRole('LECTURER', 'ADMIN'), requireScriptMembership, async (req, res) => {
   try {
-    const { studentName, regNumber } = req.body
+    const regNumber = typeof req.body.regNumber === 'string' ? req.body.regNumber.trim() : ''
+    let studentName = typeof req.body.studentName === 'string' ? req.body.studentName.trim() : ''
+    // A corrected reg number is matched to the class list again, so the
+    // script picks up the student's name and roster link. The typed reg
+    // number is kept as typed.
+    let classListEntryId = null
+    const match = regNumber ? matchRegNumber(regNumber, req.markingSession.classList) : null
+    if (match) {
+      classListEntryId = match.entry.id
+      if (!studentName) studentName = match.entry.name || ''
+    }
     const identifier = [studentName, regNumber].filter(Boolean).join(', ') || null
     const script = await prisma.script.update({
       where: { id: req.params.scriptId },
@@ -756,6 +766,7 @@ router.put('/scripts/:scriptId/studentInfo', requireRole('LECTURER', 'ADMIN'), r
         studentName: studentName || null,
         regNumber: regNumber || null,
         studentIdentifier: identifier,
+        classListEntryId,
       },
     })
     res.json({ ...script, duplicates: await findDuplicates(prisma, script) })

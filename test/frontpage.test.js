@@ -171,3 +171,12 @@ test('courseDetailsToFill only fills fields the lecturer left blank', () => {
   assert.deepEqual(courseDetailsToFill(session, detected), { semester: 'First', academicSession: '2025/2026' })
   assert.deepEqual(courseDetailsToFill(session, { courseCode: null, semester: null, academicSession: null }), {})
 })
+
+test('matchRegNumber rescues a slip in the year when only one student is that close', () => {
+  const list = [{ id: 'e1', name: 'Ada', regNumber: '2021364030' }, { id: 'e2', name: 'Obi', regNumber: '2021364155' }]
+  assert.equal(matchRegNumber('2001364080', list)?.entry.id, 'e1')
+  // a student with the year read exists: the year is trusted, no rescue
+  assert.equal(matchRegNumber('2001364080', [...list, { id: 'e3', name: 'Eze', regNumber: '2001999999' }]), null)
+  // two students equally close: never guessed
+  assert.equal(matchRegNumber('2001364080', [{ id: 'a', regNumber: '2021364030' }, { id: 'b', regNumber: '2011364090' }]), null)
+})
