@@ -16,6 +16,13 @@ test('review context carries the guide, the answer and the current score for eac
   assert.match(c, /Current score: not confirmed yet/)
 })
 
+test('a question the student did not answer is one short line, without the guide', () => {
+  const blank = { ...answers[0], id: 'a3', extractedText: '  ', question: { ...answers[0].question, id: 'q3', number: '3' } }
+  const c = buildReviewContext({ answers: [blank] })
+  assert.match(c, /Question 3 \(5 marks\): not answered by the student\. Current score: not confirmed yet/)
+  assert.doesNotMatch(c, /Model answer/)
+})
+
 test('a proposal is kept only for a question on the script, with the score inside its marks', () => {
   const ok = cleanReviewReply({ reply: ' Fine. ', proposal: { questionId: 'q1', score: 3.3, reason: 'Gave the definition.' } }, answers)
   assert.deepEqual(ok, { reply: 'Fine.', proposal: { answerId: 'a1', questionId: 'q1', label: 'Question 1', score: 3.5, maxMarks: 5, reason: 'Gave the definition.' } })

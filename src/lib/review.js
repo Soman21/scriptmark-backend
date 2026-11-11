@@ -13,6 +13,12 @@ export function buildReviewContext(script) {
       ? `${a.confirmedScore} (${a.autoAccepted ? 'auto accepted because the AI was highly confident' : 'confirmed by a lecturer'})`
       : 'not confirmed yet'
     const student = (a.visionTranscript || a.extractedText || '').slice(0, MAX_TEXT)
+    // A question the student did not answer (common with "answer any
+    // three") needs no guide text: one line keeps the request small enough
+    // for the free AI plans.
+    if (!student.trim()) {
+      return `Question ID: ${q.id}\nQuestion ${q.number}${q.subLabel || ''} (${q.maxMarks} marks): not answered by the student. Current score: ${confirmed}`
+    }
     return [
       `Question ID: ${q.id}`,
       `Question ${q.number}${q.subLabel || ''} (${q.maxMarks} marks): ${q.text}`,
