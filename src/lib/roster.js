@@ -61,7 +61,25 @@ export function matchRegNumber(detectedRegNumber, entries) {
   }
 
   if (best && bestDistance <= 2) return { entry: best, matchType: 'fuzzy' }
-  return null
+
+  // A slip in the year itself (a handwritten 2 read as 0 turns 2021 into
+  // 2001). Only tried when no student on the list shares the year read,
+  // and only accepted when exactly one student is within 2 digits of the
+  // whole number, so a near tie between two students is never guessed.
+  const sameYear = entries.some((e) => (normalizeRegNumber(e.regNumber).match(REG_NUMBER_PATTERN) || [])[1] === targetMatch[1])
+  if (sameYear) return null
+  const flat = `${targetMatch[1]}${targetMatch[2]}`
+  const close = []
+  for (const e of entries) {
+    const m = normalizeRegNumber(e.regNumber).match(REG_NUMBER_PATTERN)
+    if (!m || m[3] !== targetMatch[3]) continue
+    const d = editDistance(flat, `${m[1]}${m[2]}`)
+    if (d <= 2) close.push({ e, d })
+  }
+  if (close.length === 0) return null
+  const min = Math.min(...close.map((c) => c.d))
+  const nearest = close.filter((c) => c.d === min)
+  return nearest.length === 1 ? { entry: nearest[0].e, matchType: 'fuzzy' } : null
 }
 
 // OCR on handwriting often reads a 0 as O or a 1 as l/I/|. Only these
