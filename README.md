@@ -38,6 +38,8 @@ Create a `.env` file in this folder with:
 | `SUPABASE_SECRET_KEY` | From step 2 |
 | `GOOGLE_CREDENTIALS_JSON` | Entire contents of the downloaded `.json` key, minified to one line, single quoted |
 | `GROQ_API_KEY` | From Groq console |
+| `CLOUDFLARE_ACCOUNT_ID` | Optional. Cloudflare dashboard, Account ID. The assistants and examiner's report then run on Cloudflare Workers AI and leave Groq's allowance to marking |
+| `CLOUDFLARE_API_TOKEN` | Optional, with the above. A token with the Workers AI permission |
 
 ## 4. Install and migrate
 ```bash
