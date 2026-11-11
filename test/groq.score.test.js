@@ -307,7 +307,7 @@ test('too large: whole questions are packed into as few requests as fit', async 
   ])
   // Groq counted the full request a little over the limit, so two
   // requests are needed, not one per question.
-  const groups = packQuestions('s'.repeat(100), qs, 8000, 9000)
+  const groups = packQuestions('s'.repeat(100), qs, 8000, 8500)
   assert.ok(groups.length >= 2 && groups.length < 4, `groups: ${groups.length}`)
   for (const g of groups) assert.equal(new Set(g.map((q) => q.number)).size * 2, g.length)
   assert.deepEqual(groups.flat().map((q) => q.id), qs.map((q) => q.id))
@@ -356,8 +356,49 @@ test('a reply Groq rejects as invalid JSON is tried again, then without JSON mod
     return fake(url, opts)
   }
   const bad = { status: 400, body: '{"error":{"message":"Failed to validate JSON.","code":"json_validate_failed","failed_generation":""}}' }
-  queue.push(bad, bad, `Here you go: ${JSON.stringify({ results: good })} done`)
-  const results = await scoreScriptAgainstGuide('text', questions, noSleep)
+  queue.push(bad, bad, `Here you go: ${JSON.stringify({ results: [good[0]] })} done`)
+  const results = await scoreScriptAgainstGuide('text', [questions[0]], noSleep)
   assert.deepEqual(formats, ['json_object', 'json_object', 'none'])
+  assert.deepEqual(results.map((r) => r.suggestedScore), [8])
+})
+
+test('packing keeps at most five parts in one request', async () => {
+  const { packQuestions } = await import('../src/lib/groq.js')
+  const qs = ['1', '2', '3', '4', '5', '6', '7'].map((n) => ({ id: n, number: n, subLabel: null, text: 'x', modelAnswer: 'y', keywords: '', maxMarks: 5 }))
+  const groups = packQuestions('s', qs, 8000, 8100)
+  assert.ok(groups.every((g) => g.length <= 5))
+  assert.deepEqual(groups.flat().map((q) => q.id), qs.map((q) => q.id))
+})
+
+test('a JSON reject with several questions sends them again in two smaller requests', async () => {
+  const bad = { status: 400, body: '{"error":{"code":"json_validate_failed"}}' }
+  queue.push(bad, [good[0]], [good[1]])
+  const results = await scoreScriptAgainstGuide('text', questions, noSleep)
+  assert.equal(calls, 3)
   assert.deepEqual(results.map((r) => r.suggestedScore), [8, 5])
+})
+
+test('a reply cut off for length is split into smaller requests', async () => {
+  const fake = globalThis.fetch
+  let first = true
+  globalThis.fetch = async (url, opts) => {
+    if (first) {
+      first = false
+      calls++
+      return { ok: true, status: 200, headers: new Headers(), json: async () => ({ choices: [{ finish_reason: 'length', message: { content: '{"results":[' } }] }) }
+    }
+    return fake(url, opts)
+  }
+  queue.push([good[0]], [good[1]])
+  const results = await scoreScriptAgainstGuide('text', questions, noSleep)
+  assert.equal(calls, 3)
+  assert.deepEqual(results.map((r) => r.suggestedScore), [8, 5])
+})
+
+test('questions still missing after every try are asked for again in smaller requests, keeping the clean ones', async () => {
+  const qs = [...questions, { ...questions[0], id: 'q3', number: '3' }]
+  const third = { ...good[0], questionId: 'q3', suggestedScore: 6 }
+  queue.push([good[0]], [], [], [good[1]], [third])
+  const results = await scoreScriptAgainstGuide('text', qs, noSleep)
+  assert.deepEqual(results.map((r) => r.suggestedScore), [8, 5, 6])
 })
