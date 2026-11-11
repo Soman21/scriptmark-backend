@@ -34,6 +34,8 @@ test('assistant questions go to Cloudflare when it is set up', async () => {
   assert.equal(sent.length, 1)
   assert.match(sent[0].url, /api\.cloudflare\.com\/client\/v4\/accounts\/acct\/ai\/v1\/chat\/completions/)
   assert.equal(sent[0].body.model, '@cf/openai/gpt-oss-120b')
+  // Cloudflare's default of 256 tokens is used up by the model's thinking.
+  assert.equal(sent[0].body.max_tokens, 4096)
 })
 
 test('Cloudflare allowance used up: the question goes to the Groq backup model', async () => {
