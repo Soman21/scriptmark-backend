@@ -1289,33 +1289,69 @@ const ASSISTANT_TOOLS = [
   },
 ]
 
-// One Groq round trip, returning the raw assistant message (which may carry
+// The assistants (AI Assistant, marking assistant, page assistant and the
+// examiner's report) run on Cloudflare Workers AI when it is set up, so
+// their questions never use the Groq allowance that marking needs. It is
+// the same gpt-oss-120b model, on Cloudflare's own free daily allowance,
+// and Cloudflare keeps no prompts. When Cloudflare is not set up, or its
+// allowance is used up, the request goes to Groq's backup model instead.
+const CLOUDFLARE_MODEL = process.env.CLOUDFLARE_AI_MODEL || '@cf/openai/gpt-oss-120b'
+
+function cloudflareUrl() {
+  const account = process.env.CLOUDFLARE_ACCOUNT_ID
+  return account && process.env.CLOUDFLARE_API_TOKEN
+    ? `https://api.cloudflare.com/client/v4/accounts/${account}/ai/v1/chat/completions`
+    : null
+}
+
+// body: an OpenAI style chat request without "model". Returns the reply
+// message. Which service answered is in message.servedBy, for the logs.
+export async function assistantChat(body) {
+  const url = cloudflareUrl()
+  if (url) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
+        body: JSON.stringify({ ...body, model: CLOUDFLARE_MODEL }),
+      })
+      if (!res.ok) throw new Error(`Cloudflare AI error (${res.status}): ${await res.text()}`)
+      const message = (await res.json()).choices?.[0]?.message
+      if (!message || (!message.content && !message.tool_calls?.length)) throw new Error('Cloudflare AI returned an empty response.')
+      return { ...message, servedBy: 'cloudflare' }
+    } catch (err) {
+      console.warn(`Assistant on Cloudflare failed, using Groq instead: ${err.message}`)
+    }
+  }
+  const res = await fetch(GROQ_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+    body: JSON.stringify({ ...body, model: FALLBACK_MODEL || MODEL }),
+  })
+  if (!res.ok) throw new Error(`Groq API error (${res.status}): ${await res.text()}`)
+  const message = (await res.json()).choices?.[0]?.message
+  if (!message) throw new Error('Groq returned an empty response.')
+  return { ...message, servedBy: 'groq' }
+}
+
+// A JSON reply from the assistant: JSON mode is not asked for (not every
+// service supports it the same way), so the object is taken from the text.
+async function assistantJson(body) {
+  const message = await assistantChat(body)
+  if (!message.content) throw new Error('The assistant returned an empty response.')
+  return JSON.parse(jsonFrom(message.content))
+}
+
+// One round trip, returning the raw assistant message (which may carry
 // tool_calls instead of, or alongside, content) so the caller can execute
 // tools and loop. Kept separate from the tool-execution loop itself, which
 // needs Prisma access and therefore lives in the assistant route, not here.
 export async function chatWithAssistantTools(messages) {
-  const res = await fetch(GROQ_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [{ role: 'system', content: ASSISTANT_SYSTEM_PROMPT }, ...messages],
-      tools: ASSISTANT_TOOLS,
-      temperature: 0.6,
-    }),
+  const { servedBy, ...message } = await assistantChat({
+    messages: [{ role: 'system', content: ASSISTANT_SYSTEM_PROMPT }, ...messages],
+    tools: ASSISTANT_TOOLS,
+    temperature: 0.6,
   })
-
-  if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(`Groq API error (${res.status}): ${errText}`)
-  }
-
-  const data = await res.json()
-  const message = data.choices?.[0]?.message
-  if (!message) throw new Error('Groq returned an empty response.')
   return message
 }
 const REVIEW_SYSTEM_PROMPT = `You are the ScriptMark marking assistant. A lecturer is reviewing one
@@ -1337,54 +1373,26 @@ Respond with ONLY a JSON object:
 Propose at most one score change per reply, only when it would differ from the current score.`
 
 export async function reviewScriptChat(context, messages) {
-  const res = await fetch(GROQ_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: REVIEW_SYSTEM_PROMPT },
-        { role: 'system', content: context },
-        ...messages,
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.3,
-    }),
+  return assistantJson({
+    messages: [
+      { role: 'system', content: REVIEW_SYSTEM_PROMPT },
+      { role: 'system', content: context },
+      ...messages,
+    ],
+    temperature: 0.3,
   })
-  if (!res.ok) throw new Error(`Groq API error (${res.status}): ${await res.text()}`)
-  const data = await res.json()
-  const content = data.choices?.[0]?.message?.content
-  if (!content) throw new Error('Groq returned an empty response.')
-  return JSON.parse(content)
 }
 
 // The chat helper on a ScriptMark page; see pageAssistant.js.
 export async function pageAssistantChat(systemPrompt, context, messages) {
-  const res = await fetch(GROQ_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'system', content: `Page summary:\n${context}` },
-        ...messages,
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.2,
-    }),
+  return assistantJson({
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'system', content: `Page summary:\n${context}` },
+      ...messages,
+    ],
+    temperature: 0.2,
   })
-  if (!res.ok) throw new Error(`Groq API error (${res.status}): ${await res.text()}`)
-  const data = await res.json()
-  const content = data.choices?.[0]?.message?.content
-  if (!content) throw new Error('Groq returned an empty response.')
-  return JSON.parse(content)
 }
 
 const SHARE_MARKS_SYSTEM_PROMPT = `You are an experienced examiner checking a marking guide. One question's
