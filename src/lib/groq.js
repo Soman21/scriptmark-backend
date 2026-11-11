@@ -1296,6 +1296,7 @@ const ASSISTANT_TOOLS = [
 // and Cloudflare keeps no prompts. When Cloudflare is not set up, or its
 // allowance is used up, the request goes to Groq's backup model instead.
 const CLOUDFLARE_MODEL = process.env.CLOUDFLARE_AI_MODEL || '@cf/openai/gpt-oss-120b'
+const CLOUDFLARE_MAX_TOKENS = 4096
 
 function cloudflareUrl() {
   const account = process.env.CLOUDFLARE_ACCOUNT_ID
@@ -1313,11 +1314,16 @@ export async function assistantChat(body) {
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` },
-        body: JSON.stringify({ ...body, model: CLOUDFLARE_MODEL }),
+        // Cloudflare stops a reply at 256 tokens unless told otherwise, and
+        // gpt-oss spends those on its thinking first, leaving no answer.
+        body: JSON.stringify({ max_tokens: CLOUDFLARE_MAX_TOKENS, ...body, model: CLOUDFLARE_MODEL }),
       })
       if (!res.ok) throw new Error(`Cloudflare AI error (${res.status}): ${await res.text()}`)
-      const message = (await res.json()).choices?.[0]?.message
-      if (!message || (!message.content && !message.tool_calls?.length)) throw new Error('Cloudflare AI returned an empty response.')
+      const choice = (await res.json()).choices?.[0]
+      const message = choice?.message
+      if (!message || (!message.content && !message.tool_calls?.length)) {
+        throw new Error(`Cloudflare AI returned an empty response (finish reason: ${choice?.finish_reason || 'none'}).`)
+      }
       return { ...message, servedBy: 'cloudflare' }
     } catch (err) {
       console.warn(`Assistant on Cloudflare failed, using Groq instead: ${err.message}`)
