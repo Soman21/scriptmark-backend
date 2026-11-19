@@ -40,6 +40,10 @@ before(async () => {
   app.use('/api/courses', (await import('../src/routes/courses.js')).default)
   app.use('/api/admin', (await import('../src/routes/admin.js')).default)
   app.use('/api/track', (await import('../src/routes/track.js')).default)
+  app.use('/api/marked', (await import('../src/routes/marked.js')).default)
+  // A page image for the marked script PDF, served like Supabase would.
+  const pageJpg = (await import('node:fs')).readFileSync(new URL('./fixtures/page.jpg', import.meta.url))
+  app.get('/img/page.jpg', (req, res) => res.type('image/jpeg').send(pageJpg))
   await new Promise((resolve) => {
     server = app.listen(0, resolve)
   })
@@ -909,4 +913,116 @@ test('marking: the AI daily limit pauses the run without flagging, and Mark resu
   }
   assert.equal(status.paused, null)
   assert.deepEqual(status.scripts.map((x) => x.status), ['SCORED', 'SCORED', 'SCORED'])
+})
+
+// Raw request for binary replies (PDF and zip).
+async function fetchRaw(method, path, token, body) {
+  const res = await fetch(`${base}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  return { status: res.status, type: res.headers.get('content-type'), disposition: res.headers.get('content-disposition'), buffer: Buffer.from(await res.arrayBuffer()) }
+}
+
+test('marked script: confirm saves the remark, PDF only once every score is confirmed', { skip }, async () => {
+  const img = base.replace('/api', '/img/page.jpg')
+  const script = await prisma.script.create({
+    data: {
+      sessionId: b.session.id,
+      studentName: 'Ink Student',
+      regNumber: '2021364080',
+      status: 'SCORED',
+      ocrText: 'Front\n\n--- page break ---\n\n1 The z transform is X(z) = sum of x[n] z^-n over all n',
+      pages: {
+        create: [
+          { pageNumber: 1, imageUrl: img, ocrLines: [["EXAMINER'S USE ONLY", 0.73, 0.17, 0.15, 0.015], ['QUESTION NUMBER', 0.62, 0.64, 0.12, 0.02], ['REMARK', 0.76, 0.645, 0.1, 0.015], ['1', 0.66, 0.675, 0.02, 0.02], ['TOTAL', 0.63, 0.905, 0.08, 0.02]] },
+          { pageNumber: 2, imageUrl: img, ocrLines: [['1 The z transform is', 0.1, 0.2, 0.5, 0.02], ['X(z) = sum of x[n] z^-n over all n', 0.1, 0.24, 0.6, 0.02]] },
+        ],
+      },
+    },
+  })
+  const answer = await prisma.scriptAnswer.create({
+    data: { scriptId: script.id, questionId: b.guide.questions[0].id, suggestedScore: 4, confidence: 'medium', extractedText: 'The z transform is X(z) = sum of x[n] z^-n over all n', remark: 'Good definition' },
+  })
+
+  const view = await call('GET', `/marked/scripts/${script.id}`, users.bola)
+  assert.equal(view.status, 200)
+  assert.equal(view.body.ready, false)
+  assert.equal(view.body.hasPositions, true)
+  assert.equal(view.body.anchors[answer.id].page, 2)
+  assert.ok(view.body.cover.totalAt)
+  assert.equal(view.body.answered[answer.id], true)
+  assert.equal(view.body.pages[0].ocrLines, undefined, 'positions stay on the server')
+
+  const early = await call('GET', `/marked/scripts/${script.id}/pdf`, users.bola)
+  assert.equal(early.status, 409)
+  assert.equal(early.body.error, 'Confirm all scores first.')
+
+  // A lecturer outside the session cannot see the script, or its ink.
+  users.dayo = (await signup('Dayo', 'LECTURER')).token
+  assert.equal((await call('GET', `/marked/scripts/${script.id}`, users.dayo)).status, 403)
+  assert.equal((await call('PUT', `/marked/scripts/${script.id}/ink/2`, users.dayo, { items: [] })).status, 403)
+
+  const confirmed = await call('PUT', `/results/${answer.id}/confirm`, users.bola, { confirmedScore: 4, remark: '  Clear definition  ' })
+  assert.equal(confirmed.status, 200)
+  assert.equal(confirmed.body.remark, 'Clear definition')
+
+  const ink = await call('PUT', `/marked/scripts/${script.id}/ink/2`, users.bola, { items: [{ k: 'text', x: 0.1, y: 0.6, t: 'See me' }, { k: 'pen', pts: [[0.1, 0.3], [0.5, 0.31]] }] })
+  assert.equal(ink.status, 200)
+  assert.equal(ink.body.items.length, 2)
+  assert.equal((await call('GET', `/marked/scripts/${script.id}`, users.bola)).body.ink[2].length, 2)
+
+  const pdf = await fetchRaw('GET', `/marked/scripts/${script.id}/pdf`, users.bola)
+  assert.equal(pdf.status, 200)
+  assert.equal(pdf.type, 'application/pdf')
+  assert.match(pdf.disposition, /attachment; filename="2021364080 ECE512Bola Marked.pdf"/)
+  const text = pdf.buffer.toString('latin1')
+  assert.equal((text.match(/\/Type \/Page\b/g) || []).length, 2, 'one PDF page per script page')
+  assert.match(text, /Caveat/, 'the handwriting font is embedded')
+  ;(await import('node:fs')).writeFileSync('/tmp/marked-test.pdf', pdf.buffer)
+
+  const inline = await fetchRaw('GET', `/marked/scripts/${script.id}/pdf?inline=1`, users.bola)
+  assert.match(inline.disposition, /^inline/)
+
+  // Clearing the page removes the row.
+  await call('PUT', `/marked/scripts/${script.id}/ink/2`, users.bola, { items: [] })
+  assert.equal(await prisma.scriptInk.count({ where: { scriptId: script.id } }), 0)
+})
+
+test('marked scripts: the session list and the download in a zip or one PDF', { skip }, async () => {
+  const ready = await call('GET', `/marked/sessions/${b.session.id}/ready`, users.bola)
+  assert.equal(ready.status, 200)
+  const ink = ready.body.scripts.find((s) => s.studentName === 'Ink Student')
+  assert.equal(ink.ready, true)
+  const pending = await prisma.script.create({ data: { sessionId: b.session.id, studentName: 'Not Yet', status: 'SCORED' } })
+  await prisma.scriptAnswer.create({ data: { scriptId: pending.id, questionId: b.guide.questions[0].id, suggestedScore: 2 } })
+  const again = await call('GET', `/marked/sessions/${b.session.id}/ready`, users.bola)
+  const notReady = again.body.scripts.find((s) => s.id === pending.id)
+  assert.equal(notReady.ready, false)
+  assert.equal(ready.body.perDownload, 10)
+  assert.equal((await call('GET', `/marked/sessions/${b.session.id}/ready`, users.dayo)).status, 403)
+
+  const zip = await fetchRaw('POST', `/marked/sessions/${b.session.id}/download`, users.bola, { scriptIds: [ink.id, notReady.id], format: 'separate' })
+  assert.equal(zip.status, 200)
+  assert.equal(zip.type, 'application/zip')
+  const JSZip = (await import('jszip')).default
+  const files = Object.keys((await JSZip.loadAsync(zip.buffer)).files)
+  assert.deepEqual(files, ['2021364080 ECE512Bola Marked.pdf'], 'the unconfirmed script is skipped')
+
+  const one = await fetchRaw('POST', `/marked/sessions/${b.session.id}/download`, users.bola, { scriptIds: [ink.id], format: 'combined' })
+  assert.equal(one.type, 'application/pdf')
+
+  const none = await call('POST', `/marked/sessions/${b.session.id}/download`, users.bola, { scriptIds: [notReady.id] })
+  assert.equal(none.status, 409)
+  const many = await call('POST', `/marked/sessions/${b.session.id}/download`, users.bola, { scriptIds: Array.from({ length: 11 }, (_, i) => `s${i}`) })
+  assert.equal(many.status, 400)
+  // Another session's script cannot be pulled into this download.
+  const other = await call('POST', `/marked/sessions/${b.session.id}/download`, users.bola, { scriptIds: [c.script.id] })
+  assert.equal(other.status, 409)
+})
+
+test('marking keeps the AI remark and the page line positions', { skip }, async () => {
+  const s = await prisma.script.findFirst({ where: { studentName: 'Ink Student' }, include: { answers: true } })
+  assert.equal(s.answers[0].remark, 'Clear definition')
 })

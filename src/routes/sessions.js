@@ -28,6 +28,11 @@ import { greyPages, scoreAgainstCover, coverThreshold, groupsFromScores } from '
 import { sendEmail } from '../lib/email.js'
 import jwt from 'jsonwebtoken'
 
+// Page fields sent to the browser. ocrLines (where each line sits on the
+// page, about 10 KB a page) stays on the server, where the marked script is
+// drawn; a session of 150 scripts would otherwise send megabytes more.
+const PAGE_FIELDS = { id: true, scriptId: true, pageNumber: true, imageUrl: true, ocrText: true, ocrConfidence: true, createdAt: true }
+
 const router = express.Router()
 // GET /api/sessions/approveByLink and /denyByLink - the one-click buttons in
 // the request-notification email. Deliberately placed BEFORE requireAuth
@@ -735,7 +740,7 @@ router.get('/scripts/:scriptId', requireScriptMembership, async (req, res) => {
   const script = await prisma.script.findUnique({
     where: { id: req.params.scriptId },
     include: {
-      pages: { orderBy: { pageNumber: 'asc' } },
+      pages: { orderBy: { pageNumber: 'asc' }, select: PAGE_FIELDS },
       answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } },
       session: { select: { guide: { select: { answerRule: true } } } },
     },
@@ -780,7 +785,7 @@ router.get('/:id/scripts', requireMembership, async (req, res) => {
     where: { sessionId: req.params.id },
     include: {
       answers: { include: { question: true }, orderBy: { question: { order: 'asc' } } },
-      pages: { orderBy: { pageNumber: 'asc' } },
+      pages: { orderBy: { pageNumber: 'asc' }, select: PAGE_FIELDS },
     },
     orderBy: { uploadedAt: 'asc' },
   })
@@ -826,10 +831,12 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
 
     let pageText = ''
     let pageConfidence = 0
+    let pageLines = null
     try {
       const result = await extractTextFromImage(imageUrl)
       pageText = result.text
       pageConfidence = result.confidence
+      pageLines = result.lines || null
     } catch (ocrErr) {
       console.error('OCR failed on page:', ocrErr)
       await prisma.scriptPage.create({
@@ -837,13 +844,13 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
       })
       await prisma.script.update({ where: { id: script.id }, data: { status: 'FLAGGED' } })
       return res.status(207).json({
-        script: await prisma.script.findUnique({ where: { id: script.id }, include: { pages: true } }),
+        script: await prisma.script.findUnique({ where: { id: script.id }, include: { pages: { select: PAGE_FIELDS } } }),
         warning: `Page ${pageNumber} uploaded, but OCR failed on it. The script has been flagged for manual review.`,
       })
     }
 
     await prisma.scriptPage.create({
-      data: { scriptId: script.id, pageNumber, imageUrl, ocrText: pageText, ocrConfidence: pageConfidence },
+      data: { scriptId: script.id, pageNumber, imageUrl, ocrText: pageText, ocrConfidence: pageConfidence, ...(pageLines ? { ocrLines: pageLines } : {}) },
     })
 
     // Front page of a brand new script, no name/reg typed in: try to read them
@@ -885,7 +892,7 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
     const updated = await prisma.script.update({
       where: { id: script.id },
       data: { ocrText: combinedText, ocrConfidence: avgConfidence, status: 'DIGITIZED' },
-      include: { pages: { orderBy: { pageNumber: 'asc' } } },
+      include: { pages: { orderBy: { pageNumber: 'asc' }, select: PAGE_FIELDS } },
     })
 
     const duplicates = isFirstPageOfNewScript ? await findDuplicates(prisma, updated) : []
@@ -1218,6 +1225,7 @@ async function remarkAnswers(answers, questions, session) {
         data: {
           suggestedScore: r.suggestedScore,
           reasoning: r.reasoning,
+          remark: r.remark || null,
           confidence: r.confidence || null,
           extractedText: r.answerText || a.extractedText,
           stepBreakdown: r.stepBreakdown || null,
@@ -1327,7 +1335,9 @@ async function markScript(script, guide, session) {
         const result = await extractTextFromImage(page.imageUrl)
         await prisma.scriptPage.update({
           where: { id: page.id },
-          data: { ocrText: result.text, ocrConfidence: result.confidence },
+          // The line positions come in the same reply; kept for the marked
+          // script's red ink (see markedLayout.js).
+          data: { ocrText: result.text, ocrConfidence: result.confidence, ...(result.lines ? { ocrLines: result.lines } : {}) },
         })
         return result
       })
@@ -1456,6 +1466,7 @@ async function markScript(script, guide, session) {
       const answerData = {
         suggestedScore: r.suggestedScore,
         reasoning: r.reasoning,
+        remark: r.remark || null,
         confidence: r.confidence || null,
         extractedText: r.answerText || ocrText,
         visionTranscript: r.visionTranscript || null,

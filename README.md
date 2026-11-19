@@ -62,6 +62,8 @@ Runs on `http://localhost:4000`. Check with `curl http://localhost:4000/api/heal
 - Student name and reg number detection from the front page, with manual override.
 - AI scoring of a script against the guide (Groq, `openai/gpt-oss-120b`). It is always a suggestion, and drawn or table answers always go to review.
 - Human confirmation of scores. Script totals follow the answer rule: every answer is marked, but only the compulsory questions and the best others count.
+- Remarks: a few words per answer for the student, drafted by the AI with the score and edited by the lecturer.
+- Marked scripts (`/api/marked`): the student's pages with ticks, circled marks, remarks and the cover total in red handwriting (Caveat font, OFL), drawn from the confirmed scores on every download, so it never goes out of date. Mark positions come from the OCR line positions kept on each page. Lecturers can add their own ink (pen, text, tick, cross, moved marks), kept apart from the page images. Single PDF, print view, and session downloads in groups of 10 (zip of PDFs, or one PDF for printing).
 - CA score entry, Excel and PDF export with grades, analytics from confirmed scores.
 - AI assistant chat for the guide, results and pages.
 - Admin page: lecturers, admins and site activity.
