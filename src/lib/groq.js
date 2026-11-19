@@ -93,6 +93,12 @@ For each question, also copy out the specific portion of the student's text that
 THAT question (not the whole script) — this lets a human reviewer see exactly what you
 scored, side by side with the expected answer.
 
+Also write a "remark": at most 8 plain words for the STUDENT, written on their script beside
+the mark the way a lecturer writes in red ink, for example "Correct formula, wrong units",
+"Missing primary keys" or "Well explained". It must agree with the score: never say something
+is missing when you gave full marks. No marks or numbers of marks in the remark. For a question
+the student did not answer, the remark is "".
+
 Also rate your own confidence in the suggested score as "high", "medium", or "low".
 Use "low" whenever the student's answer is ambiguous, the OCR text looks garbled or
 incomplete, or the question and answer are hard to match up confidently.
@@ -106,7 +112,7 @@ EVERY point, in order, including points the student missed (awarded 0).
 Respond with ONLY a JSON object of this exact shape, and nothing else. Omit "stepBreakdown"
 entirely for a question that has no marking points; include it, with one entry per point in
 the same order given, ONLY for a question that has them:
-{"results": [{"questionId": "the question's id", "suggestedScore": number, "answerText": "the relevant portion of the student's text for this question", "confidence": "high" | "medium" | "low", "reasoning": "a short, specific explanation", "stepBreakdown": [{"description": "the point as given", "marks": number, "awarded": number, "attempt": false, "reasoning": "short reason for this point's award"}]}]}`
+{"results": [{"questionId": "the question's id", "suggestedScore": number, "answerText": "the relevant portion of the student's text for this question", "confidence": "high" | "medium" | "low", "reasoning": "a short, specific explanation", "remark": "at most 8 words for the student", "stepBreakdown": [{"description": "the point as given", "marks": number, "awarded": number, "attempt": false, "reasoning": "short reason for this point's award"}]}]}`
 
 // questions: array of { id, number, subLabel, text, modelAnswer, keywords, maxMarks, steps? }
 // steps, when present, is the question's marking points: an array of
@@ -428,6 +434,15 @@ function clamp(n, min, max) {
 // score, so a human enters it). Any question with a problem is forced to
 // "low" confidence and gets a note at the front of its reasoning. problems
 // is a list of short descriptions; empty means the reply was clean.
+// A remark is a few words for the student: one line, no more than 80
+// characters, cut at a word.
+export function cleanRemark(value) {
+  if (typeof value !== 'string') return ''
+  const text = value.replace(/\s+/g, ' ').trim().replace(/^["']|["']$/g, '')
+  if (text.length <= 80) return text
+  return text.slice(0, 80).replace(/\s+\S*$/, '')
+}
+
 export function validateScoreResults(rawResults, questions) {
   const problems = []
   const byId = new Map()
@@ -534,6 +549,7 @@ export function validateScoreResults(rawResults, questions) {
       answerText: typeof r.answerText === 'string' ? r.answerText : '',
       confidence,
       reasoning,
+      remark: cleanRemark(r.remark),
     }
     if (stepBreakdown) cleaned.stepBreakdown = stepBreakdown
     return cleaned

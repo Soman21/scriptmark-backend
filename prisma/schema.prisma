@@ -273,6 +273,7 @@ model Script {
 
   pages   ScriptPage[]
   answers ScriptAnswer[]
+  ink     ScriptInk[]
 }
 
 model ScriptPage {
@@ -283,7 +284,26 @@ model ScriptPage {
   imageUrl      String
   ocrText       String?
   ocrConfidence Float?
+  // Where each line of OCR text sits on the page, kept from the same
+  // Vision reply as ocrText: [[text, x, y, w, h], ...] with x, y, w, h as
+  // fractions of the page size. Used to put red ink marks beside answers.
+  ocrLines      Json?
   createdAt     DateTime @default(now())
+}
+
+// A lecturer's own ink on one page of a script (pen strokes, typed notes,
+// ticks, moved marks). Kept apart from the page image, which never changes,
+// and drawn on top of it in the Marked view and the marked PDF.
+model ScriptInk {
+  id          String   @id @default(cuid())
+  scriptId    String
+  script      Script   @relation(fields: [scriptId], references: [id], onDelete: Cascade)
+  pageNumber  Int
+  items       Json
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+
+  @@unique([scriptId, pageNumber])
 }
 
 model ScriptAnswer {
@@ -333,6 +353,11 @@ model ScriptAnswer {
   // (block diagram, circuit, graph...). Set means the answer contains a
   // diagram: it is marked by concept and always goes to human review.
   diagramDescription String?
+
+  // A few words for the student, written on the marked script beside the
+  // mark (for example "Missing primary keys"). Drafted by the AI with the
+  // score, edited by the lecturer. Never the AI's longer reasoning.
+  remark String?
 }
 
 // One page view or click, for the Analytics tab on the Admin page. No

@@ -11,6 +11,7 @@ import notificationRoutes from './routes/notifications.js'
 import courseRoutes from './routes/courses.js'
 import adminRoutes from './routes/admin.js'
 import trackRoutes from './routes/track.js'
+import markedRoutes from './routes/marked.js'
 import prisma from './lib/prisma.js'
 import { loadAdminGrants } from './lib/roles.js'
 import { loadSuspended } from './lib/suspension.js'
@@ -38,6 +39,7 @@ app.use('/api/notifications', notificationRoutes)
 app.use('/api/courses', courseRoutes)
 app.use('/api/admin', adminRoutes)
 app.use('/api/track', trackRoutes)
+app.use('/api/marked', markedRoutes)
 
 app.use((err, req, res, next) => {
   console.error(err)

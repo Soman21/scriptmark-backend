@@ -54,6 +54,7 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
       const answerData = {
         suggestedScore: r.suggestedScore,
         reasoning: r.reasoning,
+        remark: r.remark || null,
         confidence: r.confidence || null,
         extractedText: r.answerText || script.ocrText,
       }
@@ -94,7 +95,7 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
 // "override" and requires a reason, recorded in the audit trail below.
 router.put('/:answerId/confirm', async (req, res) => {
   try {
-    const { extractedText, reason, pointScores } = req.body
+    const { extractedText, reason, pointScores, remark } = req.body
     let { confirmedScore } = req.body
 
     const existing = await prisma.scriptAnswer.findUnique({
@@ -128,6 +129,8 @@ router.put('/:answerId/confirm', async (req, res) => {
       data: {
         confirmedScore: Number(confirmedScore),
         extractedText: extractedText ?? undefined,
+        // The few words written beside the mark on the marked script.
+        ...(typeof remark === 'string' ? { remark: remark.trim().slice(0, 120) || null } : {}),
         ...(pointBreakdown ? { stepBreakdown: pointBreakdown } : {}),
         confirmedAt: new Date(),
         autoAccepted: false, // a human just made the call, this is no longer an unreviewed auto-accept
