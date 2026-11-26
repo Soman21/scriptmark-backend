@@ -258,6 +258,7 @@ async function scoreOnce(ocrText, questions, options = {}) {
   // without JSON mode and the JSON is picked out of the plain reply.
   let jsonMode = true
   let jsonFailures = 0
+  let minuteWaits = 0
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const isLast = attempt === maxAttempts
@@ -318,6 +319,18 @@ async function scoreOnce(ocrText, questions, options = {}) {
       }
       // Bad key, bad request etc. will not fix themselves, so fail straight away.
       if (!RETRYABLE_STATUSES.has(res.status)) throw lastError
+      // Over the per minute limit: Groq says how long to wait. Waiting is
+      // not a failed try, so it does not use up an attempt (up to a cap, so
+      // a stuck limit cannot hold a script forever). A request near the
+      // whole 8,000 a minute only fits when nothing else ran in that minute,
+      // and giving up after a few waits left scripts flagged.
+      if (res.status === 429 && minuteWaits < MAX_MINUTE_WAITS) {
+        minuteWaits++
+        console.warn(`Scoring waits for Groq's per minute limit (${minuteWaits}/${MAX_MINUTE_WAITS})`)
+        await sleep(groqWaitMs(errText) || retryDelayMs(res, attempt))
+        attempt--
+        continue
+      }
       if (!isLast) await sleep((res.status === 429 && groqWaitMs(errText)) || retryDelayMs(res, attempt))
       continue
     }
@@ -372,6 +385,8 @@ async function scoreOnce(ocrText, questions, options = {}) {
 }
 
 const SCORE_MAX_ATTEMPTS = 3
+// Waits for the per minute limit that do not count as a failed try.
+const MAX_MINUTE_WAITS = 12
 
 // An error that means "send these questions in smaller requests", keeping
 // the questions already scored cleanly.
