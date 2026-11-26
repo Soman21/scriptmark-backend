@@ -5,6 +5,7 @@ import { notifyIfSessionConfirmed } from '../lib/notifications.js'
 import { requireAuth } from '../middleware/auth.js'
 import { scoreScriptAgainstGuide } from '../lib/groq.js'
 import { markFailures, recordFailure } from '../lib/markFailure.js'
+import { trimForMarking } from '../lib/trimScriptText.js'
 import { applyPointScores } from '../lib/markingPoints.js'
 import { accessibleGuidesWhere, canAccessScript, canAccessSession } from '../lib/access.js'
 
@@ -39,7 +40,7 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
 
     let results
     try {
-      results = await scoreScriptAgainstGuide(script.ocrText, guide.questions)
+      results = await scoreScriptAgainstGuide(trimForMarking(script.ocrText), guide.questions)
     } catch (err) {
       recordFailure(script.id, err)
       throw err

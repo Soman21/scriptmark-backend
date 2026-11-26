@@ -9,6 +9,7 @@ import { requireAuth, requireRole } from '../middleware/auth.js'
 import { uploadScriptImage } from '../lib/supabaseStorage.js'
 import { extractTextFromImage } from '../lib/vision.js'
 import { extractTextFromDocument } from '../lib/docParse.js'
+import { trimForMarking, trimSummary } from '../lib/trimScriptText.js'
 import { withDuplicateFlags, findDuplicates } from '../lib/duplicates.js'
 import { resultRow, RESULT_COLUMNS } from '../lib/resultRows.js'
 import { writeResultsPdf } from '../lib/pdfExport.js'
@@ -1318,6 +1319,14 @@ async function runMarkingQueue(guide, session) {
 // OCRs (if needed) and scores one script. Returns 'paused' when the AI's
 // daily allowance has run out, so the run stops instead of failing every
 // remaining script the same way.
+// The script text as sent to the marking AI, without repeated headers and
+// other clutter. The saved text is left as it was read.
+function trimmedForMarking(text) {
+  const trimmed = trimForMarking(text)
+  if (trimmed.length < text.length) console.log(`Trimmed script text before marking: ${trimSummary(text, trimmed)}`)
+  return trimmed
+}
+
 async function markScript(script, guide, session) {
   try {
     let ocrText = script.ocrText
@@ -1379,7 +1388,7 @@ async function markScript(script, guide, session) {
       })
     }
 
-    const results = await scoreScriptAgainstGuide(ocrText, guide.questions)
+    const results = await scoreScriptAgainstGuide(trimmedForMarking(ocrText), guide.questions)
 
     // For calculation heavy questions, standard OCR is unreliable on
     // mathematical notation, so re transcribe that question's answer
