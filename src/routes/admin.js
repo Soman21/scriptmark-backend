@@ -71,7 +71,7 @@ router.get('/overview', async (req, res) => {
         uptimeSeconds: Math.round(process.uptime()),
         services: [
           { name: 'AI scoring', ok: configured('GROQ_API_KEY') },
-          { name: 'Text recognition', ok: configured('GOOGLE_CREDENTIALS_JSON') },
+          { name: 'Text recognition', ok: configured('GEMINI_API_KEY') },
           { name: 'File storage', ok: configured('SUPABASE_URL', 'SUPABASE_SECRET_KEY') },
           { name: 'Email', ok: configured('BREVO_SMTP_KEY') },
         ],

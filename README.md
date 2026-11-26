@@ -36,7 +36,7 @@ Create a `.env` file in this folder with:
 | `PORT` | `4000` |
 | `SUPABASE_URL` | `https://[your-project-ref].supabase.co` |
 | `SUPABASE_SECRET_KEY` | From step 2 |
-| `GOOGLE_CREDENTIALS_JSON` | Entire contents of the downloaded `.json` key, minified to one line, single quoted |
+| `GEMINI_API_KEY` | Gemini API key from Google AI Studio, used to read page images. Optional `GEMINI_OCR_MODEL` changes the model |
 | `GROQ_API_KEY` | From Groq console |
 | `CLOUDFLARE_ACCOUNT_ID` | Optional. Cloudflare dashboard, Account ID. The assistants and examiner's report then run on Cloudflare Workers AI and leave Groq's allowance to marking |
 | `CLOUDFLARE_API_TOKEN` | Optional, with the above. A token with the Workers AI permission |
