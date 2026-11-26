@@ -125,10 +125,19 @@ test('does not retry a 401 (bad key)', async () => {
   assert.equal(calls, 1)
 })
 
-test('throws after 3 rate limited attempts with nothing usable', async () => {
-  queue.push({ status: 429 }, { status: 429 }, { status: 429 })
+test('keeps waiting through per minute limits, then succeeds', async () => {
+  // Waits for the minute's allowance do not use up the 3 attempts.
+  queue.push(...Array.from({ length: 5 }, () => ({ status: 429 })), good)
+  const results = await scoreScriptAgainstGuide('text', questions, noSleep)
+  assert.equal(calls, 6)
+  assert.equal(results[1].suggestedScore, 5)
+})
+
+test('gives up when the per minute limit never clears', async () => {
+  // 12 waits that do not count, then the 3 normal attempts.
+  queue.push(...Array.from({ length: 15 }, () => ({ status: 429 })))
   await assert.rejects(scoreScriptAgainstGuide('text', questions, noSleep), /Groq API error \(429\)/)
-  assert.equal(calls, 3)
+  assert.equal(calls, 15)
 })
 
 test('retries malformed JSON, then succeeds', async () => {
