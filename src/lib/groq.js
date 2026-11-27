@@ -3,6 +3,7 @@
 // must confirm the score before it counts (see results.js "/confirm" route).
 
 import { pickRegNumber } from './roster.js'
+import { geminiChat, geminiConfigured } from './geminiText.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
 import { cleanPoints, roundQuarter, pointResult, attemptMark, bestTotal, countBestFrom, applyPrintedMarks } from './markingPoints.js'
 import { mapLimit } from './mapLimit.js'
@@ -17,6 +18,31 @@ const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated an
 // them apart. Set GROQ_FALLBACK_MODEL to an empty value to turn it off.
 const FALLBACK_MODEL = process.env.GROQ_FALLBACK_MODEL ?? 'openai/gpt-oss-20b'
 export const BACKUP_NOTE = 'Marked by backup AI model.'
+
+// For every AI job that is not marking (reading guides, class lists, front
+// pages, model answers, sharing marks). With a Gemini key set these go to
+// Gemini, so the main Groq model's free allowance is left for marking. If
+// Gemini cannot answer they go to the backup Groq model, never the main
+// one. With no Gemini key they go to the main Groq model as before.
+// body: { messages, temperature, response_format }. Returns a fetch like
+// response in Groq's shape.
+async function lightChat(body) {
+  const groq = (model) =>
+    fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({ model, ...body }),
+    })
+  if (!geminiConfigured()) return groq(MODEL)
+  try {
+    const res = await geminiChat(body)
+    if (res.ok) return res
+    console.warn(`Gemini answered ${res.status}; using ${FALLBACK_MODEL || MODEL} instead`)
+  } catch (err) {
+    console.warn(`Gemini failed (${err.message}); using ${FALLBACK_MODEL || MODEL} instead`)
+  }
+  return groq(FALLBACK_MODEL || MODEL)
+}
 
 // When MODEL's daily allowance is expected back (ms since epoch). Until
 // then scoring goes straight to the backup instead of asking MODEL first.
@@ -824,21 +850,13 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
   let aiPick = null
   let parsed = {}
   try {
-    const res = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: scoringModel(), // the backup while the main model is out for the day
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: pageText },
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
-      }),
+    const res = await lightChat({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: pageText },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
     })
     if (res.ok) {
       const data = await res.json()
@@ -1057,21 +1075,13 @@ async function parseGuidePieceSplitting(text, sleep, depth = 0) {
 async function parseGuidePiece(text, sleep) {
   let lastError = null
   for (let attempt = 1; attempt <= PARSE_MAX_ATTEMPTS; attempt++) {
-    const res = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [
-          { role: 'system', content: PARSE_GUIDE_SYSTEM_PROMPT },
-          { role: 'user', content: text.slice(0, GUIDE_TEXT_LIMIT) }, // keep well within context limits
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
-      }),
+    const res = await lightChat({
+      messages: [
+        { role: 'system', content: PARSE_GUIDE_SYSTEM_PROMPT },
+        { role: 'user', content: text.slice(0, GUIDE_TEXT_LIMIT) }, // keep well within context limits
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
     })
 
     if (!res.ok) {
@@ -1143,21 +1153,13 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
 // rawText: either typed document text (docParse) or OCR'd attendance sheet text (vision).
 // The prompt above is written to work for either without needing to know which.
 export async function parseClassList(rawText) {
-  const res = await fetch(GROQ_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: PARSE_CLASS_LIST_SYSTEM_PROMPT },
-        { role: 'user', content: rawText.slice(0, 30000) },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.1,
-    }),
+  const res = await lightChat({
+    messages: [
+      { role: 'system', content: PARSE_CLASS_LIST_SYSTEM_PROMPT },
+      { role: 'user', content: rawText.slice(0, 30000) },
+    ],
+    response_format: { type: 'json_object' },
+    temperature: 0.1,
   })
 
   if (!res.ok) {
@@ -1192,21 +1194,13 @@ export async function generateModelAnswers(questions) {
     })
     .join('\n\n')
 
-  const res = await fetch(GROQ_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: GENERATE_ANSWERS_SYSTEM_PROMPT },
-        { role: 'user', content: questionsBlock },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.3,
-    }),
+  const res = await lightChat({
+    messages: [
+      { role: 'system', content: GENERATE_ANSWERS_SYSTEM_PROMPT },
+      { role: 'user', content: questionsBlock },
+    ],
+    response_format: { type: 'json_object' },
+    temperature: 0.3,
   })
 
   if (!res.ok) {
@@ -1525,15 +1519,10 @@ export async function shareQuestionMarks(parts, target, options = {}) {
   }).join('\n\n')
   const user = `Question ${parts[0]?.number ?? ''}, printed total ${target} marks.\n\n${lines}`
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const res = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [{ role: 'system', content: SHARE_MARKS_SYSTEM_PROMPT }, { role: 'user', content: user }],
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
-      }),
+    const res = await lightChat({
+      messages: [{ role: 'system', content: SHARE_MARKS_SYSTEM_PROMPT }, { role: 'user', content: user }],
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
     })
     if (!res.ok) {
       const errText = await res.text()
