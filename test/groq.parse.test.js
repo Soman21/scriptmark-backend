@@ -1,6 +1,6 @@
 import { test, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseMarkingSchemeDocument, splitGuideByQuestion, GUIDE_TEXT_LIMIT } from '../src/lib/groq.js'
+import { parseMarkingSchemeDocument, splitGuideByQuestion, splitPieceInTwo, GUIDE_TEXT_LIMIT } from '../src/lib/groq.js'
 
 const realFetch = globalThis.fetch
 afterEach(() => { globalThis.fetch = realFetch })
@@ -197,4 +197,63 @@ test('part marks printed in headings replace an even split from the parser', asy
   })
   const out = await parseMarkingSchemeDocument('Question 6 (17.5 Marks)\n(6a) Identification of Entities. (2.5 Marks)\n[printed 4 Marks changed to 2.5 Marks.]\n(6b) Attributes for each entity. (3 Marks)', noSleep)
   assert.deepEqual(out.questions.map((q) => q.maxMarks), [2.5, 3])
+})
+
+const LONG_QUESTION = `Question 4 (20 Marks)
+(4a) ${'first part text '.repeat(10)} (5 Marks)
+(4b) ${'second part text '.repeat(10)} (5 Marks)
+(4c) ${'third part text '.repeat(10)} (5 Marks)
+(4d) ${'fourth part text '.repeat(10)} (5 Marks)`
+
+test('a question is cut in two at a part boundary, the second half keeping its question', () => {
+  const [a, b] = splitPieceInTwo(LONG_QUESTION)
+  assert.match(a, /^Question 4/)
+  assert.match(a, /\(4a\)/)
+  assert.doesNotMatch(a, /\(4d\)/)
+  assert.match(b, /^Question 4 \(20 Marks\) \(continued\)\n\(4[bc]\)/)
+  assert.match(b, /\(4d\)/)
+  assert.equal(splitPieceInTwo('Question 1\nno parts here at all'), null)
+})
+
+test('a question too long for one reply is read in halves and put back together', async () => {
+  const sent = []
+  globalThis.fetch = async (_url, req) => {
+    const text = JSON.parse(req.body).messages[1].content
+    sent.push(text)
+    const parts = [...text.matchAll(/^\(4([a-d])\)/gm)].map((m) => m[1])
+    const finish = parts.length > 2 ? 'length' : 'stop'
+    const questions = parts.map((l) => ({ number: '4', subLabel: l, modelAnswer: 'x', points: [{ description: 'p', marks: 5 }] }))
+    return { ok: true, json: async () => ({ choices: [{ finish_reason: finish, message: { content: JSON.stringify({ questions }) } }] }) }
+  }
+  const out = await parseMarkingSchemeDocument(LONG_QUESTION, noSleep)
+  assert.deepEqual(out.questions.map((q) => q.subLabel), ['a', 'b', 'c', 'd'])
+  assert.equal(sent.length, 3)
+})
+
+test('a question that cannot be cut still reports it is too long', async () => {
+  fakeGroq({ finish: 'length' })
+  await assert.rejects(parseMarkingSchemeDocument('Question 1\nno parts at all', noSleep), /too long/)
+})
+
+test('questions numbered 1. 2. under section headings, without the word Question, are split', () => {
+  const text = `MARKING GUIDE
+SECTION A (Compulsory)
+1. Define a database (10 Marks)
+(a) first
+SECTION B
+2. Explain normalisation (10 Marks)
+(a) second
+3. State two keys (10 marks)
+(a) third`
+  const pieces = splitGuideByQuestion(text)
+  assert.equal(pieces.length, 3)
+  assert.match(pieces[0], /^MARKING GUIDE[\s\S]*1\. Define/)
+  assert.match(pieces[1], /^2\. Explain/)
+  assert.match(pieces[2], /^3\. State/)
+})
+
+test('numbered marking points without marks in brackets are not taken for questions', () => {
+  const text = `Question 1\n(a) points\n1. first point\n2. second point`
+  assert.equal(splitGuideByQuestion(text).length, 1)
+  assert.equal(splitGuideByQuestion('Some guide\n1. a point\n2. another point').length, 1)
 })

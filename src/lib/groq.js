@@ -3,6 +3,7 @@
 // must confirm the score before it counts (see results.js "/confirm" route).
 
 import { pickRegNumber } from './roster.js'
+import { geminiChat, geminiConfigured } from './geminiText.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
 import { cleanPoints, roundQuarter, pointResult, attemptMark, bestTotal, countBestFrom, applyPrintedMarks } from './markingPoints.js'
 import { mapLimit } from './mapLimit.js'
@@ -17,6 +18,31 @@ const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated an
 // them apart. Set GROQ_FALLBACK_MODEL to an empty value to turn it off.
 const FALLBACK_MODEL = process.env.GROQ_FALLBACK_MODEL ?? 'openai/gpt-oss-20b'
 export const BACKUP_NOTE = 'Marked by backup AI model.'
+
+// For every AI job that is not marking (reading guides, class lists, front
+// pages, model answers, sharing marks). With a Gemini key set these go to
+// Gemini, so the main Groq model's free allowance is left for marking. If
+// Gemini cannot answer they go to the backup Groq model, never the main
+// one. With no Gemini key they go to the main Groq model as before.
+// body: { messages, temperature, response_format }. Returns a fetch like
+// response in Groq's shape.
+async function lightChat(body) {
+  const groq = (model) =>
+    fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({ model, ...body }),
+    })
+  if (!geminiConfigured()) return groq(MODEL)
+  try {
+    const res = await geminiChat(body)
+    if (res.ok) return res
+    console.warn(`Gemini answered ${res.status}; using ${FALLBACK_MODEL || MODEL} instead`)
+  } catch (err) {
+    console.warn(`Gemini failed (${err.message}); using ${FALLBACK_MODEL || MODEL} instead`)
+  }
+  return groq(FALLBACK_MODEL || MODEL)
+}
 
 // When MODEL's daily allowance is expected back (ms since epoch). Until
 // then scoring goes straight to the backup instead of asking MODEL first.
@@ -824,21 +850,13 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
   let aiPick = null
   let parsed = {}
   try {
-    const res = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: scoringModel(), // the backup while the main model is out for the day
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: pageText },
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
-      }),
+    const res = await lightChat({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: pageText },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
     })
     if (res.ok) {
       const data = await res.json()
@@ -941,6 +959,24 @@ const DIAGRAM_LINE = /^\[DIAGRAM for (\d+).*\][ \t]*$/gm
 const TABLE_BLOCK = /^\[TABLE for (\d+)[^\n]*\]\n[\s\S]*?\n\[END TABLE\][ \t]*$/gm
 const NUMBER_WORDS = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten']
 
+// Guides that number their questions "1." or "2)" with the marks in
+// brackets, and no word "Question", for example under "SECTION A" and
+// "SECTION B" headings. Only a line with its marks in brackets counts, and
+// the numbers must run 1, 2, 3 in order, so a numbered list of marking
+// points inside an answer is not taken for a question.
+const NUMBERED_HEADING = /^[ \t]*(\d{1,2})[.)][ \t]+.*\([ \t]*\d+(?:\.\d+)?[ \t]*marks?[ \t]*\)/gim
+export function numberedHeadings(body) {
+  const found = []
+  let expected = 1
+  for (const m of body.matchAll(NUMBERED_HEADING)) {
+    if (Number(m[1]) === expected) {
+      found.push(m)
+      expected++
+    }
+  }
+  return found
+}
+
 // Splits guide text into one piece per whole question, so each parser call
 // writes out a small answer. Text before the first question (title and
 // instructions) stays with the first piece. Diagram lines from the vision
@@ -955,7 +991,8 @@ export function splitGuideByQuestion(rawText) {
     return ''
   }
   const body = text.replace(TABLE_BLOCK, pull).replace(DIAGRAM_LINE, pull)
-  const starts = [...body.matchAll(QUESTION_HEADING)]
+  let starts = [...body.matchAll(QUESTION_HEADING)]
+  if (starts.length < 2) starts = numberedHeadings(body)
   if (starts.length < 2) return [text]
 
   const pieces = starts.map((m, i) => ({
@@ -979,24 +1016,72 @@ export function groqWaitMs(errText) {
   return Number.isFinite(seconds) ? Math.min(Math.ceil(seconds * 1000) + 500, 60000) : null
 }
 
+function tooLongError() {
+  const err = new Error('A question in this document is too long to read in one go. Upload it in two parts.')
+  err.tooLong = true
+  return err
+}
+
+// A part of a question: "(a)", "a)", "(1a)", "2b." at the start of a line.
+const PART_LINE = /^[ \t]*\(?\d{0,2}[a-h][.)][ \t]+\S/i
+
+// Cuts one question's text in two at a part boundary near the middle, so
+// each half is a smaller answer to write out. The second half starts with
+// the question's own first line, so the model still knows which question
+// it is. Returns null when there is no part boundary to cut at.
+export function splitPieceInTwo(text) {
+  const lines = String(text || '').split('\n')
+  const starts = lines.map((l, i) => (PART_LINE.test(l) ? i : -1)).filter((i) => i > 0)
+  if (starts.length < 2) return null
+  const total = lines.join('\n').length
+  let cut = starts[0]
+  let sum = 0
+  const lengths = lines.map((l) => l.length + 1)
+  for (const i of starts) {
+    sum = lengths.slice(0, i).reduce((a, b) => a + b, 0)
+    cut = i
+    if (sum >= total / 2) break
+  }
+  if (cut === starts[0] && starts.length > 1 && sum < total / 2) cut = starts[starts.length - 1]
+  const first = lines.slice(0, cut).join('\n').trim()
+  const rest = lines.slice(cut).join('\n').trim()
+  if (!first || !rest) return null
+  const heading = lines.find((l) => l.trim()) || ''
+  const headingIsQuestion = QUESTION_HEADING_ONE.test(heading)
+  return [first, headingIsQuestion ? `${heading.trim()} (continued)\n${rest}` : rest]
+}
+const QUESTION_HEADING_ONE = /^[ \t]*(?:question[ \t]*(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b|q\.?[ \t]*(\d+)\b)/i
+
+// Parses one question's text. If the model's reply runs out of room, the
+// text is cut in two at a part boundary and each half is parsed on its own,
+// then put back together, instead of asking the lecturer to split the file.
+async function parseGuidePieceSplitting(text, sleep, depth = 0) {
+  try {
+    return await parseGuidePiece(text, sleep)
+  } catch (err) {
+    if (!err.tooLong || depth >= 2) throw err
+    const halves = splitPieceInTwo(text)
+    if (!halves) throw err
+    const a = await parseGuidePieceSplitting(halves[0], sleep, depth + 1)
+    const b = await parseGuidePieceSplitting(halves[1], sleep, depth + 1)
+    return {
+      title: a?.title || b?.title || '',
+      subject: a?.subject || b?.subject || '',
+      questions: [...(Array.isArray(a?.questions) ? a.questions : []), ...(Array.isArray(b?.questions) ? b.questions : [])],
+    }
+  }
+}
+
 async function parseGuidePiece(text, sleep) {
   let lastError = null
   for (let attempt = 1; attempt <= PARSE_MAX_ATTEMPTS; attempt++) {
-    const res = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [
-          { role: 'system', content: PARSE_GUIDE_SYSTEM_PROMPT },
-          { role: 'user', content: text.slice(0, GUIDE_TEXT_LIMIT) }, // keep well within context limits
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
-      }),
+    const res = await lightChat({
+      messages: [
+        { role: 'system', content: PARSE_GUIDE_SYSTEM_PROMPT },
+        { role: 'user', content: text.slice(0, GUIDE_TEXT_LIMIT) }, // keep well within context limits
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
     })
 
     if (!res.ok) {
@@ -1013,7 +1098,7 @@ async function parseGuidePiece(text, sleep) {
     // A reply cut off at the length limit may still close its JSON early and
     // look complete, so treat it as a failure rather than a short guide.
     if (choice?.finish_reason === 'length') {
-      throw new Error('A question in this document is too long to read in one go. Upload it in two parts.')
+      throw tooLongError()
     }
     const content = choice?.message?.content
     if (!content) throw new Error('Groq returned an empty response.')
@@ -1034,7 +1119,7 @@ async function parseGuidePiece(text, sleep) {
 export async function parseMarkingSchemeDocument(rawText, options = {}) {
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
   const pieces = splitGuideByQuestion(rawText)
-  const results = await mapLimit(pieces, PARSE_CONCURRENCY, (piece) => parseGuidePiece(piece, sleep))
+  const results = await mapLimit(pieces, PARSE_CONCURRENCY, (piece) => parseGuidePieceSplitting(piece, sleep))
 
   const questions = results.flatMap((parsed) => (Array.isArray(parsed?.questions) ? parsed.questions : []))
   return {
@@ -1068,21 +1153,13 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
 // rawText: either typed document text (docParse) or OCR'd attendance sheet text (vision).
 // The prompt above is written to work for either without needing to know which.
 export async function parseClassList(rawText) {
-  const res = await fetch(GROQ_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: PARSE_CLASS_LIST_SYSTEM_PROMPT },
-        { role: 'user', content: rawText.slice(0, 30000) },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.1,
-    }),
+  const res = await lightChat({
+    messages: [
+      { role: 'system', content: PARSE_CLASS_LIST_SYSTEM_PROMPT },
+      { role: 'user', content: rawText.slice(0, 30000) },
+    ],
+    response_format: { type: 'json_object' },
+    temperature: 0.1,
   })
 
   if (!res.ok) {
@@ -1117,21 +1194,13 @@ export async function generateModelAnswers(questions) {
     })
     .join('\n\n')
 
-  const res = await fetch(GROQ_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        { role: 'system', content: GENERATE_ANSWERS_SYSTEM_PROMPT },
-        { role: 'user', content: questionsBlock },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.3,
-    }),
+  const res = await lightChat({
+    messages: [
+      { role: 'system', content: GENERATE_ANSWERS_SYSTEM_PROMPT },
+      { role: 'user', content: questionsBlock },
+    ],
+    response_format: { type: 'json_object' },
+    temperature: 0.3,
   })
 
   if (!res.ok) {
@@ -1450,15 +1519,10 @@ export async function shareQuestionMarks(parts, target, options = {}) {
   }).join('\n\n')
   const user = `Question ${parts[0]?.number ?? ''}, printed total ${target} marks.\n\n${lines}`
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const res = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [{ role: 'system', content: SHARE_MARKS_SYSTEM_PROMPT }, { role: 'user', content: user }],
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
-      }),
+    const res = await lightChat({
+      messages: [{ role: 'system', content: SHARE_MARKS_SYSTEM_PROMPT }, { role: 'user', content: user }],
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
     })
     if (!res.ok) {
       const errText = await res.text()
