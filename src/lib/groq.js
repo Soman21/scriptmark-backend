@@ -941,6 +941,24 @@ const DIAGRAM_LINE = /^\[DIAGRAM for (\d+).*\][ \t]*$/gm
 const TABLE_BLOCK = /^\[TABLE for (\d+)[^\n]*\]\n[\s\S]*?\n\[END TABLE\][ \t]*$/gm
 const NUMBER_WORDS = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten']
 
+// Guides that number their questions "1." or "2)" with the marks in
+// brackets, and no word "Question", for example under "SECTION A" and
+// "SECTION B" headings. Only a line with its marks in brackets counts, and
+// the numbers must run 1, 2, 3 in order, so a numbered list of marking
+// points inside an answer is not taken for a question.
+const NUMBERED_HEADING = /^[ \t]*(\d{1,2})[.)][ \t]+.*\([ \t]*\d+(?:\.\d+)?[ \t]*marks?[ \t]*\)/gim
+export function numberedHeadings(body) {
+  const found = []
+  let expected = 1
+  for (const m of body.matchAll(NUMBERED_HEADING)) {
+    if (Number(m[1]) === expected) {
+      found.push(m)
+      expected++
+    }
+  }
+  return found
+}
+
 // Splits guide text into one piece per whole question, so each parser call
 // writes out a small answer. Text before the first question (title and
 // instructions) stays with the first piece. Diagram lines from the vision
@@ -955,7 +973,8 @@ export function splitGuideByQuestion(rawText) {
     return ''
   }
   const body = text.replace(TABLE_BLOCK, pull).replace(DIAGRAM_LINE, pull)
-  const starts = [...body.matchAll(QUESTION_HEADING)]
+  let starts = [...body.matchAll(QUESTION_HEADING)]
+  if (starts.length < 2) starts = numberedHeadings(body)
   if (starts.length < 2) return [text]
 
   const pieces = starts.map((m, i) => ({
@@ -977,6 +996,62 @@ export function groqWaitMs(errText) {
   if (!m) return null
   const seconds = Number(m[1] || 0) * 60 + Number(m[2])
   return Number.isFinite(seconds) ? Math.min(Math.ceil(seconds * 1000) + 500, 60000) : null
+}
+
+function tooLongError() {
+  const err = new Error('A question in this document is too long to read in one go. Upload it in two parts.')
+  err.tooLong = true
+  return err
+}
+
+// A part of a question: "(a)", "a)", "(1a)", "2b." at the start of a line.
+const PART_LINE = /^[ \t]*\(?\d{0,2}[a-h][.)][ \t]+\S/i
+
+// Cuts one question's text in two at a part boundary near the middle, so
+// each half is a smaller answer to write out. The second half starts with
+// the question's own first line, so the model still knows which question
+// it is. Returns null when there is no part boundary to cut at.
+export function splitPieceInTwo(text) {
+  const lines = String(text || '').split('\n')
+  const starts = lines.map((l, i) => (PART_LINE.test(l) ? i : -1)).filter((i) => i > 0)
+  if (starts.length < 2) return null
+  const total = lines.join('\n').length
+  let cut = starts[0]
+  let sum = 0
+  const lengths = lines.map((l) => l.length + 1)
+  for (const i of starts) {
+    sum = lengths.slice(0, i).reduce((a, b) => a + b, 0)
+    cut = i
+    if (sum >= total / 2) break
+  }
+  if (cut === starts[0] && starts.length > 1 && sum < total / 2) cut = starts[starts.length - 1]
+  const first = lines.slice(0, cut).join('\n').trim()
+  const rest = lines.slice(cut).join('\n').trim()
+  if (!first || !rest) return null
+  const heading = lines.find((l) => l.trim()) || ''
+  const headingIsQuestion = QUESTION_HEADING_ONE.test(heading)
+  return [first, headingIsQuestion ? `${heading.trim()} (continued)\n${rest}` : rest]
+}
+const QUESTION_HEADING_ONE = /^[ \t]*(?:question[ \t]*(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b|q\.?[ \t]*(\d+)\b)/i
+
+// Parses one question's text. If the model's reply runs out of room, the
+// text is cut in two at a part boundary and each half is parsed on its own,
+// then put back together, instead of asking the lecturer to split the file.
+async function parseGuidePieceSplitting(text, sleep, depth = 0) {
+  try {
+    return await parseGuidePiece(text, sleep)
+  } catch (err) {
+    if (!err.tooLong || depth >= 2) throw err
+    const halves = splitPieceInTwo(text)
+    if (!halves) throw err
+    const a = await parseGuidePieceSplitting(halves[0], sleep, depth + 1)
+    const b = await parseGuidePieceSplitting(halves[1], sleep, depth + 1)
+    return {
+      title: a?.title || b?.title || '',
+      subject: a?.subject || b?.subject || '',
+      questions: [...(Array.isArray(a?.questions) ? a.questions : []), ...(Array.isArray(b?.questions) ? b.questions : [])],
+    }
+  }
 }
 
 async function parseGuidePiece(text, sleep) {
@@ -1013,7 +1088,7 @@ async function parseGuidePiece(text, sleep) {
     // A reply cut off at the length limit may still close its JSON early and
     // look complete, so treat it as a failure rather than a short guide.
     if (choice?.finish_reason === 'length') {
-      throw new Error('A question in this document is too long to read in one go. Upload it in two parts.')
+      throw tooLongError()
     }
     const content = choice?.message?.content
     if (!content) throw new Error('Groq returned an empty response.')
@@ -1034,7 +1109,7 @@ async function parseGuidePiece(text, sleep) {
 export async function parseMarkingSchemeDocument(rawText, options = {}) {
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
   const pieces = splitGuideByQuestion(rawText)
-  const results = await mapLimit(pieces, PARSE_CONCURRENCY, (piece) => parseGuidePiece(piece, sleep))
+  const results = await mapLimit(pieces, PARSE_CONCURRENCY, (piece) => parseGuidePieceSplitting(piece, sleep))
 
   const questions = results.flatMap((parsed) => (Array.isArray(parsed?.questions) ? parsed.questions : []))
   return {
