@@ -5,7 +5,7 @@
 import { pickRegNumber } from './roster.js'
 import { geminiChat, geminiConfigured } from './geminiText.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
-import { cleanPoints, roundQuarter, pointResult, attemptMark, bestTotal, countBestFrom, applyPrintedMarks } from './markingPoints.js'
+import { cleanPoints, needsDiagramLook, roundQuarter, pointResult, attemptMark, bestTotal, countBestFrom, applyPrintedMarks } from './markingPoints.js'
 import { mapLimit } from './mapLimit.js'
 import { recordUsage } from './aiUsage.js'
 import { compactModelAnswer, stripCorrectionNotes } from './guideCompact.js'
@@ -97,7 +97,12 @@ export function groqWaitFullMs(errText) {
 // from MODEL since it is a different model on the same free Groq account.
 const VISION_MODEL = 'qwen/qwen3.8-27b'
 
-const SYSTEM_PROMPT = `You are an assistant that helps a human lecturer grade exam scripts.
+// The scoring rules, in parts. Each request gets only the parts its
+// questions need (see scoringPromptFor), so a request with no drawing, no
+// table, no bands and no "best N" part does not carry those rules. The
+// wording of every rule is unchanged.
+const RULES = {
+  head: `You are an assistant that helps a human lecturer grade exam scripts.
 You NEVER assign a final grade — you only suggest a score and explain your reasoning.
 A human always reviews and confirms the score afterward.
 
@@ -107,7 +112,8 @@ subpart as its own separate item to score, using its own max marks.
 For each question given, read the student's extracted answer text and compare it to the
 model answer and keywords. Judge conceptual correctness, not exact wording match.
 
-Some questions include MARKING POINTS: a list of specific points, each with its own marks,
+`,
+  points: `Some questions include MARKING POINTS: a list of specific points, each with its own marks,
 that together add up to the question's max marks. When a question has marking points, do
 not give one holistic score. Judge each point separately against what the student wrote:
 award the point's full marks if the student covers it, part of its marks if the student
@@ -116,15 +122,20 @@ student clearly attempts the point with something related but incorrect, set "at
 for that point (it earns a fixed attempt mark of about one fifth of the point; the system sets
 the number). Give a short reason for each point. The question's suggestedScore is then the sum of the marks you awarded
 across its points. This lets a student earn credit for each correct point even when
-another point is missing or wrong. When a question says "Only the best N of these points count", the guide lists more
+another point is missing or wrong. `,
+  countBest: `When a question says "Only the best N of these points count", the guide lists more
 accepted answers than the student needs to give (an "any five" question): judge every point
-the same way; the system counts only the student's best N. Questions with no marking points are scored holistically. When a model answer gives mark
+the same way; the system counts only the student's best N. `,
+  holistic: `Questions with no marking points are scored holistically. `,
+  bands: `When a model answer gives mark
 bands (for example "Excellent (13-15 marks)", "Good (10-12 marks)"), first decide which band
 the student's answer fits by the band's description, then give a score inside that band.
-A model answer may contain a table in Markdown ("|" between cells): each row is one item of
+`,
+  table: `A model answer may contain a table in Markdown ("|" between cells): each row is one item of
 the expected answer, and a student may give the same items as a table or in sentences.
 
-DRAWINGS: some answers are drawings (block diagrams, circuits, graphs, sketches). Mark a
+`,
+  drawings: `DRAWINGS: some answers are drawings (block diagrams, circuits, graphs, sketches). Mark a
 drawing by the concept it shows, not its format: a correct concept shown as a drawing earns
 the same marks as the same concept written in words. Labels are required: a drawing whose
 parts are not labelled earns only an attempt mark of about one fifth of the point's marks
@@ -139,7 +150,8 @@ table for which cell belongs to which row. Mark its content by meaning against t
 points or model answer, as you would prose: students may name rows differently, order them
 differently, or mix a table with sentences.
 
-For each question, also copy out the specific portion of the student's text that answers
+`,
+  tail: `For each question, also copy out the specific portion of the student's text that answers
 THAT question (not the whole script) — this lets a human reviewer see exactly what you
 scored, side by side with the expected answer.
 
@@ -156,7 +168,29 @@ EVERY point, in order, including points the student missed (awarded 0).
 Respond with ONLY a JSON object of this exact shape, and nothing else. Omit "stepBreakdown"
 entirely for a question that has no marking points; include it, with one entry per point in
 the same order given, ONLY for a question that has them:
-{"results": [{"questionId": "the question's id", "suggestedScore": number, "answerText": "the relevant portion of the student's text for this question", "confidence": "high" | "medium" | "low", "reasoning": "a short, specific explanation", "stepBreakdown": [{"description": "the point as given", "marks": number, "awarded": number, "attempt": false, "reasoning": "short reason for this point's award"}]}]}`
+{"results": [{"questionId": "the question's id", "suggestedScore": number, "answerText": "the relevant portion of the student's text for this question", "confidence": "high" | "medium" | "low", "reasoning": "a short, specific explanation", "stepBreakdown": [{"description": "the point as given", "marks": number, "awarded": number, "attempt": false, "reasoning": "short reason for this point's award"}]}]}`,
+}
+
+const BAND_PATTERN = /\(\s*\d+(?:\.\d+)?\s*[-–to]+\s*\d+(?:\.\d+)?\s*marks?\s*\)/i
+
+// The scoring rules for one request: questions in it and the text sent.
+export function scoringPromptFor(questions, text = '') {
+  const qs = Array.isArray(questions) ? questions : []
+  const withPoints = qs.some((q) => Array.isArray(q.steps) && q.steps.length > 0)
+  const parts = [RULES.head]
+  if (withPoints) parts.push(RULES.points)
+  if (qs.some((q) => q.countBest)) parts.push(RULES.countBest)
+  if (qs.some((q) => !(Array.isArray(q.steps) && q.steps.length > 0))) parts.push(RULES.holistic)
+  if (qs.some((q) => BAND_PATTERN.test(String(q.modelAnswer || '')))) parts.push(RULES.bands)
+  if (qs.some((q) => MARKDOWN_TABLE_LINE.test(String(q.modelAnswer || '')))) parts.push(RULES.table)
+  if (qs.some(needsDiagramLook) || /DIAGRAM SEEN ON THE PAGE/.test(String(text || ''))) parts.push(RULES.drawings)
+  parts.push(RULES.tail)
+  return parts.map((p) => p.trimEnd()).join('\n\n')
+}
+const MARKDOWN_TABLE_LINE = /^\s*\|.*\|\s*$/m
+
+// Every rule, for requests where the questions are not known.
+export const SYSTEM_PROMPT = Object.values(RULES).map((p) => p.trimEnd()).join('\n\n')
 
 // questions: array of { id, number, subLabel, text, modelAnswer, keywords, maxMarks, steps? }
 // steps, when present, is the question's marking points: an array of
@@ -220,10 +254,10 @@ function replyTokens(q) {
 export function packQuestions(ocrText, questions, limit, tokensRequested) {
   const byQuestion = groupByQuestion(questions)
   if (!limit || !tokensRequested) return byQuestion
-  const fullChars = SYSTEM_PROMPT.length + userPromptFor(ocrText, questions).length
+  const fullChars = scoringPromptFor(questions, ocrText).length + userPromptFor(ocrText, questions).length
   const perChar = tokensRequested / fullChars
   const budget = limit * 0.9
-  const fixed = (SYSTEM_PROMPT.length + userPromptFor(ocrText, []).length) * perChar
+  const fixed = (scoringPromptFor(questions, ocrText).length + userPromptFor(ocrText, []).length) * perChar
   const groups = []
   let current = []
   let size = fixed
@@ -338,7 +372,7 @@ async function scoreOnce(ocrText, questions, options = {}) {
       body: JSON.stringify({
         model,
         messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'system', content: scoringPromptFor(pending, ocrText) },
           { role: 'user', content: userPromptFor(ocrText, pending) },
         ],
         ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
