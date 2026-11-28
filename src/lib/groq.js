@@ -8,6 +8,7 @@ import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPag
 import { cleanPoints, roundQuarter, pointResult, attemptMark, bestTotal, countBestFrom, applyPrintedMarks } from './markingPoints.js'
 import { mapLimit } from './mapLimit.js'
 import { recordUsage } from './aiUsage.js'
+import { compactModelAnswer, stripCorrectionNotes } from './guideCompact.js'
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
@@ -273,7 +274,7 @@ export function groupByQuestion(questions) {
 const SPLIT_MAX_ATTEMPTS = 6
 
 // The guide part of the scoring prompt for these questions.
-function questionsBlockFor(questions) {
+export function questionsBlockFor(questions) {
   return questions
     .map((q) => {
       const label = q.subLabel ? `Question ${q.number}${q.subLabel}` : `Question ${q.number}`
@@ -283,7 +284,22 @@ function questionsBlockFor(questions) {
               q.countBest ? `\nOnly the best ${q.countBest} of these ${q.steps.length} points count.` : ''
             }`
           : ''
-      return `Question ID: ${q.id}\n${label}: ${q.text}\nModel Answer: ${q.modelAnswer}\nKeywords: ${q.keywords}\nMax Marks: ${q.maxMarks}${stepsBlock}`
+      // Compact copy of the stored guide (see guideCompact.js): correction
+      // notes out, and for a part with points, model answer lines that only
+      // repeat a point. Keywords are made from the model answer, so with
+      // points they repeat them too and are left out.
+      const hasPoints = Array.isArray(q.steps) && q.steps.length > 0
+      const answer = compactModelAnswer(q.modelAnswer, q.steps)
+      const keywords = hasPoints ? '' : String(q.keywords || '').trim()
+      return [
+        `Question ID: ${q.id}`,
+        `${label}: ${stripCorrectionNotes(q.text)}`,
+        answer && `Model Answer: ${answer}`,
+        keywords && `Keywords: ${keywords}`,
+        `Max Marks: ${q.maxMarks}${stepsBlock}`,
+      ]
+        .filter(Boolean)
+        .join('\n')
     })
     .join('\n\n')
 }
