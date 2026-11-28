@@ -151,6 +151,12 @@ points or model answer, as you would prose: students may name rows differently, 
 differently, or mix a table with sentences.
 
 `,
+  working: `When the text includes a section "WORKING READ FROM THE PAGE IMAGE for" a question,
+that is the student's working for that question read again from the page image, because OCR
+often mangles fractions, exponents and multi step working. For that question, mark that
+working instead of the OCR text.
+
+`,
   tail: `For each question, also copy out the specific portion of the student's text that answers
 THAT question (not the whole script) — this lets a human reviewer see exactly what you
 scored, side by side with the expected answer.
@@ -184,6 +190,7 @@ export function scoringPromptFor(questions, text = '') {
   if (qs.some((q) => BAND_PATTERN.test(String(q.modelAnswer || '')))) parts.push(RULES.bands)
   if (qs.some((q) => MARKDOWN_TABLE_LINE.test(String(q.modelAnswer || '')))) parts.push(RULES.table)
   if (qs.some(needsDiagramLook) || /DIAGRAM SEEN ON THE PAGE/.test(String(text || ''))) parts.push(RULES.drawings)
+  if (/WORKING READ FROM THE PAGE IMAGE for/.test(String(text || ''))) parts.push(RULES.working)
   parts.push(RULES.tail)
   return parts.map((p) => p.trimEnd()).join('\n\n')
 }
@@ -229,7 +236,7 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
     // under the limit Groq gave, using Groq's own count of this request to
     // turn characters into tokens. Without Groq's numbers (the reply was
     // cut off or came back short), the questions are split in two.
-    let groups = err.tokenLimit ? packQuestions(ocrText, rest, err.tokenLimit, err.tokensRequested) : halves(rest)
+    let groups = err.tokenLimit ? packQuestions(ocrText, rest, err.tokenLimit, err.tokensRequested, options.extras) : halves(rest)
     if (groups.length === 1) groups = halves(rest)
     for (const group of groups) {
       const results = await scoreScriptAgainstGuide(ocrText, group, { ...options, attempts: SPLIT_MAX_ATTEMPTS })
@@ -251,10 +258,10 @@ function replyTokens(q) {
   return 250 + 60 * (Array.isArray(q.steps) ? q.steps.length : 0)
 }
 
-export function packQuestions(ocrText, questions, limit, tokensRequested) {
+export function packQuestions(ocrText, questions, limit, tokensRequested, extras) {
   const byQuestion = groupByQuestion(questions)
   if (!limit || !tokensRequested) return byQuestion
-  const fullChars = scoringPromptFor(questions, ocrText).length + userPromptFor(ocrText, questions).length
+  const fullChars = scoringPromptFor(questions, ocrText).length + userPromptFor(ocrText, questions, extras).length
   const perChar = tokensRequested / fullChars
   const budget = limit * 0.9
   const fixed = (scoringPromptFor(questions, ocrText).length + userPromptFor(ocrText, []).length) * perChar
@@ -266,7 +273,7 @@ export function packQuestions(ocrText, questions, limit, tokensRequested) {
     // each part gets a copy of the student's answer, a reason and a line
     // per marking point. Too many parts in one request and the reply is
     // cut off before it ends, so the space it needs is kept free too.
-    const cost = (questionsBlockFor(group).length + 2) * perChar + group.reduce((n, q) => n + replyTokens(q), 0)
+    const cost = (questionsBlockFor(group).length + extrasBlockFor(group, extras).length + 2) * perChar + group.reduce((n, q) => n + replyTokens(q), 0)
     if (current.length && (size + cost > budget || current.length + group.length > MAX_PARTS_PER_REQUEST)) {
       groups.push(current)
       current = []
@@ -338,8 +345,28 @@ export function questionsBlockFor(questions) {
     .join('\n\n')
 }
 
-function userPromptFor(ocrText, questions) {
-  return `MARKING GUIDE:\n${questionsBlockFor(questions)}\n\nSTUDENT'S EXTRACTED SCRIPT TEXT (from OCR):\n${ocrText}`
+// What the vision model saw for single parts, added under the script text
+// for those parts only. extras: { [questionId]: { working, diagram } }.
+// working is a calculation re read from the page image; diagram is the
+// description of a drawing (and any table) the student drew.
+function labelOf(q) {
+  return q.subLabel ? `Question ${q.number}${q.subLabel}` : `Question ${q.number}`
+}
+
+export function extrasBlockFor(questions, extras) {
+  if (!extras) return ''
+  const out = []
+  for (const q of questions) {
+    const e = extras[q.id]
+    if (!e) continue
+    if (e.working) out.push(`WORKING READ FROM THE PAGE IMAGE for ${labelOf(q)} (Question ID ${q.id}):\n${e.working}`)
+    if (e.diagram) out.push(`DIAGRAM SEEN ON THE PAGE for ${labelOf(q)} (Question ID ${q.id}, described by a model that looked at the page image):\n${e.diagram}`)
+  }
+  return out.length ? `\n\n${out.join('\n\n')}` : ''
+}
+
+function userPromptFor(ocrText, questions, extras) {
+  return `MARKING GUIDE:\n${questionsBlockFor(questions)}\n\nSTUDENT'S EXTRACTED SCRIPT TEXT (from OCR):\n${ocrText}${extrasBlockFor(questions, extras)}`
 }
 
 async function scoreOnce(ocrText, questions, options = {}) {
@@ -372,8 +399,8 @@ async function scoreOnce(ocrText, questions, options = {}) {
       body: JSON.stringify({
         model,
         messages: [
-          { role: 'system', content: scoringPromptFor(pending, ocrText) },
-          { role: 'user', content: userPromptFor(ocrText, pending) },
+          { role: 'system', content: scoringPromptFor(pending, userPromptFor(ocrText, pending, options.extras)) },
+          { role: 'user', content: userPromptFor(ocrText, pending, options.extras) },
         ],
         ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
         temperature: 0.2,

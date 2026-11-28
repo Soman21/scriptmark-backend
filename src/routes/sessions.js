@@ -1394,67 +1394,53 @@ async function markScript(script, guide, session) {
       })
     }
 
-    const results = await scoreScriptAgainstGuide(trimmedForMarking(ocrText), guide.questions)
-
-    // For calculation heavy questions, standard OCR is unreliable on
-    // mathematical notation, so re transcribe that question's answer
-    // directly from the page image(s) with the vision model and re score
-    // just that question against the corrected transcript. Runs after the
-    // normal batch score above so a vision failure just leaves the
-    // original OCR based result in place rather than losing the question.
+    // Calculation heavy parts and parts that may be answered with a drawing
+    // or a table are looked at first, from the page images: OCR mangles
+    // maths, cannot read a drawing and mixes a table's columns. What the
+    // vision model sees is added under the script text for that part only,
+    // and then the whole guide is marked in one pass. Before, each of these
+    // parts was marked twice (once from the OCR text, then again with the
+    // whole script and the vision text), which cost one whole script
+    // request per part. A vision failure just leaves the OCR text.
     const pageImageUrls = script.pages.map((p) => p.imageUrl).filter(Boolean)
-    const calcHeavyQuestions = guide.questions.filter((q) => q.isCalculationHeavy)
-    for (const q of calcHeavyQuestions) {
+    const extras = {}
+    const seenById = new Map()
+    for (const q of guide.questions.filter((x) => x.isCalculationHeavy)) {
       try {
-        const visionTranscript = await transcribeCalculationFromImage(pageImageUrls, {
-          text: q.text,
-          maxMarks: q.maxMarks,
-        })
-        if (!visionTranscript) continue
-
-        const [rescored] = await scoreScriptAgainstGuide(visionTranscript, [q])
-        if (!rescored) continue
-
-        const idx = results.findIndex((r) => r.questionId === q.id)
-        const withTranscript = { ...rescored, visionTranscript }
-        if (idx >= 0) {
-          results[idx] = withTranscript
-        } else {
-          results.push(withTranscript)
-        }
+        const working = await transcribeCalculationFromImage(pageImageUrls, { text: q.text, maxMarks: q.maxMarks })
+        if (working) extras[q.id] = { ...extras[q.id], working }
       } catch (err) {
         if (err.code === AI_DAILY_LIMIT) throw err
         console.error(`Calculation heavy re transcription failed for question ${q.id}:`, err)
       }
     }
-
-    // Drawn answers (block diagrams, circuits, graphs) and tables: OCR cannot
-    // read a drawing and mixes a table's columns, so for parts that may be
-    // answered with one, the vision model describes what is drawn and copies
-    // any table cell by cell, and the part is marked again with that added
-    // to the text. Drawn answers always go to a human
-    // (see reviewDrawnAnswer). A failure leaves the text based result.
     for (const q of guide.questions.filter(needsDiagramLook)) {
       try {
         const seen = await describeDiagramFromImage(pageImageUrls, q)
         if (!seen?.present) continue
-        const idx = results.findIndex((r) => r.questionId === q.id)
-        const baseText = results[idx]?.visionTranscript || ocrText
-        const [rescored] = await scoreScriptAgainstGuide(withDiagram(baseText, seen.description), [q])
-        if (!rescored) continue
-        const drawn = {
-          ...reviewDrawnAnswer(rescored, seen.labelled, q.countBest),
-          // Kept with the answer so re marking applies the same label rule.
-          diagramDescription: seen.labelled === false ? `${NO_LABELS} ${seen.description}` : seen.description,
-          ...(results[idx]?.visionTranscript ? { visionTranscript: results[idx].visionTranscript } : {}),
-        }
-        if (idx >= 0) results[idx] = drawn
-        else results.push(drawn)
+        seenById.set(q.id, seen)
+        extras[q.id] = { ...extras[q.id], diagram: seen.description }
       } catch (err) {
         if (err.code === AI_DAILY_LIMIT) throw err
         console.error(`Diagram reading failed for question ${q.id}:`, err)
       }
     }
+
+    const byId = new Map(guide.questions.map((q) => [q.id, q]))
+    const results = (await scoreScriptAgainstGuide(trimmedForMarking(ocrText), guide.questions, { extras })).map((r) => {
+      const q = byId.get(r.questionId)
+      const seen = seenById.get(r.questionId)
+      const working = extras[r.questionId]?.working
+      // Drawn answers always go to a human (see reviewDrawnAnswer), and the
+      // description is kept with the answer so re marking applies the same
+      // label rule without looking at the images again.
+      const out = seen ? reviewDrawnAnswer(r, seen.labelled, q?.countBest) : r
+      return {
+        ...out,
+        ...(working ? { visionTranscript: working } : {}),
+        ...(seen ? { diagramDescription: seen.labelled === false ? `${NO_LABELS} ${seen.description}` : seen.description } : {}),
+      }
+    })
 
     let totalSuggested = 0
     let hasLowConfidence = false
