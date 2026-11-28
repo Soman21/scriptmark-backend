@@ -9,6 +9,7 @@ import { cleanPoints, needsDiagramLook, roundQuarter, pointResult, attemptMark, 
 import { mapLimit } from './mapLimit.js'
 import { recordUsage } from './aiUsage.js'
 import { compactModelAnswer, stripCorrectionNotes } from './guideCompact.js'
+import { splitScript, sectionTextFor } from './scriptSections.js'
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
@@ -223,6 +224,21 @@ export const SYSTEM_PROMPT = Object.values(RULES).map((p) => p.trimEnd()).join('
 // large is split into its parts. Between parts Groq may ask us to wait for
 // the minute's allowance (429), and we wait as long as it says.
 export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) {
+  // TRIAL, off unless MARK_BY_SECTION=1 (or options.bySection): each
+  // request carries only the script sections for its own questions (see
+  // scriptSections.js). A script without clear labels is sent whole.
+  const bySection = options.bySection ?? process.env.MARK_BY_SECTION === '1'
+  if (bySection && questions.length > 1) {
+    const split = splitScript(ocrText, questions)
+    if (split) {
+      const done = new Map()
+      for (const group of packBySection(split, questions, options.extras)) {
+        const results = await scoreScriptAgainstGuide(sectionTextFor(split, group), group, { ...options, bySection: false })
+        results.forEach((r) => done.set(r.questionId, r))
+      }
+      return questions.map((q) => done.get(q.id))
+    }
+  }
   // Sized before sending: a request that is clearly over the per minute
   // limit is split straight away, instead of being sent, refused (413) and
   // then split. The estimate errs on the large side (3.5 characters a
@@ -263,6 +279,26 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
     }
     return questions.map((q) => done.get(q.id))
   }
+}
+
+// Whole questions packed together while the request stays small (under
+// 60% of the minute limit, at most MAX_PARTS_PER_REQUEST parts), each group
+// with only its own sections.
+function packBySection(split, questions, extras) {
+  const groups = []
+  let current = []
+  for (const group of groupByQuestion(questions)) {
+    const next = [...current, ...group]
+    const size = estimateInputTokens(sectionTextFor(split, next), next, extras) + next.reduce((n, q) => n + replyTokens(q), 0)
+    if (current.length && (size > TOKENS_PER_MINUTE * 0.6 || next.length > MAX_PARTS_PER_REQUEST)) {
+      groups.push(current)
+      current = [...group]
+    } else {
+      current = next
+    }
+  }
+  if (current.length) groups.push(current)
+  return groups
 }
 
 // Groq's free plan: tokens a minute for one model, counting the request
@@ -432,6 +468,10 @@ async function scoreOnce(ocrText, questions, options = {}) {
           { role: 'user', content: userPromptFor(ocrText, pending, options.extras) },
         ],
         ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+        // TRIAL: how long gpt-oss thinks before answering ("low", "medium"
+        // or "high"). Its thinking counts against the same token limits.
+        // Unset means Groq's default (medium), as before.
+        ...(reasoningEffort(options) ? { reasoning_effort: reasoningEffort(options) } : {}),
         temperature: 0.2,
       }),
     }), { service: 'groq', model, job: options.job || 'marking' })
@@ -540,6 +580,11 @@ async function scoreOnce(ocrText, questions, options = {}) {
 }
 
 const SCORE_MAX_ATTEMPTS = 3
+
+function reasoningEffort(options) {
+  const v = String(options.reasoningEffort ?? process.env.GROQ_REASONING_EFFORT ?? '').toLowerCase().trim()
+  return ['low', 'medium', 'high'].includes(v) ? v : null
+}
 // Waits for the per minute limit that do not count as a failed try.
 const MAX_MINUTE_WAITS = 12
 
