@@ -223,6 +223,25 @@ export const SYSTEM_PROMPT = Object.values(RULES).map((p) => p.trimEnd()).join('
 // large is split into its parts. Between parts Groq may ask us to wait for
 // the minute's allowance (429), and we wait as long as it says.
 export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) {
+  // Sized before sending: a request that is clearly over the per minute
+  // limit is split straight away, instead of being sent, refused (413) and
+  // then split. The estimate errs on the large side (3.5 characters a
+  // token); a part that still turns out too large is split as before.
+  if (questions.length > 1) {
+    const input = estimateInputTokens(ocrText, questions, options.extras)
+    const reply = questions.reduce((n, q) => n + replyTokens(q), 0)
+    if (input + reply > TOKENS_PER_MINUTE * 0.9) {
+      const groups = packQuestions(ocrText, questions, TOKENS_PER_MINUTE, input, options.extras)
+      if (groups.length > 1) {
+        const done = new Map()
+        for (const group of groups) {
+          const results = await scoreScriptAgainstGuide(ocrText, group, { ...options, attempts: SPLIT_MAX_ATTEMPTS })
+          results.forEach((r) => done.set(r.questionId, r))
+        }
+        return questions.map((q) => done.get(q.id))
+      }
+    }
+  }
   try {
     return await scoreOnce(ocrText, questions, options)
   } catch (err) {
@@ -244,6 +263,16 @@ export async function scoreScriptAgainstGuide(ocrText, questions, options = {}) 
     }
     return questions.map((q) => done.get(q.id))
   }
+}
+
+// Groq's free plan: tokens a minute for one model, counting the request
+// and its reply. One request over this is refused outright.
+const TOKENS_PER_MINUTE = Number(process.env.GROQ_TOKENS_PER_MINUTE) || 8000
+const CHARS_PER_TOKEN = 3.5
+
+export function estimateInputTokens(ocrText, questions, extras) {
+  const chars = scoringPromptFor(questions, userPromptFor(ocrText, questions, extras)).length + userPromptFor(ocrText, questions, extras).length
+  return Math.ceil(chars / CHARS_PER_TOKEN)
 }
 
 // Groups whole questions (all their parts together, in guide order) so that
