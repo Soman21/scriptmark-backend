@@ -152,3 +152,14 @@ violations. (12.5 Marks)
   ], text)
   assert.deepEqual(qs.map((q) => [q.maxMarks, q.questionTotal]), [[4, 17.5], [5.5, 17.5], [3, 17.5]])
 })
+
+test('guide totals that differ only by rounding are not flagged', () => {
+  const parts = [
+    { number: '1', subLabel: 'a', maxMarks: 4.38, questionTotal: 17.5, steps: [{ description: 'x', marks: 4.37 }] },
+    { number: '1', subLabel: 'b', maxMarks: 4.375, questionTotal: 17.5, steps: [{ description: 'x', marks: 4.38 }] },
+    { number: '1', subLabel: 'c', maxMarks: 4.37, questionTotal: 17.5, steps: [{ description: 'x', marks: 4.37 }] },
+    { number: '1', subLabel: 'd', maxMarks: 4.38, questionTotal: 17.5, steps: [{ description: 'x', marks: 4.38 }] },
+  ]
+  assert.deepEqual(checkGuideTotals(parts), [])
+  assert.equal(checkGuideTotals([{ number: '2', maxMarks: 5, steps: [{ description: 'x', marks: 4.75 }] }]).length, 1)
+})
