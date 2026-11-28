@@ -1331,8 +1331,10 @@ async function runMarkingQueue(guide, session) {
         run.lookAgain = false
         continue
       }
+      console.log(`Marking run for session ${session.id}: ${scripts.length} script(s) to mark`)
       for (const script of scripts) {
         tried.add(script.id)
+        console.log(`Marking script ${script.id}: ${script.ocrText ? 'text already read' : `reading ${script.pages.length} page(s)`}`)
         // Every AI call for this script is counted, for the thesis and to
         // see how much of the free allowance one script takes.
         const { result: outcome, usage } = await trackUsage(() => markScript(script, guide, session))

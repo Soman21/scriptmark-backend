@@ -18,6 +18,10 @@ export function roundQuarter(n) {
 }
 
 const near = (a, b) => Math.abs(a - b) < 1e-6
+// Guide totals: a difference of one or two hundredths is rounding, not an
+// error. 17.5 shared over four parts is 4.375 each, which the editor shows
+// and saves as 4.38, and points of 4.37 and 4.38 are then the same total.
+const totalsMatch = (a, b) => Math.abs(a - b) < 0.015
 const toNum = (v) => {
   const n = typeof v === 'string' ? Number(v.trim()) : v
   return typeof n === 'number' && Number.isFinite(n) ? n : null
@@ -91,7 +95,7 @@ export function checkGuideTotals(questions) {
     if (points.length) {
       // With "best 5 of 7" the part is out of the 5 highest point marks.
       const sum = bestTotal(points.map((p) => p.marks), q.countBest)
-      if (!near(sum, max)) warnings.push({ label: `Q${q.number}${q.subLabel || ''}`, kind: 'POINTS', expected: max, actual: roundTo(sum) })
+      if (!totalsMatch(sum, max)) warnings.push({ label: `Q${q.number}${q.subLabel || ''}`, kind: 'POINTS', expected: max, actual: roundTo(sum) })
     }
     const key = String(q.number)
     if (!byNumber.has(key)) byNumber.set(key, [])
@@ -101,7 +105,7 @@ export function checkGuideTotals(questions) {
     const total = parts.map((p) => toNum(p.questionTotal)).find((t) => t != null && t > 0)
     if (total == null) continue
     const sum = parts.reduce((s, p) => s + (toNum(p.maxMarks) ?? 0), 0)
-    if (!near(sum, total)) warnings.push({ label: `Q${number}`, kind: 'PARTS', expected: total, actual: roundTo(sum) })
+    if (!totalsMatch(sum, total)) warnings.push({ label: `Q${number}`, kind: 'PARTS', expected: total, actual: roundTo(sum) })
   }
   return warnings
 }
