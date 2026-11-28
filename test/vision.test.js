@@ -44,6 +44,33 @@ test('reads JSON wrapped in other text, drops bad boxes', async () => {
 })
 
 test('api error throws', async () => {
-  const { call } = await run({}, 429)
-  await assert.rejects(call, /Gemini 429/)
+  const { call } = await run({}, 400)
+  await assert.rejects(call, /Gemini 400/)
+})
+
+test('a busy reply waits and reads the page again', async () => {
+  process.env.GEMINI_API_KEY = 'k'
+  const replies = [
+    { ok: false, status: 503, text: async () => 'overloaded' },
+    { ok: false, status: 429, text: async () => '{"retryDelay": "3s"}' },
+    { ok: true, status: 200, json: async () => wrap({ lines: [{ text: 'hi' }] }) },
+  ]
+  globalThis.fetch = async () => replies.shift()
+  const waits = []
+  const { extractTextFromImage } = await import('../src/lib/vision.js')
+  const r = await extractTextFromImage(png, { sleep: async (ms) => waits.push(ms) })
+  assert.equal(r.text, 'hi')
+  assert.deepEqual(waits, [2000, 3500])
+})
+
+test('a daily limit pauses instead of retrying', async () => {
+  process.env.GEMINI_API_KEY = 'k'
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    return { ok: false, status: 429, text: async () => 'Quota exceeded: GenerateRequestsPerDayPerProjectPerModel' }
+  }
+  const { extractTextFromImage } = await import('../src/lib/vision.js')
+  await assert.rejects(extractTextFromImage(png, { sleep: async () => {} }), (err) => err.code === 'AI_DAILY_LIMIT')
+  assert.equal(calls, 1)
 })

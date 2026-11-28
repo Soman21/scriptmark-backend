@@ -54,31 +54,56 @@ function parseLines(raw) {
     .filter((l) => l.text)
 }
 
-export async function extractTextFromImage(imageUrl) {
+// Gemini answers 429 when the minute's allowance is used and 503 when it is
+// busy. Both clear by themselves, so the page waits and is read again
+// instead of the script being flagged. A daily limit cannot clear soon, so
+// it is passed on as AI_DAILY_LIMIT and the marking run pauses (Resume).
+const RETRYABLE = new Set([429, 500, 502, 503, 504])
+const MAX_TRIES = 5
+export const AI_DAILY_LIMIT = 'AI_DAILY_LIMIT'
+
+// Gemini's error says how long to wait, e.g. "retryDelay": "34s".
+export function geminiWaitMs(body) {
+  const m = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(String(body || ''))
+  return m ? Math.min(Math.ceil(Number(m[1]) * 1000) + 500, 60000) : null
+}
+
+export async function extractTextFromImage(imageUrl, options = {}) {
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
   const apiKey = process.env.GEMINI_API_KEY
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set')
   const model = process.env.GEMINI_OCR_MODEL || DEFAULT_MODEL
   const image = await toImage(imageUrl)
-
-  const res = await fetch(`${API_BASE}/${model}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-    body: JSON.stringify({
-      contents: [
-        {
-          parts: [
-            { text: PROMPT },
-            { inline_data: { mime_type: image.mimeType, data: image.data.toString('base64') } },
-          ],
-        },
-      ],
-      generationConfig: { temperature: 0, responseMimeType: 'application/json' },
-    }),
+  const request = JSON.stringify({
+    contents: [
+      {
+        parts: [
+          { text: PROMPT },
+          { inline_data: { mime_type: image.mimeType, data: image.data.toString('base64') } },
+        ],
+      },
+    ],
+    generationConfig: { temperature: 0, responseMimeType: 'application/json' },
   })
-  if (!res.ok) {
+
+  let res
+  for (let attempt = 1; ; attempt++) {
+    res = await fetch(`${API_BASE}/${model}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: request,
+    })
+    if (res.ok) break
     const body = await res.text().catch(() => '')
     recordUsage({ service: 'gemini', model, job: 'page reading', refused: true })
-    throw new Error(`Gemini ${res.status}: ${body.slice(0, 300)}`)
+    const err = new Error(`Gemini ${res.status}: ${body.slice(0, 300)}`)
+    if (res.status === 429 && /per ?day/i.test(body)) {
+      err.code = AI_DAILY_LIMIT
+      throw err
+    }
+    if (!RETRYABLE.has(res.status) || attempt >= MAX_TRIES) throw err
+    console.warn(`Page reading waits for Gemini (${res.status}), try ${attempt + 1} of ${MAX_TRIES}`)
+    await sleep(geminiWaitMs(body) ?? Math.min(2000 * 2 ** (attempt - 1), 30000))
   }
   const data = await res.json()
   recordUsage({ service: 'gemini', model, job: 'page reading', data })
