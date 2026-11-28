@@ -852,7 +852,7 @@ router.post('/:id/scripts', requireRole('LECTURER', 'ADMIN'), requireMembership,
     // automatically from the OCR text. Never overrides a value already typed in.
     let detected = null
     if (isFirstPageOfNewScript && !studentName && !regNumber) {
-      detected = await extractStudentInfo(pageText, req.markingSession.classList)
+      detected = await extractStudentInfo(pageText, req.markingSession.classList, { courseDetailsSet: courseDetailsSet(req.markingSession) })
       await fillBlankCourseDetails(req.markingSession, detected)
       // With an attendance sheet or class list already uploaded, the name
       // comes from it straight away, so the lecturer sees the right student
@@ -1266,6 +1266,12 @@ async function remarkAnswers(answers, questions, session) {
   }
 }
 
+// True when the session has all its course details, so a front page is
+// only needed for the student's reg number.
+function courseDetailsSet(session) {
+  return ['courseCode', 'semester', 'academicSession'].every((f) => session?.[f] && String(session[f]).trim())
+}
+
 // Fills any course code, semester or academic session the lecturer left
 // blank on the session, from what a script's front page says. Each field
 // is only written while it is still blank in the database, so a value the
@@ -1373,7 +1379,7 @@ async function markScript(script, guide, session) {
       let studentName = script.studentName
       let regNumber = script.regNumber
       if ((!studentName || !regNumber) && pageTexts[0]) {
-        const detected = await extractStudentInfo(pageTexts[0], session.classList)
+        const detected = await extractStudentInfo(pageTexts[0], session.classList, { courseDetailsSet: courseDetailsSet(session) })
         await fillBlankCourseDetails(session, detected)
         studentName = studentName || detected.name
         regNumber = regNumber || detected.regNumber

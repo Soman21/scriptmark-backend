@@ -4,7 +4,7 @@
 // fake fetch so no real Groq requests are made. Run with: npm test
 import { test, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { cleanRegNumber, findRegNumberCandidates, pickRegNumber, matchRegNumber } from '../src/lib/roster.js'
+import { cleanRegNumber, findRegNumberCandidates, pickRegNumber, matchRegNumber, sureRegNumber } from '../src/lib/roster.js'
 import { extractStudentInfo } from '../src/lib/groq.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester, courseDetailsToFill } from '../src/lib/frontPage.js'
 
@@ -179,4 +179,37 @@ test('matchRegNumber rescues a slip in the year when only one student is that cl
   assert.equal(matchRegNumber('2001364080', [...list, { id: 'e3', name: 'Eze', regNumber: '2001999999' }]), null)
   // two students equally close: never guessed
   assert.equal(matchRegNumber('2001364080', [{ id: 'a', regNumber: '2021364030' }, { id: 'b', regNumber: '2011364090' }]), null)
+})
+
+// Front page without the AI (stage 23).
+
+const roster = [
+  { id: 'a', name: 'Ada Obi', regNumber: '2021/245678' },
+  { id: 'b', name: 'Bola Ade', regNumber: '2021/245699' },
+]
+
+test('a reg number that matches the class list exactly is sure', () => {
+  assert.equal(sureRegNumber("STUDENT'S REG. NO\n2021/245678\nS/N: 25/B1/89487", roster), '2021/245678')
+})
+
+test('no list, a near match, or two numbers that match need the AI', () => {
+  assert.equal(sureRegNumber('2021/245678', []), null)
+  assert.equal(sureRegNumber('2021/245679', roster), null)
+  assert.equal(sureRegNumber('2021/245678 2021/245699', roster), null)
+})
+
+test('the AI is not called when the reg number is sure and course details are set', async () => {
+  const real = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    throw new Error('no AI expected')
+  }
+  try {
+    const got = await extractStudentInfo('Reg No 2021/245678', roster, { courseDetailsSet: true })
+    assert.equal(got.regNumber, '2021/245678')
+    assert.equal(calls, 0)
+  } finally {
+    globalThis.fetch = real
+  }
 })
