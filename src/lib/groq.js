@@ -7,6 +7,7 @@ import { geminiChat, geminiConfigured } from './geminiText.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
 import { cleanPoints, roundQuarter, pointResult, attemptMark, bestTotal, countBestFrom, applyPrintedMarks } from './markingPoints.js'
 import { mapLimit } from './mapLimit.js'
+import { recordUsage } from './aiUsage.js'
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = 'openai/gpt-oss-120b' // llama-3.3-70b-versatile was deprecated and decommissioned by Groq on August 16, 2026; this is their recommended 1:1 replacement
@@ -26,22 +27,44 @@ export const BACKUP_NOTE = 'Marked by backup AI model.'
 // one. With no Gemini key they go to the main Groq model as before.
 // body: { messages, temperature, response_format }. Returns a fetch like
 // response in Groq's shape.
-async function lightChat(body) {
-  const groq = (model) =>
-    fetch(GROQ_API_URL, {
+async function lightChat(body, job = 'other') {
+  const groq = async (model) => counted(
+    await fetch(GROQ_API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({ model, ...body }),
-    })
+    }),
+    { service: 'groq', model, job }
+  )
   if (!geminiConfigured()) return groq(MODEL)
   try {
-    const res = await geminiChat(body)
+    const res = await geminiChat(body, job)
     if (res.ok) return res
     console.warn(`Gemini answered ${res.status}; using ${FALLBACK_MODEL || MODEL} instead`)
   } catch (err) {
     console.warn(`Gemini failed (${err.message}); using ${FALLBACK_MODEL || MODEL} instead`)
   }
   return groq(FALLBACK_MODEL || MODEL)
+}
+
+// Wraps a fetch response so that reading its body also records the call
+// in aiUsage.js. Callers keep using res.ok, res.json() and res.text().
+function counted(res, info) {
+  if (!res.ok) {
+    recordUsage({ ...info, refused: true })
+    return res
+  }
+  return {
+    ok: res.ok,
+    status: res.status,
+    headers: res.headers,
+    json: async () => {
+      const data = await res.json()
+      recordUsage({ ...info, data })
+      return data
+    },
+    text: () => res.text(),
+  }
 }
 
 // When MODEL's daily allowance is expected back (ms since epoch). Until
@@ -290,7 +313,7 @@ async function scoreOnce(ocrText, questions, options = {}) {
     const isLast = attempt === maxAttempts
     const pending = questions.filter((q) => !done.has(q.id))
     const model = scoringModel()
-    const res = await fetch(GROQ_API_URL, {
+    const res = counted(await fetch(GROQ_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -305,7 +328,7 @@ async function scoreOnce(ocrText, questions, options = {}) {
         ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
         temperature: 0.2,
       }),
-    })
+    }), { service: 'groq', model, job: options.job || 'marking' })
 
     if (!res.ok) {
       const errText = await res.text()
@@ -620,7 +643,7 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
   ]
 
   try {
-    const res = await fetch(GROQ_API_URL, {
+    const res = counted(await fetch(GROQ_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -635,7 +658,7 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
         response_format: { type: 'json_object' },
         temperature: 0.1,
       }),
-    })
+    }), { service: 'groq', model: VISION_MODEL, job: 'calculation look' })
 
     if (!res.ok) {
       console.error(`Groq vision API error (${res.status}):`, await res.text())
@@ -665,7 +688,7 @@ async function visionJson(systemPrompt, userContent, options = {}) {
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
   try {
     for (let attempt = 0; ; attempt++) {
-    const res = await fetch(GROQ_API_URL, {
+    const res = counted(await fetch(GROQ_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -680,7 +703,7 @@ async function visionJson(systemPrompt, userContent, options = {}) {
         response_format: { type: 'json_object' },
         temperature: 0.1,
       }),
-    })
+    }), { service: 'groq', model: VISION_MODEL, job: options.job || 'vision' })
     if (!res.ok) {
       const errText = await res.text()
       if (res.status === 429 && /per day/i.test(errText)) {
@@ -742,7 +765,7 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
   const parsed = await visionJson(systemPrompt, [
     { type: 'text', text: `Question (${question?.maxMarks ?? '?'} marks): ${question?.text ?? ''}${pointLines}` },
     ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
-  ])
+  ], { job: 'drawing look' })
   if (!parsed) return null
   const drawing = parsed.present && typeof parsed.description === 'string' ? parsed.description.trim() : ''
   const table = typeof parsed.table === 'string' && (parsed.table.match(/\|/g) || []).length >= 2 ? parsed.table.trim() : ''
@@ -788,7 +811,7 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
       { type: 'text', text: `Text on this page (read by OCR, tables may be out of order):\n${String(pageText || '').slice(0, 4000)}` },
       { type: 'image_url', image_url: { url: imageUrl } },
     ],
-    { retries: 4, sleep: options.sleep }
+    { retries: 4, sleep: options.sleep, job: 'guide figures' }
   )
   const label = (q) => (typeof q === 'string' && q.trim() ? q.trim() : null)
   const figures = (Array.isArray(parsed?.figures) ? parsed.figures : [])
@@ -857,7 +880,7 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
       ],
       response_format: { type: 'json_object' },
       temperature: 0.1,
-    })
+    }, 'front page')
     if (res.ok) {
       const data = await res.json()
       const content = data.choices?.[0]?.message?.content
@@ -1082,7 +1105,7 @@ async function parseGuidePiece(text, sleep) {
       ],
       response_format: { type: 'json_object' },
       temperature: 0.1,
-    })
+    }, 'guide reading')
 
     if (!res.ok) {
       const errText = await res.text()
@@ -1160,7 +1183,7 @@ export async function parseClassList(rawText) {
     ],
     response_format: { type: 'json_object' },
     temperature: 0.1,
-  })
+  }, 'class list')
 
   if (!res.ok) {
     const errText = await res.text()
@@ -1201,7 +1224,7 @@ export async function generateModelAnswers(questions) {
     ],
     response_format: { type: 'json_object' },
     temperature: 0.3,
-  })
+  }, 'model answers')
 
   if (!res.ok) {
     const errText = await res.text()
@@ -1402,8 +1425,13 @@ export async function assistantChat(body) {
         // gpt-oss spends those on its thinking first, leaving no answer.
         body: JSON.stringify({ max_tokens: CLOUDFLARE_MAX_TOKENS, ...body, model: CLOUDFLARE_MODEL }),
       })
-      if (!res.ok) throw new Error(`Cloudflare AI error (${res.status}): ${await res.text()}`)
-      const choice = (await res.json()).choices?.[0]
+      if (!res.ok) {
+        recordUsage({ service: 'cloudflare', model: CLOUDFLARE_MODEL, job: 'assistant', refused: true })
+        throw new Error(`Cloudflare AI error (${res.status}): ${await res.text()}`)
+      }
+      const data = await res.json()
+      recordUsage({ service: 'cloudflare', model: CLOUDFLARE_MODEL, job: 'assistant', data })
+      const choice = data.choices?.[0]
       const message = choice?.message
       if (!message || (!message.content && !message.tool_calls?.length)) {
         throw new Error(`Cloudflare AI returned an empty response (finish reason: ${choice?.finish_reason || 'none'}).`)
@@ -1413,11 +1441,11 @@ export async function assistantChat(body) {
       console.warn(`Assistant on Cloudflare failed, using Groq instead: ${err.message}`)
     }
   }
-  const res = await fetch(GROQ_API_URL, {
+  const res = counted(await fetch(GROQ_API_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
     body: JSON.stringify({ ...body, model: FALLBACK_MODEL || MODEL }),
-  })
+  }), { service: 'groq', model: FALLBACK_MODEL || MODEL, job: 'assistant' })
   if (!res.ok) throw new Error(`Groq API error (${res.status}): ${await res.text()}`)
   const message = (await res.json()).choices?.[0]?.message
   if (!message) throw new Error('Groq returned an empty response.')
@@ -1523,7 +1551,7 @@ export async function shareQuestionMarks(parts, target, options = {}) {
       messages: [{ role: 'system', content: SHARE_MARKS_SYSTEM_PROMPT }, { role: 'user', content: user }],
       response_format: { type: 'json_object' },
       temperature: 0.1,
-    })
+    }, 'fix all')
     if (!res.ok) {
       const errText = await res.text()
       if (res.status === 429 && attempt < 3 && !/per day/i.test(errText)) {

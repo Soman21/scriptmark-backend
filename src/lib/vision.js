@@ -2,6 +2,8 @@
 // needs a billing account. Keeps the same return shape ({ text, confidence })
 // and adds `lines` with a box per line, so marked script ink can be placed.
 
+import { recordUsage } from './aiUsage.js'
+
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models'
 const DEFAULT_MODEL = 'gemini-3.5-flash'
 
@@ -75,9 +77,11 @@ export async function extractTextFromImage(imageUrl) {
   })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
+    recordUsage({ service: 'gemini', model, job: 'page reading', refused: true })
     throw new Error(`Gemini ${res.status}: ${body.slice(0, 300)}`)
   }
   const data = await res.json()
+  recordUsage({ service: 'gemini', model, job: 'page reading', data })
   const raw = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || ''
   if (!raw) return { text: '', confidence: 0, lines: [] }
 

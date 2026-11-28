@@ -16,6 +16,7 @@ import { writeResultsPdf } from '../lib/pdfExport.js'
 import { extractStudentInfo, scoreScriptAgainstGuide, transcribeCalculationFromImage, describeDiagramFromImage, parseClassList, AI_DAILY_LIMIT } from '../lib/groq.js'
 import { checkGuideTotals, needsDiagramLook, capUnlabelledDrawing, bestTotal } from '../lib/markingPoints.js'
 import { mapLimit } from '../lib/mapLimit.js'
+import { trackUsage, usageSummary } from '../lib/aiUsage.js'
 import { matchRegNumber, mergeClassListEntries, normalizeRegNumber, findUnresolvedScripts } from '../lib/roster.js'
 import { computeSessionAnalytics } from '../lib/analytics.js'
 import { courseDetailsToFill } from '../lib/frontPage.js'
@@ -1171,7 +1172,9 @@ router.post('/:id/remark', requireRole('LECTURER', 'ADMIN'), requireMembership, 
     const redo = answers.filter((a) => a.confirmedAt == null || a.autoAccepted)
     res.json({ started: true, answers: redo.length, keptConfirmed: answers.length - redo.length })
 
-    remarkAnswers(redo, questions, session).catch((err) => console.error('Re marking failed:', err))
+    trackUsage(() => remarkAnswers(redo, questions, session))
+      .then(({ usage }) => console.log(`AI use for re marking ${redo.length} answers in session ${session.id}: ${usageSummary(usage)}`))
+      .catch((err) => console.error('Re marking failed:', err))
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Could not start re marking: ' + err.message })
@@ -1307,7 +1310,10 @@ async function runMarkingQueue(guide, session) {
       }
       for (const script of scripts) {
         tried.add(script.id)
-        const outcome = await markScript(script, guide, session)
+        // Every AI call for this script is counted, for the thesis and to
+        // see how much of the free allowance one script takes.
+        const { result: outcome, usage } = await trackUsage(() => markScript(script, guide, session))
+        console.log(`AI use for script ${script.id} (${outcome}): ${usageSummary(usage)}`)
         if (outcome === 'paused') return
       }
     }
