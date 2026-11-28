@@ -748,40 +748,11 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
     ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
   ]
 
-  try {
-    const res = counted(await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: VISION_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userContent },
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
-      }),
-    }), { service: 'groq', model: VISION_MODEL, job: 'calculation look' })
-
-    if (!res.ok) {
-      console.error(`Groq vision API error (${res.status}):`, await res.text())
-      return null
-    }
-
-    const data = await res.json()
-    const content = data.choices?.[0]?.message?.content
-    if (!content) return null
-
-    const parsed = JSON.parse(content)
-    const transcript = typeof parsed.transcript === 'string' ? parsed.transcript.trim() : ''
-    return transcript || null
-  } catch (err) {
-    console.error('Vision transcription failed:', err)
-    return null
-  }
+  // Waits and tries again when the vision model is busy, like the drawing
+  // look; a daily limit pauses the run instead of leaving the OCR text.
+  const parsed = await visionJson(systemPrompt, userContent, { job: 'calculation look', retries: 3 })
+  const transcript = typeof parsed?.transcript === 'string' ? parsed.transcript.trim() : ''
+  return transcript || null
 }
 
 // Sends one request to the vision model and returns its parsed JSON reply,
@@ -871,7 +842,7 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
   const parsed = await visionJson(systemPrompt, [
     { type: 'text', text: `Question (${question?.maxMarks ?? '?'} marks): ${question?.text ?? ''}${pointLines}` },
     ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
-  ], { job: 'drawing look' })
+  ], { job: 'drawing look', retries: 3 })
   if (!parsed) return null
   const drawing = parsed.present && typeof parsed.description === 'string' ? parsed.description.trim() : ''
   const table = typeof parsed.table === 'string' && (parsed.table.match(/\|/g) || []).length >= 2 ? parsed.table.trim() : ''
