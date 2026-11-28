@@ -119,6 +119,19 @@ export function findRegNumberCandidates(pageText) {
   return found
 }
 
+// The reg number on a front page when code alone can be sure of it: exactly
+// one reg number shaped string on the page matches a student on the class
+// list exactly, and no other one on the page comes near any student. Then
+// the AI is not needed to find it. Returns null in every other case, and the
+// AI reads the page as before.
+export function sureRegNumber(pageText, classList) {
+  if (!Array.isArray(classList) || classList.length === 0) return null
+  const candidates = findRegNumberCandidates(pageText)
+  const matches = candidates.map((c) => ({ c, m: matchRegNumber(c, classList) })).filter((x) => x.m)
+  if (matches.length !== 1 || matches[0].m.matchType !== 'exact') return null
+  return matches[0].c
+}
+
 // Picks the reg number to store for a script's front page. The AI's pick
 // goes first, then any other reg number shaped strings on the page. With a
 // class list, the first one that matches a student on it wins, so a wrong

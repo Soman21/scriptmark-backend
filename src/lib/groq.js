@@ -2,7 +2,7 @@
 // for suggesting scores. This is ALWAYS a suggestion — a human lecturer/reviewer
 // must confirm the score before it counts (see results.js "/confirm" route).
 
-import { pickRegNumber } from './roster.js'
+import { pickRegNumber, sureRegNumber } from './roster.js'
 import { geminiChat, geminiConfigured } from './geminiText.js'
 import { cleanCourseCode, cleanAcademicSession, cleanSemester } from './frontPage.js'
 import { cleanPoints, needsDiagramLook, roundQuarter, pointResult, attemptMark, bestTotal, countBestFrom, applyPrintedMarks } from './markingPoints.js'
@@ -942,8 +942,17 @@ Respond with ONLY a JSON object of this exact shape, nothing else:
 // them in.
 const EMPTY_FRONT_PAGE = { name: null, regNumber: null, courseCode: null, semester: null, academicSession: null }
 
-export async function extractStudentInfo(pageText, classList) {
+// options.courseDetailsSet: the session already has its course code,
+// semester and academic session, so the page is read only for the reg
+// number. When that number is certain from the page text and the class
+// list alone (see sureRegNumber), no AI call is made. The name then comes
+// from the class list, as it would anyway once the reg number matches.
+export async function extractStudentInfo(pageText, classList, options = {}) {
   if (!pageText || !pageText.trim()) return { ...EMPTY_FRONT_PAGE }
+  if (options.courseDetailsSet) {
+    const sure = sureRegNumber(pageText, classList)
+    if (sure) return { ...EMPTY_FRONT_PAGE, regNumber: sure }
+  }
 
   const systemPrompt = `You are given OCR text from the front page of a handwritten exam answer booklet,
 with line breaks in rough top to bottom reading order. The page may have been photographed
