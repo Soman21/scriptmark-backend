@@ -5,6 +5,7 @@ import { adminEmails, isOwner, OWNER_EMAIL, loadAdminGrants, effectiveRole } fro
 import { setSuspended } from '../lib/suspension.js'
 import { logActivity } from '../lib/activity.js'
 import { dayRange } from '../lib/siteStats.js'
+import { usageToday } from '../lib/aiUsage.js'
 
 const router = express.Router()
 // Every route here is Admin only. The role is worked out on the server for
@@ -12,6 +13,12 @@ const router = express.Router()
 router.use(requireAuth, requireRole('ADMIN'))
 
 const configured = (...names) => names.every((n) => !!process.env[n])
+
+// GET /api/admin/ai-usage - AI calls and tokens used today (UTC day), by
+// service, model and job, counted since the server last started.
+router.get('/ai-usage', (req, res) => {
+  res.json(usageToday())
+})
 
 // GET /api/admin/overview - totals, system status, recent activity,
 // lecturers and sessions, in one request for the Admin page.

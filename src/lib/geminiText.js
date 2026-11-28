@@ -3,6 +3,8 @@
 // change how it reads the answer. Used for jobs that are not marking, so the
 // free Groq allowance is kept for marking.
 
+import { recordUsage } from './aiUsage.js'
+
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models'
 const DEFAULT_MODEL = 'gemini-3.5-flash'
 
@@ -12,7 +14,7 @@ export function geminiConfigured() {
 
 // body: { messages: [{ role, content }], temperature, response_format }
 // Returns { ok, status, json(), text() } like a fetch response.
-export async function geminiChat(body) {
+export async function geminiChat(body, job = 'other') {
   const model = process.env.GEMINI_MODEL || DEFAULT_MODEL
   const system = body.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n\n')
   const contents = body.messages
@@ -32,9 +34,11 @@ export async function geminiChat(body) {
   })
   if (!res.ok) {
     const errText = await res.text().catch(() => '')
+    recordUsage({ service: 'gemini', model, job, refused: true })
     return { ok: false, status: res.status, headers: res.headers, text: async () => errText }
   }
   const data = await res.json()
+  recordUsage({ service: 'gemini', model, job, data })
   const candidate = data?.candidates?.[0]
   const content = (candidate?.content?.parts || []).map((p) => p.text || '').join('')
   const reply = {

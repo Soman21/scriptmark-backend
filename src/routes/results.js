@@ -6,6 +6,7 @@ import { requireAuth } from '../middleware/auth.js'
 import { scoreScriptAgainstGuide } from '../lib/groq.js'
 import { markFailures, recordFailure } from '../lib/markFailure.js'
 import { trimForMarking } from '../lib/trimScriptText.js'
+import { trackUsage, usageSummary } from '../lib/aiUsage.js'
 import { applyPointScores } from '../lib/markingPoints.js'
 import { accessibleGuidesWhere, canAccessScript, canAccessSession } from '../lib/access.js'
 
@@ -40,8 +41,11 @@ router.post('/scripts/:scriptId/score', async (req, res) => {
 
     let results
     try {
-      results = await scoreScriptAgainstGuide(trimForMarking(script.ocrText), guide.questions)
+      const tracked = await trackUsage(() => scoreScriptAgainstGuide(trimForMarking(script.ocrText), guide.questions))
+      results = tracked.result
+      console.log(`AI use for Remark of script ${script.id}: ${usageSummary(tracked.usage)}`)
     } catch (err) {
+      if (err.aiUsage) console.log(`AI use for failed Remark of script ${script.id}: ${usageSummary(err.aiUsage)}`)
       recordFailure(script.id, err)
       throw err
     }
