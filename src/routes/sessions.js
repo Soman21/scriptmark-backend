@@ -1183,13 +1183,6 @@ router.post('/:id/remark', requireRole('LECTURER', 'ADMIN'), requireMembership, 
 
 const NO_LABELS = 'No labels.'
 
-// The student's text with the vision model's description of their drawing.
-// The description may also hold a table the student wrote, copied cell by
-// cell, because OCR mixes a table's columns.
-function withDiagram(text, description) {
-  return `${text || ''}\n\nDIAGRAM SEEN ON THE PAGE (described by a model that looked at the page image):\n${description}`
-}
-
 // A drawn answer is never auto accepted: confidence is capped at medium so
 // a lecturer always checks it. With labelled === false, points expecting a
 // labelled drawing are capped at the attempt mark (markingPoints.js).
@@ -1206,33 +1199,57 @@ function reviewDrawnAnswer(r, labelled, countBest = null) {
 async function remarkAnswers(answers, questions, session) {
   const byId = new Map(questions.map((q) => [q.id, q]))
   const touchedScripts = new Set()
+  // One request per script for all its changed parts, instead of one
+  // request per part, each carrying the whole script. A calculation read
+  // from the image and a drawing seen before are reused from the saved
+  // answer, so re marking needs no new vision call.
+  const byScript = new Map()
   for (const a of answers) {
-    const q = byId.get(a.questionId)
-    const base = (q.isCalculationHeavy && a.visionTranscript) || a.script.ocrText
-    if (!base) continue
-    // A drawing seen before is reused, so re marking needs no new vision call.
-    const text = a.diagramDescription ? withDiagram(base, a.diagramDescription) : base
+    if (!byId.has(a.questionId)) continue
+    if (!byScript.has(a.scriptId)) byScript.set(a.scriptId, [])
+    byScript.get(a.scriptId).push(a)
+  }
+  for (const list of byScript.values()) {
+    const ocrText = list[0].script.ocrText || ''
+    const extras = {}
+    for (const a of list) {
+      const q = byId.get(a.questionId)
+      const working = q.isCalculationHeavy && a.visionTranscript
+      if (working || a.diagramDescription) extras[q.id] = { working: working || null, diagram: a.diagramDescription || null }
+    }
+    const qs = list.map((a) => byId.get(a.questionId)).filter((q) => ocrText || extras[q.id]?.working)
+    if (qs.length === 0) continue
+    let scored
     try {
-      const [scored] = await scoreScriptAgainstGuide(text, [q])
-      if (!scored) continue
-      const r = a.diagramDescription ? reviewDrawnAnswer(scored, !a.diagramDescription.startsWith(NO_LABELS), q.countBest) : scored
-      const autoAccept = session.autoAcceptHighConfidence && r.confidence === 'high'
-      await prisma.scriptAnswer.update({
-        where: { id: a.id },
-        data: {
-          suggestedScore: r.suggestedScore,
-          reasoning: r.reasoning,
-          confidence: r.confidence || null,
-          extractedText: r.answerText || a.extractedText,
-          stepBreakdown: r.stepBreakdown || null,
-          ...(autoAccept
-            ? { confirmedScore: r.suggestedScore, confirmedAt: new Date(), autoAccepted: true }
-            : { confirmedScore: null, confirmedAt: null, autoAccepted: false }),
-        },
-      })
-      touchedScripts.add(a.scriptId)
+      scored = await scoreScriptAgainstGuide(trimmedForMarking(ocrText), qs, { extras })
     } catch (err) {
-      console.error(`Re marking answer ${a.id} failed:`, err)
+      console.error(`Re marking script ${list[0].scriptId} failed:`, err)
+      continue
+    }
+    for (const a of list) {
+      const q = byId.get(a.questionId)
+      const result = scored.find((r) => r?.questionId === a.questionId)
+      if (!result) continue
+      const r = a.diagramDescription ? reviewDrawnAnswer(result, !a.diagramDescription.startsWith(NO_LABELS), q.countBest) : result
+      const autoAccept = session.autoAcceptHighConfidence && r.confidence === 'high'
+      try {
+        await prisma.scriptAnswer.update({
+          where: { id: a.id },
+          data: {
+            suggestedScore: r.suggestedScore,
+            reasoning: r.reasoning,
+            confidence: r.confidence || null,
+            extractedText: r.answerText || a.extractedText,
+            stepBreakdown: r.stepBreakdown || null,
+            ...(autoAccept
+              ? { confirmedScore: r.suggestedScore, confirmedAt: new Date(), autoAccepted: true }
+              : { confirmedScore: null, confirmedAt: null, autoAccepted: false }),
+          },
+        })
+        touchedScripts.add(a.scriptId)
+      } catch (err) {
+        console.error(`Re marking answer ${a.id} failed:`, err)
+      }
     }
   }
   for (const scriptId of touchedScripts) {
